@@ -27,7 +27,6 @@ EDEN = Path.home() / ".local/bin/eden"
 CONTROL_TEMPLATE = (
     Path.home() / ".local/share/netease-switch/eden/config/eden/qt-config.ini"
 )
-HELPER = ROOT / "scripts/eden-airplay-advertise.py"
 HELPER_PYTHON = Path("/usr/bin/python3")
 IPTV_DIRECT_HELPER = ROOT / "scripts/eden-iptv-direct.py"
 IPTV_DIRECT_MARKER = "iptv-direct-http.flag"
@@ -259,16 +258,6 @@ def preflight(args, state, nro):
             ["xdpyinfo", "-display", os.environ["DISPLAY"]],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-        if not HELPER.is_file():
-            raise ValueError(f"AirPlay discovery helper is missing: {HELPER}")
-        subprocess.run(
-            [
-                str(HELPER_PYTHON), "-c",
-                "import dbus; from gi.repository import GLib; "
-                "dbus.SystemBus().get_name_owner('org.freedesktop.Avahi')",
-            ],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             # Match the receiver socket: old connections in TIME_WAIT must
             # not prevent restarting an otherwise stopped emulator.
@@ -337,7 +326,6 @@ def launch(state, nro, interface, address, lock_fd, iptv_direct_http=False,
     logs.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     eden_log_path = logs / f"eden-desktop-{stamp}.log"
-    helper_log_path = logs / f"eden-discovery-{stamp}.log"
     direct_log_path = logs / f"eden-iptv-direct-{stamp}.log"
     environment = os.environ.copy()
     environment.update({
@@ -347,7 +335,7 @@ def launch(state, nro, interface, address, lock_fd, iptv_direct_http=False,
         "EDEN_STATE_DIR": str(state),
         "QT_QPA_PLATFORM": "xcb",
     })
-    eden = helper = None
+    eden = None
     direct = None
     direct_resources = contextlib.ExitStack()
     stop_requested = False
@@ -367,67 +355,22 @@ def launch(state, nro, interface, address, lock_fd, iptv_direct_http=False,
                 iptv_direct_session(state, interface, direct_log, iptv_direct_http_diagnostics))
             print(f"IPTV direct HTTP enabled; public IPv4 HTTP only; log: {direct_log_path}",
                   flush=True)
-        with eden_log_path.open("wb") as eden_log, helper_log_path.open("wb") as helper_log:
+        with eden_log_path.open("wb") as eden_log:
             eden = subprocess.Popen(
                 [str(EDEN), "-g", str(nro)], env=environment, cwd=ROOT,
                 stdout=eden_log, stderr=subprocess.STDOUT, start_new_session=True,
                 pass_fds=(lock_fd,),
             )
-            helper_command = [
-                str(HELPER_PYTHON), str(HELPER), "--pid", str(eden.pid),
-                "--interface", interface, "--address", address, "--port", "7000",
-            ]
             print(f"Eden PID {eden.pid}; desktop {environment['DISPLAY']}", flush=True)
             print(f"Eden log: {eden_log_path}", flush=True)
-            print(f"AirPlay discovery log: {helper_log_path}", flush=True)
-            print(
-                "Waiting for this NRO's AirPlay listener; choose No if Eden "
-                "asks for decryption keys.",
-                flush=True,
-            )
-            # The helper requires both PID-owned port 7000 and a complete /info.
-            # A first-run Qt modal may hold boot, so wait while the GUI lives.
-            last_error = None
+            print("AirPlay and DLNA discovery are provided by the NRO itself.", flush=True)
             while eden.poll() is None and not stop_requested:
                 if direct is not None and direct.poll() is not None:
                     raise RuntimeError("IPTV direct HTTP helper exited; stopping this Eden session.")
-                try:
-                    probe = subprocess.run(
-                        helper_command + ["--check"], cwd=ROOT,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=6,
-                    )
-                    if probe.returncode == 0:
-                        break
-                    if probe.stderr != last_error:
-                        helper_log.write(probe.stderr)
-                        helper_log.flush()
-                        last_error = probe.stderr
-                except subprocess.TimeoutExpired:
-                    pass
-                time.sleep(0.5)
-            if stop_requested or eden.poll() is not None:
-                return 130 if stop_requested else eden.returncode
-            helper = subprocess.Popen(
-                helper_command,
-                cwd=ROOT, stdout=helper_log, stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            warned = False
-            while eden.poll() is None and not stop_requested:
-                if direct is not None and direct.poll() is not None:
-                    raise RuntimeError("IPTV direct HTTP helper exited; stopping this Eden session.")
-                if helper.poll() is not None and not warned:
-                    print(
-                        f"AirPlay helper exited ({helper.returncode}); "
-                        f"see {helper_log_path}. Eden remains available.",
-                        file=sys.stderr, flush=True,
-                    )
-                    warned = True
                 time.sleep(0.25)
             return 130 if stop_requested else eden.returncode
     finally:
         # Signal only the subprocesses created by this launcher.
-        stop_child(helper)
         stop_child(eden)
         direct_resources.close()
         for number, handler in old_handlers.items():
@@ -439,7 +382,7 @@ def main():
         description=__doc__,
         epilog=(
             "Requires the Eden-compatible deko3d build of the NRO, a current X11 "
-            "desktop, iproute2, xdpyinfo, Avahi, python3-dbus and python3-gi. "
+            "desktop, iproute2 and xdpyinfo. "
             "No virtual desktop is created."
         ),
     )

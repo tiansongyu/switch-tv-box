@@ -34,11 +34,15 @@ switch/switch-tv-box/
   licenses/
 ```
 
-Release 同时提供 `switch-tv-box-v0.1.1-complete.zip`，包含 `sdmc/` 安装目录、
+Release 同时提供 `switch-tv-box-v0.1.2-complete.zip`，包含 `sdmc/` 安装目录、
 `source/` 完整已提交源码与离线规范、`manifest.json` 构建标识。安装时复制
 `sdmc/` 里面的内容到 SD 卡根目录；下载完整性可用 `SHA256SUMS.txt` 核对。
 
 使用 Atmosphère/homebrew 环境，推荐完整应用模式启动。手机与 Switch 连接同一局域网，在支持 AirPlay 的应用中选择 **Switch TV Box**。镜像需要配对时，输入电视上显示的 PIN。
+
+NRO 内置 DLNA（SSDP）与 AirPlay（mDNS）自动发现，无需电脑端发现程序或手动填写 IP。
+v0.1.2 修复了兼容标记关闭 AirPlay 公告、DLNA 组播接收与公告网卡不一致、
+以及繁忙局域网中定期公告被延迟的问题。
 
 **在 Eden 中运行需要额外的模拟器配置。** 下载的 NRO 包含图形界面，但只打开 NRO
 不会创建 Eden 兼容标记；缺少标记时，Eden 0.2.1 可能停在 `QUICK START` /
@@ -73,7 +77,7 @@ Release 同时提供 `switch-tv-box-v0.1.1-complete.zip`，包含 `sdmc/` 安装
 
 只跑测试：`./scripts/build-local.sh test`。只编译和打包：`./scripts/build-local.sh build`。VS Code 默认构建任务使用 Docker。完整说明见 [构建指南](docs/BUILD.md)。
 
-使用本机已有 Eden 在独立虚拟桌面运行实际 NRO：见 [模拟器启动与兼容说明](docs/EMULATOR.md)，包括独立 SD 配置、兼容 SDK 和局域网发现助手。
+使用本机已有 Eden 在独立虚拟桌面运行实际 NRO：见 [模拟器启动与兼容说明](docs/EMULATOR.md)，包括独立 SD 配置、兼容 SDK 和组播模拟限制。
 
 生成二十一种真实 UI 预览：`python3 scripts/preview_home.py`，输出到 `artifacts/ui/`。
 

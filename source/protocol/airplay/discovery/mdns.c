@@ -23,6 +23,8 @@
 #ifdef __SWITCH__
 #include <switch.h>
 
+#include "app/lan_address.h"
+#include "app/platform_compat.h"
 #include "log/log.h"
 
 typedef Thread AirPlayMdnsThread;
@@ -32,6 +34,7 @@ typedef void (*AirPlayMdnsThreadEntry)(void *argument);
 #define AIRPLAY_MDNS_LOG_ERROR(...) log_error(__VA_ARGS__)
 #define AIRPLAY_MDNS_LOG_INFO(...) log_info(__VA_ARGS__)
 #define AIRPLAY_MDNS_LOG_WARN(...) log_warn(__VA_ARGS__)
+#define AIRPLAY_MDNS_SELECT tvbox_socket_select
 #else
 #include <pthread.h>
 
@@ -42,6 +45,7 @@ typedef void *(*AirPlayMdnsThreadEntry)(void *argument);
 #define AIRPLAY_MDNS_LOG_ERROR(...) ((void)fprintf(stderr, __VA_ARGS__))
 #define AIRPLAY_MDNS_LOG_INFO(...) ((void)0)
 #define AIRPLAY_MDNS_LOG_WARN(...) ((void)fprintf(stderr, __VA_ARGS__))
+#define AIRPLAY_MDNS_SELECT select
 #endif
 
 #define AIRPLAY_MDNS_MULTICAST "224.0.0.251"
@@ -138,6 +142,7 @@ static void mdns_socket_close_fd(int socket_fd)
     network_diagnostics_socket_closed(NETWORK_DIAGNOSTIC_MDNS);
 }
 
+#ifndef __SWITCH__
 static int mdns_socket_connect(int socket_fd, const struct sockaddr *address,
                                socklen_t address_length)
 {
@@ -151,6 +156,7 @@ static int mdns_socket_connect(int socket_fd, const struct sockaddr *address,
         errno = saved_errno;
     return result;
 }
+#endif
 
 static void mdns_sleep_ms(unsigned int duration_ms)
 {
@@ -245,6 +251,9 @@ static void mdns_worker_heartbeat(void)
 
 static bool determine_local_address(uint32_t *address_out)
 {
+#ifdef __SWITCH__
+    return tvbox_lan_address(address_out);
+#else
     struct sockaddr_in remote;
     struct sockaddr_in local;
     socklen_t local_size = sizeof(local);
@@ -271,6 +280,7 @@ static bool determine_local_address(uint32_t *address_out)
         return false;
     *address_out = local.sin_addr.s_addr;
     return true;
+#endif
 }
 
 static size_t sanitize_label(const char *input, char *output, size_t capacity)
@@ -635,7 +645,9 @@ static AIRPLAY_MDNS_THREAD_RETURN mdns_thread(void *argument)
         AIRPLAY_TRACE_SYNC("[airplay] t_ms=%llu mdns worker announce done\n",
                            (unsigned long long)AIRPLAY_TRACE_NOW_MS());
     }
-    next_announcement = mdns_now_ms() + AIRPLAY_MDNS_ANNOUNCE_INTERVAL_MS;
+    /* Repeat one second later so losing the first Wi-Fi multicast frame does
+     * not leave the phone waiting for the periodic refresh. */
+    next_announcement = mdns_now_ms() + 1000u;
 
     while (atomic_load(&g_mdns.running))
     {
@@ -675,7 +687,7 @@ static AIRPLAY_MDNS_THREAD_RETURN mdns_thread(void *argument)
             NetworkOperationToken operation =
                 network_diagnostics_operation_begin(
                     NETWORK_DIAGNOSTIC_MDNS, NETWORK_OPERATION_SELECT);
-            result = select(socket_fd + 1, &read_set, NULL, NULL, &timeout);
+            result = AIRPLAY_MDNS_SELECT(socket_fd + 1, &read_set, NULL, NULL, &timeout);
             int saved_errno = result < 0 ? errno : 0;
 
             network_diagnostics_operation_end(&operation, saved_errno);
@@ -797,10 +809,14 @@ static bool create_socket(void)
                            (unsigned long long)AIRPLAY_TRACE_NOW_MS());
     }
     multicast_interface.s_addr = g_mdns.config.ipv4_address;
-    setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_IF,
-               &multicast_interface, sizeof(multicast_interface));
-    setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_TTL,
-               &multicast_ttl, sizeof(multicast_ttl));
+    failure_stage = "multicast-interface";
+    if (setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_IF,
+                   &multicast_interface, sizeof(multicast_interface)) != 0)
+        goto failure;
+    failure_stage = "multicast-ttl";
+    if (setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_TTL,
+                   &multicast_ttl, sizeof(multicast_ttl)) != 0)
+        goto failure;
     setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_LOOP,
                &multicast_loop, sizeof(multicast_loop));
     {

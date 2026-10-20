@@ -66,7 +66,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	switch-tv-box
 APP_TITLE	:=	Switch TV Box
 APP_AUTHOR	:=	Switch TV Box contributors; NX-Cast / Ode1l
-APP_VERSION	:=	0.1.1
+APP_VERSION	:=	0.1.2
 ICON		:=	assets/icon/switch-screencast-logo.jpg
 BUILD		:=	build
 SOURCES		:=	source \

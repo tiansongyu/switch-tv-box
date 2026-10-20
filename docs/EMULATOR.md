@@ -34,7 +34,8 @@ python3 scripts/run-eden.py --interface enp7s0
    如果提示缺少解密组件，对本项目自制 NRO 选择 **No**。
 
 该标记只用于 Eden，不应复制到实体 Switch。图形界面启动成功也不代表手机发现
-已自动配置；AirPlay 的局域网发现仍按下文使用启动器和 Avahi 助手。
+已自动配置。v0.1.2 起，NRO 自行发送 AirPlay 和 DLNA 发现公告，
+启动器不再自动启动 Avahi 发现助手。
 
 2026-10-21 在独立虚拟桌面对正式 v0.1.1 NRO 做过对照：SHA-256 为
 `41c0489f9a005000ec9bb2344e845e26f9f6b6ba28eb6a44c7469340b00fba4d`。
@@ -89,12 +90,12 @@ python3 scripts/run-eden-virtual.py --interface enp7s0
 
 包装器需要 `Xvfb`、`xauth` 和 `xdpyinfo`，使用临时认证文件并禁用 X11 TCP，
 不开放 VNC 端口。启动日志会显示 `DISPLAY` 和 `XAUTHORITY`，可用于该会话的
-截图与按键验证。退出时先关闭本次 Eden 和发现助手，再关闭自身的 Xvfb，
+截图与按键验证。退出时先关闭本次 Eden，再关闭自身的 Xvfb，
 不修改或终止其他桌面。需要在现有桌面运行时，直接调用 `run-eden.py`。
 
 `--interface` 必填，选择手机所在局域网的物理网卡。本机为 `enp7s0`；
 IPv4 会自动从该网卡读取，也可用 `--address` 明确指定。系统需要现有 Eden、
-`ip`、`xdpyinfo`、Avahi 服务、`python3-dbus` 和 `python3-gi`。
+`ip` 和 `xdpyinfo`。
 
 启动器从 `dist/switch-tv-box-sdmc.zip` 安装中文字体、DLNA 资源和许可证，
 并将 `--nro` 指定的文件（默认仓库根目录 `switch-tv-box.nro`）安装到模拟 SD。
@@ -147,7 +148,7 @@ AirPlay、DLNA 和实体 Switch 不启用这条路径。
 启动器会等到其 Eden 子进程拥有 7000 端口、实际 `/info` 响应可用后，
 启动 `scripts/eden-airplay-advertise.py`，在指定网卡上发布真实接收器发现记录。
 音频与控制仍由 NRO 处理。退出时仅清理本次创建的子进程和发现记录。
-模拟器和发现助手的独立日志写入 `artifacts/validation/`。
+模拟器日志写入 `artifacts/validation/`；发现服务由 NRO 自身运行。
 
 ## 已定位的 Eden GPU 缺陷
 
@@ -195,8 +196,9 @@ Eden 官方的
    Eden v0.2.1 对媒体状态 IPC 60 报未实现错误；此模式下由桌面系统管理休眠。
 2. 跳过 `audaInitialize()`。Eden 不提供 `aud:a` 服务，请求该服务会阻塞；
    播放器改用已有的 mpv 音量和静音控制路径。
-3. 关闭 NRO 内置 mDNS 广播，交由启动器的 Avahi 发现助手在选定 LAN 网卡发布。
-   Eden 的组播 socket 选项支持不完整；手机发现不能依赖这条模拟路径。
+3. 保留 NRO 内置 mDNS 广播；兼容标记不再关闭设备发现。
+   Eden 的组播 socket 选项支持不完整，因此模拟器不能替代实体 Switch 的
+   手机发现验收。启动器不再通过外部公告掩盖这项模拟器限制。
 4. 网络就绪检查使用即时轮询，并在应用线程中短暂休眠，避免阻塞 Eden
    数量有限的 BSD 服务线程。SSDP 直接接收有界 UDP 数据报，不依赖其未实现的
    `FIONREAD`，避免数据报始终未被消费造成高 CPU 占用。
@@ -207,8 +209,8 @@ Eden 官方的
    返回 `0xD401`。运行时诊断已确认释放的 `0x3C0000` 缓冲区与失败的栈页重叠。
 7. 使用 FFmpeg 软件解码视频，绕过此版本模拟器中出现绿屏和残留设备共享内存的
    nvtegra 帧表面路径。图形界面与视频呈现继续使用 GPU；实体 Switch 保留硬解码。
-8. DLNA 的 SSDP LOCATION 和设备描述 URLBase 使用所选物理网卡的地址，
-   避免宿主代理网卡的默认路由导致手机收到不可访问的接收地址。
+8. DLNA 与 AirPlay 均使用 NIFM 返回的局域网地址。此行为也用于实体 Switch，
+   不再通过访问公网的路由选择发现地址。
 
 首页的 IP 地址也改为每秒刷新，避免每帧重复查询网络服务。
 

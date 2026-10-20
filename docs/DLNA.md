@@ -28,6 +28,11 @@ DLNA 使用 UDP 1900 发现设备、TCP 49152 提供描述与控制；只验证�
 
 ## 本轮参考和修复
 
+v0.1.2 的发现修复直接位于 NRO 中：使用 NIFM 当前局域网地址生成 LOCATION
+和 URLBase，在同一接口加入 `239.255.255.250` 并发送公告；启动后间隔一秒重复
+公告，之后每 30 秒刷新，接收其他 SSDP 流量不会阻止刷新。AirPlay 同样保留内置
+mDNS，使用主机局域网地址，启动时重复公告。没有新增电脑端组件。
+
 参考本地 `~/github/wiliwili`，版本
 [`88e5876bea9502d06f46a8656e3530684d3aaf7d`](https://github.com/xfangfang/wiliwili/tree/88e5876bea9502d06f46a8656e3530684d3aaf7d)：
 

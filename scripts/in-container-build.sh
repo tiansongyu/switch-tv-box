@@ -9,7 +9,7 @@ if [[ "${TVBOX_ACTION:-release}" == test || "${TVBOX_ACTION:-release}" == releas
     # GCC 12 ASan can crash before main in PIE executables on high-ASLR hosts.
     # Keep ASan/UBSan enabled and use fixed executable mappings for host tests.
     # These flags do not affect the Switch executable or the host's ASLR policy.
-    PKG_CONFIG_PATH="$host_pc" make test-ui test-iptv-data test-airplay test-c-safety-sanitize \
+    PKG_CONFIG_PATH="$host_pc" make test-ui test-iptv-data test-airplay test-airplay-mdns-suspend test-c-safety-sanitize \
         HOST_SANITIZER_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie"
     sh scripts/test_airplay_photo.sh
     python3 scripts/test_dev_workflow.py

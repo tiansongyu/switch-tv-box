@@ -19,9 +19,9 @@
 #include <unistd.h>
 
 #include "app/network_diagnostics.h"
+#include "app/lan_address.h"
 #include "app/platform_compat.h"
 #include "log/log.h"
-#include "local_address.h"
 #include "protocol/dlna/server_info.h"
 
 #define SSDP_PORT 1900
@@ -199,19 +199,6 @@ static void ssdp_socket_close_fd(int socket_fd)
     network_diagnostics_socket_closed(NETWORK_DIAGNOSTIC_SSDP);
 }
 
-static int ssdp_connect(int socket_fd, const struct sockaddr *address,
-                        socklen_t address_length)
-{
-    NetworkOperationToken operation = network_diagnostics_operation_begin(
-        NETWORK_DIAGNOSTIC_SSDP, NETWORK_OPERATION_CONNECT);
-    int result = connect(socket_fd, address, address_length);
-    int saved_errno = result < 0 ? errno : 0;
-
-    network_diagnostics_operation_end(&operation, saved_errno);
-    if (result < 0)
-        errno = saved_errno;
-    return result;
-}
 
 static ssize_t ssdp_sendto(int socket_fd, const void *buffer, size_t length,
                            int flags, const struct sockaddr *address,
@@ -278,62 +265,13 @@ static char *ssdp_format_date_alloc(void)
     return strdup(buffer);
 }
 
-// Determine the outbound IPv4 address by connecting a dummy UDP socket.
+/* Share NIFM's LAN address with the device description and AirPlay records. */
 static bool determine_local_ip(char **out)
 {
-    if (g_ssdp.eden_compat)
-    {
-        *out = dlna_eden_local_address_alloc();
-        return *out != NULL;
-    }
-    int sock = ssdp_socket_create(AF_INET, SOCK_DGRAM, 0);
-    char *local_ip = NULL;
-    if (sock < 0)
-    {
-        log_error("[ssdp] create socket failed: %s (%d)\n", strerror(errno), errno);
+    if (!out)
         return false;
-    }
-
-    struct sockaddr_in remote;
-    memset(&remote, 0, sizeof(remote));
-    remote.sin_family = AF_INET;
-    remote.sin_port = htons(9);
-    remote.sin_addr.s_addr = inet_addr("8.8.8.8");
-
-    if (ssdp_connect(sock, (struct sockaddr *)&remote, sizeof(remote)) < 0)
-    {
-        log_error("[ssdp] connect failed: %s (%d)\n", strerror(errno), errno);
-        ssdp_socket_close_fd(sock);
-        return false;
-    }
-
-    struct sockaddr_in local;
-    socklen_t addr_len = sizeof(local);
-    if (getsockname(sock, (struct sockaddr *)&local, &addr_len) < 0)
-    {
-        log_error("[ssdp] getsockname failed: %s (%d)\n", strerror(errno), errno);
-        ssdp_socket_close_fd(sock);
-        return false;
-    }
-
-    local_ip = malloc(INET_ADDRSTRLEN);
-    if (!local_ip)
-    {
-        ssdp_socket_close_fd(sock);
-        return false;
-    }
-
-    if (!inet_ntop(AF_INET, &local.sin_addr, local_ip, INET_ADDRSTRLEN))
-    {
-        log_error("[ssdp] inet_ntop failed: %s (%d)\n", strerror(errno), errno);
-        ssdp_socket_close_fd(sock);
-        free(local_ip);
-        return false;
-    }
-
-    ssdp_socket_close_fd(sock);
-    *out = local_ip;
-    return true;
+    *out = tvbox_lan_address_alloc();
+    return *out != NULL;
 }
 
 static bool create_socket(SsdpState *state)
@@ -370,9 +308,15 @@ static bool create_socket(SsdpState *state)
         return false;
     }
 
-    struct ip_mreq mreq;
+    struct ip_mreq mreq = {0};
     mreq.imr_multiaddr.s_addr = inet_addr(SSDP_MULTICAST);
-    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (!state->local_ip ||
+        inet_pton(AF_INET, state->local_ip, &mreq.imr_interface) != 1)
+    {
+        log_error("[ssdp] no usable LAN address for multicast\n");
+        ssdp_socket_close_fd(socket_fd);
+        return false;
+    }
     if (setsockopt(socket_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq,
                    sizeof(mreq)) < 0)
     {
@@ -381,16 +325,24 @@ static bool create_socket(SsdpState *state)
         return false;
     }
 
-    if (state->local_ip && state->local_ip[0] != '\0')
+    if (setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_IF,
+                   &mreq.imr_interface, sizeof(mreq.imr_interface)) < 0)
     {
-        struct in_addr iface;
-        iface.s_addr = inet_addr(state->local_ip);
-        (void)setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_IF, &iface,
-                         sizeof(iface));
+        log_error("[ssdp] multicast interface failed: %s (%d)\n", strerror(errno), errno);
+        ssdp_socket_close_fd(socket_fd);
+        return false;
     }
 
     {
-        int loop = 0;
+        unsigned char ttl = 4;
+        unsigned char loop = 0;
+        if (setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl,
+                       sizeof(ttl)) < 0)
+        {
+            log_error("[ssdp] multicast TTL failed: %s (%d)\n", strerror(errno), errno);
+            ssdp_socket_close_fd(socket_fd);
+            return false;
+        }
         (void)setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop,
                          sizeof(loop));
     }
@@ -739,7 +691,8 @@ static void handle_packet(char *packet, ssize_t length, const struct sockaddr_in
 static void ssdp_thread(void *arg)
 {
     (void)arg;
-    uint64_t next_notify_ms = ssdp_now_ms();
+    send_alive_notifications();
+    uint64_t next_notify_ms = ssdp_now_ms() + 1000u;
     bool was_suspended = false;
 
     while (atomic_load(&g_ssdp.running))
@@ -783,16 +736,16 @@ static void ssdp_thread(void *arg)
         if (!atomic_load(&g_ssdp.running))
             break;
 
-        if (ret == 0)
+        /* Refresh even when other LAN devices continuously send SSDP traffic.
+         * Previously a busy socket could starve all periodic advertisements. */
+        uint64_t now_ms = ssdp_now_ms();
+        if (now_ms >= next_notify_ms)
         {
-            uint64_t now_ms = ssdp_now_ms();
-            if (now_ms >= next_notify_ms)
-            {
-                send_alive_notifications();
-                next_notify_ms = now_ms + SSDP_NOTIFY_INTERVAL_MS;
-            }
-            continue;
+            send_alive_notifications();
+            next_notify_ms = now_ms + SSDP_NOTIFY_INTERVAL_MS;
         }
+        if (ret == 0)
+            continue;
 
         if (FD_ISSET(socket_fd, &readfds))
         {
@@ -879,7 +832,6 @@ bool ssdp_start(const SsdpConfig *config)
     }
 
     g_ssdp.thread_started = true;
-    send_alive_notifications();
     log_info("[ssdp] Responder ready on %s\n", g_ssdp.location);
     return true;
 }

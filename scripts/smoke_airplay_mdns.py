@@ -211,6 +211,9 @@ def run_mode(server_binary: Path, legacy: bool) -> None:
             "_raop._tcp.local": raop_instance,
         }
         receive_services(monitor, services, 120, legacy=legacy)
+        # A phone can miss the initial Wi-Fi multicast frame. Both service
+        # records must be announced again without waiting for a query.
+        receive_services(monitor, services, 120, timeout=2.5, legacy=legacy)
 
         query = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         query.bind(("127.0.0.1", 0))

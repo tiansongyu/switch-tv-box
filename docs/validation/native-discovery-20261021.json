@@ -1,0 +1,109 @@
+{
+  "version": "0.1.2",
+  "date": "2026-10-21",
+  "nro_sha256": "c9053dc74ea963cce793627831c1bd5186bab0c376dd8a0dcd9328479f187511",
+  "build_command": "TVBOX_TOOLCHAIN_IMAGE=switch-tv-box/toolchain:eden-macros ./scripts/build-local.sh release",
+  "complete_build_and_regression_suite": "passed",
+  "native_socket_tests": {
+    "ssdp_real_multicast_search": "six renderer/service responses on loopback multicast",
+    "ssdp_nifm_address_and_socket_failures": "passed",
+    "mdns_startup_repeat_and_lifecycle": "passed",
+    "mdns_suspend_resume": "passed"
+  },
+  "actual_nro": {
+    "environment": "Eden 0.2.1; isolated Xvfb desktop; no external discovery helper",
+    "graphical_home": "IPTV / AirPlay / DLNA; v0.1.2",
+    "mdns_unicast_queries": [
+      "_airplay._tcp.local",
+      "_raop._tcp.local"
+    ],
+    "mdns_address_matches_nifm": true,
+    "ssdp_unicast_service_types": [
+      "urn:schemas-upnp-org:device:MediaRenderer:1",
+      "urn:schemas-upnp-org:service:AVTransport:1",
+      "upnp:rootdevice",
+      "uuid:5caf6a42-b730-402b-916f-d5033a74e6a9",
+      "urn:schemas-upnp-org:service:RenderingControl:1",
+      "urn:schemas-upnp-org:service:ConnectionManager:1"
+    ],
+    "description_urlbase_matches_ssdp": true,
+    "dlna_video_controls_passed": true,
+    "dlna_video_stages": [
+      {
+        "stage": "initial-play",
+        "state": "PLAYING",
+        "seconds": 0.0
+      },
+      {
+        "stage": "playing-after-3s",
+        "state": "PLAYING",
+        "seconds": 2.0
+      },
+      {
+        "stage": "pause-ack",
+        "state": "PAUSED_PLAYBACK",
+        "seconds": 2.0
+      },
+      {
+        "stage": "paused-start",
+        "state": "PAUSED_PLAYBACK",
+        "seconds": 2.0
+      },
+      {
+        "stage": "paused-after-1.3s",
+        "state": "PAUSED_PLAYBACK",
+        "seconds": 2.0
+      },
+      {
+        "stage": "seek-12.5s-paused",
+        "state": "PAUSED_PLAYBACK",
+        "seconds": 2.0
+      },
+      {
+        "stage": "seek-12.5s-paused",
+        "state": "PAUSED_PLAYBACK",
+        "seconds": 12.0
+      },
+      {
+        "stage": "resume",
+        "state": "PLAYING",
+        "seconds": 12.0
+      },
+      {
+        "stage": "resume-progress",
+        "state": "PLAYING",
+        "seconds": 14.0
+      },
+      {
+        "stage": "first-stop",
+        "state": "STOPPED",
+        "seconds": 0.0
+      },
+      {
+        "stage": "same-url-replay",
+        "state": "PLAYING",
+        "seconds": 0.0
+      },
+      {
+        "stage": "same-url-replay-progress",
+        "state": "PLAYING",
+        "seconds": 2.0
+      },
+      {
+        "stage": "final-stop",
+        "state": "STOPPED",
+        "seconds": 0.0
+      }
+    ]
+  },
+  "limits": [
+    "Physical Switch and phone end-to-end discovery has not been tested.",
+    "Eden SSDP multicast search returned no responses from this NRO; its unicast control and discovery paths passed.",
+    "Native host multicast tests do not validate Eden multicast forwarding or a physical Wi-Fi network."
+  ],
+  "reference": {
+    "wiliwili_commit": "88e5876bea9502d06f46a8656e3530684d3aaf7d",
+    "libpdr_commit": "9dd3ab920940adac013a3cf40e3a5805d7e193e1",
+    "libpdr_file": "src/ssdp.cpp"
+  }
+}

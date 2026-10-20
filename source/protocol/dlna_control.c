@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "app/platform_compat.h"
+#include "app/lan_address.h"
 #include "log/log.h"
 #include "protocol/dlna/control/event_server.h"
 #include "protocol/dlna/control/soap_server.h"
@@ -20,7 +21,6 @@
 #include "protocol/dlna/description/scpd.h"
 #include "protocol/dlna/description/template_resource.h"
 #include "protocol/dlna/discovery/ssdp.h"
-#include "protocol/dlna/discovery/local_address.h"
 #include "protocol/http/http_server.h"
 
 static bool g_dlnaRunning = false;
@@ -212,53 +212,7 @@ static void dlna_identity_ensure_loaded(void)
 
 static char *dlna_determine_local_ip_alloc(void)
 {
-    if (tvbox_eden_compat_enabled())
-        return dlna_eden_local_address_alloc();
-
-    int sock;
-    struct sockaddr_in remote;
-    struct sockaddr_in local;
-    socklen_t addr_len = sizeof(local);
-    char *local_ip;
-
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
-        return NULL;
-
-    memset(&remote, 0, sizeof(remote));
-    remote.sin_family = AF_INET;
-    remote.sin_port = htons(9);
-    remote.sin_addr.s_addr = inet_addr("8.8.8.8");
-
-    if (connect(sock, (struct sockaddr *)&remote, sizeof(remote)) < 0)
-    {
-        close(sock);
-        return NULL;
-    }
-
-    memset(&local, 0, sizeof(local));
-    if (getsockname(sock, (struct sockaddr *)&local, &addr_len) < 0)
-    {
-        close(sock);
-        return NULL;
-    }
-
-    local_ip = malloc(INET_ADDRSTRLEN);
-    if (!local_ip)
-    {
-        close(sock);
-        return NULL;
-    }
-
-    if (!inet_ntop(AF_INET, &local.sin_addr, local_ip, INET_ADDRSTRLEN))
-    {
-        free(local_ip);
-        close(sock);
-        return NULL;
-    }
-
-    close(sock);
-    return local_ip;
+    return tvbox_lan_address_alloc();
 }
 
 static char *dlna_build_url_base_alloc(uint16_t http_port)

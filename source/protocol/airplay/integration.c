@@ -889,10 +889,9 @@ static bool integration_start_sync(void)
     receiver_config.features = AIRPLAY_MDNS_FEATURES_MIRROR_COMPAT |
                                AIRPLAY_MDNS_FEATURE_VIDEO |
                                AIRPLAY_MDNS_FEATURE_HLS;
-    /* Eden stubs multicast interface/membership options. The desktop launcher
-     * publishes this live receiver via Avahi on the selected LAN interface. */
-    receiver_config.enable_discovery =
-        NXCAST_AIRPLAY_DISCOVERY_ENABLED != 0 && !tvbox_eden_compat_enabled();
+    /* A standalone NRO must advertise itself. GUI/audio compatibility flags
+     * must never silently make a running receiver invisible to the phone. */
+    receiver_config.enable_discovery = NXCAST_AIRPLAY_DISCOVERY_ENABLED != 0;
     receiver_config.pin_display_callback = integration_pin_display;
     receiver_config.pin_dismiss_callback = integration_pin_dismiss;
     receiver_config.transport_prepare_callback = integration_mirror_prepare;
