@@ -1,0 +1,29 @@
+--- a/source/MmeDocument.cpp
++++ b/source/MmeDocument.cpp
+@@ -108,11 +108,21 @@
+ 	fprintf(f, "#else\n");
+ 	fprintf(f, "static const uint32_t %s_SetupCmds[] = {\n", name);
+ 	fprintf(f, "#endif\n");
+-	fprintf(f, "\t0x%08X,\n", // MmeInstructionRamPointer+MmeInstructionRamLoad
+-		MakeCmdHeader(SubmissionMode::IncreaseOnce, 1+m_code.size(), subchannel, 0x45));
+-	fprintf(f, "\t0x%08X,\n", 0);
+-	for (size_t i = 0; i < m_code.size(); i ++)
+-		fprintf(f, "\t0x%08X,\n", m_code[i]);
++	// Preserve GPU instruction RAM and all entry addresses, while making every
++	// exported entry an explicit upload. Eden 0.2.1 otherwise rebases a suffix
++	// into a flat map while holding a reference invalidated by that insertion.
++	// Each upload must include the complete suffix: exported macros can jump
++	// past another exported entry to shared helper code (e.g. ClearColor).
++	for (const auto& entry : m_exports)
++	{
++		const size_t start = entry->second;
++		fprintf(f, "\t0x%08X,\n",
++			MakeCmdHeader(SubmissionMode::IncreaseOnce,
++				1+m_code.size()-start, subchannel, 0x45));
++		fprintf(f, "\t0x%08X,\n", static_cast<uint32_t>(start));
++		for (size_t i = start; i < m_code.size(); i ++)
++			fprintf(f, "\t0x%08X,\n", m_code[i]);
++	}
+ 	fprintf(f, "\t0x%08X,\n", // MmeStartAddressRamPointer+MmeStartAddressRamLoad
+ 		MakeCmdHeader(SubmissionMode::IncreaseOnce, 1+m_exports.size(), subchannel, 0x47));
+ 	fprintf(f, "\t0x%08X,\n", 0);

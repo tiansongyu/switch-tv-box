@@ -1,0 +1,24 @@
+ARG BASE_IMAGE=switch-tv-box/toolchain:local
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE_ID=unknown
+LABEL org.switch-tv-box.base-image-id="${BASE_IMAGE_ID}" \
+      org.switch-tv-box.deko3d.commit="5cc144dcf5606fbcd78430f6c62923546e5f9cf4" \
+      org.switch-tv-box.dekotools.commit="c15523cea963c04fad77a46f23c3a96d26a86ab9" \
+      org.switch-tv-box.eden-workaround="macro-entry-suffix-uploads-v1"
+
+# This derivative changes only its own deko3d libraries. The base image and
+# CloudTune/netease-switch toolchains are never modified.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      bison flex meson ninja-build patch && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY scripts/build_deko3d_eden_sdk.sh \
+     scripts/verify_deko_macro_upload.py \
+     scripts/patches/dekotools-macro-entry-suffix.patch \
+     /opt/switch-tv-box/eden-macros/
+
+RUN bash /opt/switch-tv-box/eden-macros/build_deko3d_eden_sdk.sh
+
+WORKDIR /workspace
