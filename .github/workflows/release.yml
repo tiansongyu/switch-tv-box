@@ -44,13 +44,38 @@ jobs:
             "${TOOLCHAIN_IMAGE}" \
             bash scripts/in-container-build.sh
 
-      - name: Create GitHub Release and upload assets
+      - name: Verify complete-release packaging
+        run: python3 scripts/test_package_complete_release.py
+
+      - name: Package complete source and runtime release
+        run: python3 scripts/package_complete_release.py
+
+      - name: Refuse to replace an already published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # draft:true preserves drafts, but the upload action also reuses
+          # published releases. Never replace an already validated public asset.
+          # Listing is authenticated and paginated; API failures abort this step.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name' \
+            > "${RUNNER_TEMP}/switch-tv-box-published-tags.txt"
+          if grep -Fxq -- "${RELEASE_TAG}" "${RUNNER_TEMP}/switch-tv-box-published-tags.txt"; then
+            echo "::error::This tag already has a published release; asset replacement is forbidden."
+            exit 1
+          fi
+
+      - name: Create draft GitHub Release and upload assets
         uses: softprops/action-gh-release@v3
         with:
           name: switch-tv-box ${{ github.ref_name }} - DLNA + IPTV + AirPlay 1
+          draft: true
           body_path: .github/release-notes.md
           generate_release_notes: true
           overwrite_files: true
           fail_on_unmatched_files: true
           files: |
             dist/switch-tv-box-sdmc.zip
+            dist/switch-tv-box-v*-complete.zip
+            dist/SHA256SUMS.txt

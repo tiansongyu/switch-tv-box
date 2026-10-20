@@ -23,5 +23,5 @@ else
 fi
 # One transaction: no orphan release tag if main is rejected as non-fast-forward.
 git push --atomic origin HEAD:refs/heads/main "refs/tags/$tag:refs/tags/$tag"
-echo "[release] Pushed main and $tag. GitHub Actions will build and publish switch-tv-box-sdmc.zip."
-echo '[release] Push success is not build success; check the Release workflow on GitHub.'
+echo "[release] Pushed main and $tag. GitHub Actions will build the SD and complete ZIPs in a draft release."
+echo '[release] Check the Release workflow and verify the uploaded artifacts before publishing the draft.'
