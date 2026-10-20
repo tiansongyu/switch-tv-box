@@ -97,6 +97,252 @@ class RelayTests(unittest.TestCase):
         self.connector.side_effect = lambda *_: socket.create_connection(peer.getsockname(), 3)
         return accepted, worker
 
+    def fixture_sequence(self, responses):
+        accepted, errors = [], []
+        peer = socket.socket()
+        peer.bind(("127.0.0.1", 0))
+        peer.listen(4)
+        peer.settimeout(3)
+        self.addCleanup(peer.close)
+
+        def serve():
+            try:
+                for response in responses:
+                    with peer.accept()[0] as client:
+                        client.settimeout(3)
+                        request = b""
+                        while b"\r\n\r\n" not in request:
+                            request += client.recv(4096)
+                        accepted.append(request)
+                        response(client, request)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        self.addCleanup(worker.join, 3)
+        self.connector.side_effect = lambda *_: socket.create_connection(peer.getsockname(), 3)
+        return accepted, errors, worker
+
+    @staticmethod
+    def media_header(length, start=None, *, etag=b'"same-entity"', extra=b""):
+        status = b"200 OK" if start is None else b"206 Partial Content"
+        remaining = length if start is None else length - start
+        ranged = b"" if start is None else f"Content-Range: bytes {start}-{length-1}/{length}\r\n".encode()
+        return (b"HTTP/1.1 " + status + b"\r\nContent-Type: video/mp2t\r\n"
+                + f"Content-Length: {remaining}\r\n".encode()
+                + ranged + b"ETag: " + etag + b"\r\n" + extra
+                + b"Connection: close\r\n\r\n")
+
+    def test_truncated_media_resumes_exact_unaligned_offset_without_headers(self):
+        payload = bytes(range(256)) * 2048
+        offset = 10003  # Deliberately not an MPEG-TS packet boundary.
+        for first_status in (200, 206):
+            with self.subTest(first_status=first_status):
+                original = self.media_header(
+                    len(payload), 0 if first_status == 206 else None,
+                    extra=b"Accept-Ranges: bytes\r\n" if first_status == 200 else b"")
+
+                def initial(client, _request):
+                    client.sendall(original + payload[:offset])
+
+                def resumed(client, request):
+                    self.assertIn(f"Range: bytes={offset}-{len(payload)-1}\r\n".encode(), request)
+                    self.assertEqual(request.count(b"Range:"), 2)  # Range plus If-Range.
+                    self.assertIn(b'If-Range: "same-entity"\r\n', request)
+                    self.assertIn(b"Accept-Encoding: identity\r\n", request)
+                    client.sendall(self.media_header(len(payload), offset) + payload[offset:])
+
+                accepted, errors, worker = self.fixture_sequence([initial, resumed])
+                reply = self.request(
+                    b"GET http://74.91.26.218/a.ts?key=private HTTP/1.1\r\n"
+                    b"rAnGe: bytes=0-\r\niF-RaNgE: \"old\"\r\nAccept-Encoding: gzip\r\n\r\n")
+                worker.join(3)
+                self.assertFalse(errors, errors)
+                self.assertEqual(len(accepted), 2)
+                self.assertEqual(reply, original + payload)
+                self.connector.reset_mock()
+
+    def test_slow_media_reconnects_before_idle_timeout(self):
+        payload = b"abcdefgh" * 65536
+        offset = 8192
+        records = []
+        self.server.diagnostics = True
+        self.server.diagnostic_sink = records.append
+
+        def slow(client, _request):
+            client.sendall(self.media_header(len(payload), 0) + payload[:offset])
+            # Hold a still-open origin; the receive poll must wake and reconnect.
+            self.assertEqual(client.recv(1), b"")
+
+        def resumed(client, request):
+            self.assertIn(f"Range: bytes={offset}-{len(payload)-1}".encode(), request)
+            client.sendall(self.media_header(len(payload), offset) + payload[offset:])
+
+        _accepted, errors, worker = self.fixture_sequence([slow, resumed])
+        with mock.patch.object(relay, "SLOW_WINDOW_SECONDS", 0.10):
+            started = time.monotonic()
+            reply = self.request(b"GET http://74.91.26.218/a.ts HTTP/1.1\r\n\r\n")
+            self.assertLess(time.monotonic() - started, 1.5)
+        worker.join(3)
+        self.assertFalse(errors, errors)
+        self.assertEqual(reply.split(b"\r\n\r\n", 1)[1], payload)
+        retries = [item for item in records if item["event"] == "resume"]
+        self.assertEqual([(item["offset"], item["reason"]) for item in retries],
+                         [(offset, "upstream-low-speed")])
+        closed = [item for item in records if item["event"] == "closed"][-1]
+        self.assertTrue(closed["body_complete"])
+        self.assertEqual(closed["body_bytes"], len(payload))
+        self.assertEqual(closed["resume_attempts"], 1)
+
+    def test_invalid_resumed_range_or_entity_never_enters_original_body(self):
+        length, offset = 524288, 10003
+        original = self.media_header(length, 0)
+        cases = [
+            self.media_header(length, offset + 1),
+            self.media_header(length + 1, offset),
+            self.media_header(length, offset, etag=b'"different"'),
+            self.media_header(length, offset, etag=b'W/"same-entity"'),
+            self.media_header(length, offset, extra=b'ETag: "same-entity"\r\n'),
+            self.media_header(length, offset, extra=b"Content-Encoding: gzip\r\n"),
+            self.media_header(length, offset).replace(b"video/mp2t", b"multipart/byteranges"),
+            self.media_header(length, offset, extra=b"Content-Type: video/mp2t\r\n"),
+            self.media_header(length, None, extra=b"Accept-Ranges: bytes\r\n"),
+            b"HTTP/1.1 302 Found\r\nContent-Length: 4\r\n\r\n",
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 4\r\n\r\n",
+        ]
+        for invalid in cases:
+            with self.subTest(invalid=invalid[:60]):
+                accepted, errors, worker = self.fixture_sequence([
+                    lambda client, _: client.sendall(original + b"a" * offset),
+                    lambda client, _: client.sendall(invalid + b"EVIL"),
+                ])
+                reply = self.request(b"GET http://74.91.26.218/a.ts HTTP/1.1\r\n\r\n")
+                worker.join(3)
+                self.assertFalse(errors, errors)
+                self.assertEqual(len(accepted), 2)
+                self.assertEqual(reply, original + b"a" * offset)
+                self.connector.reset_mock()
+
+    def test_resumed_header_trickle_has_total_deadline(self):
+        length, offset = 524288, 10003
+        records = []
+        self.server.diagnostics = True
+        self.server.diagnostic_sink = records.append
+        original = self.media_header(length, 0)
+
+        def drip_headers(client, _request):
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                for byte in self.media_header(length, offset):
+                    client.sendall(bytes([byte]))
+                    time.sleep(0.02)
+
+        accepted, errors, worker = self.fixture_sequence([
+            lambda client, _: client.sendall(original + b"a" * offset), drip_headers,
+        ])
+        with mock.patch.object(relay, "SLOW_WINDOW_SECONDS", 0.10):
+            started = time.monotonic()
+            reply = self.request(b"GET http://74.91.26.218/a.ts HTTP/1.1\r\n\r\n")
+            self.assertLess(time.monotonic() - started, 1)
+        worker.join(3)
+        self.assertFalse(errors, errors)
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual(reply, original + b"a" * offset)
+        closed = [item for item in records if item["event"] == "closed"][-1]
+        self.assertEqual(closed["reason"], "resume-header-timeout")
+
+    def test_resume_attempts_are_bounded_to_two(self):
+        length, step = 524288, 10003
+        records = []
+        self.server.diagnostics = True
+        self.server.diagnostic_sink = records.append
+        responses = [
+            lambda client, _: client.sendall(self.media_header(length, 0) + b"a" * step),
+            lambda client, _: client.sendall(self.media_header(length, step) + b"b" * step),
+            lambda client, _: client.sendall(self.media_header(length, step * 2) + b"c" * step),
+        ]
+        accepted, errors, worker = self.fixture_sequence(responses)
+        reply = self.request(b"GET http://74.91.26.218/a.ts HTTP/1.1\r\n\r\n")
+        worker.join(3)
+        self.assertFalse(errors, errors)
+        self.assertEqual(len(accepted), 3)
+        self.assertEqual(reply.split(b"\r\n\r\n", 1)[1], b"a" * step + b"b" * step + b"c" * step)
+        closed = [item for item in records if item["event"] == "closed"][-1]
+        self.assertEqual(closed["reason"], "resume-limit")
+        self.assertEqual(closed["resume_attempts"], 2)
+        self.assertFalse(closed["body_complete"])
+
+    def test_non_resumable_responses_do_not_reconnect(self):
+        length = 524288
+        valid = self.media_header(length, 0)
+        cases = [
+            valid.replace(b'"same-entity"', b'W/"same-entity"'),
+            valid.replace(b'ETag: "same-entity"\r\n', b""),
+            valid.replace(b"video/mp2t", b"application/vnd.apple.mpegurl"),
+            valid.replace(b"Connection: close", b"Content-Encoding: gzip\r\nConnection: close"),
+            self.media_header(length, None),  # 200 without Accept-Ranges.
+            self.media_header(length, 1),  # Partial initial range is intentionally out of scope.
+            self.media_header(100, 0),  # Small playlist-sized response.
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ]
+        for response in cases:
+            with self.subTest(response=response[:60]):
+                self.fixture_upstream(response)
+                self.request(b"GET http://74.91.26.218/a.ts HTTP/1.1\r\n\r\n")
+                self.connector.assert_called_once()
+                self.connector.reset_mock()
+        self.fixture_upstream(valid)
+        self.request(b"HEAD http://74.91.26.218/a.ts HTTP/1.1\r\n\r\n")
+        self.connector.assert_called_once()
+
+    def test_slow_window_excludes_downstream_backpressure_time(self):
+        monitor = relay.SlowTransfer()
+        with mock.patch.object(relay.time, "monotonic", return_value=10000000):
+            # Arbitrary wall-clock/client-write time is not part of this clock.
+            for _ in range(64):
+                monitor.observe(0.001, 1024)
+            self.assertFalse(monitor.slow())
+            monitor.observe(relay.SLOW_WINDOW_SECONDS, 0)
+            self.assertTrue(monitor.slow())
+        for _ in range(10000):
+            monitor.observe(0.00001, 1)
+        self.assertLessEqual(len(monitor.samples), 34)
+
+    def test_slow_client_writes_do_not_trigger_an_upstream_retry(self):
+        payload = b"media" * 65536
+        records = []
+        self.server.diagnostics = True
+        self.server.diagnostic_sink = records.append
+        original_handle = self.server.handle
+
+        class DelayedClient:
+            def __init__(self, sock):
+                self.sock = sock
+
+            def __getattr__(self, name):
+                return getattr(self.sock, name)
+
+            def sendall(self, value):
+                time.sleep(0.025)
+                return self.sock.sendall(value)
+
+        def handle(client, sequence):
+            delayed = DelayedClient(client)
+            with self.server.lock:
+                self.server.sockets.discard(client)
+                self.server.sockets.add(delayed)
+            original_handle(delayed, sequence)
+
+        self.server.handle = handle
+        self.fixture_upstream(self.media_header(len(payload), 0) + payload)
+        with mock.patch.object(relay, "SLOW_WINDOW_SECONDS", 0.05):
+            reply = self.request(b"GET http://74.91.26.218/a.ts HTTP/1.1\r\n\r\n")
+        self.assertEqual(reply.split(b"\r\n\r\n", 1)[1], payload)
+        self.connector.assert_called_once()
+        closed = [item for item in records if item["event"] == "closed"][-1]
+        self.assertGreater(closed["client_write_ms"], 100)
+        self.assertEqual(closed["resume_attempts"], 0)
+
     def test_range_binary_body_status_and_query_are_preserved(self):
         payload = bytes(range(256)) * 1027
         response = (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 9-262920/900000\r\n"

@@ -6,6 +6,7 @@ URL rewriting, redirect following, caching, or request/token logging.
 """
 
 import argparse
+from collections import deque
 import contextlib
 import ipaddress
 import json
@@ -25,6 +26,10 @@ HEADER_LIMIT = 16 * 1024
 CONNECT_TIMEOUT = 5
 IDLE_TIMEOUT = 90
 DIAGNOSTIC_REQUEST_LIMIT = 1024
+RESUME_MIN_BYTES = 256 * 1024
+RESUME_MAX_ATTEMPTS = 2
+SLOW_WINDOW_SECONDS = 8
+SLOW_BYTES_PER_SECOND = 128 * 1024
 BLOCKED_NETWORKS = tuple(ipaddress.IPv4Network(value) for value in (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
     "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
@@ -238,8 +243,11 @@ class HTTPResponse:
         self.complete = False
         self.chunk = None
         self.informational = 0
+        self.fields = {}
+        self.last_body = b""
 
     def feed(self, data):
+        self.last_body = b""
         output = bytearray()
         while self.mode is None:
             self.headers.extend(data)
@@ -261,6 +269,7 @@ class HTTPResponse:
                 raise ResponseError("unsupported-response-status")
             kept = []
             lengths, transfers = [], []
+            fields = {}
             for line in lines[1:]:
                 name, separator, value = line.partition(b":")
                 if not separator or not HEADER_NAME.fullmatch(name) or any(
@@ -268,6 +277,7 @@ class HTTPResponse:
                 ):
                     raise ResponseError("invalid-response-header")
                 name = name.lower()
+                fields.setdefault(name, []).append(value.strip())
                 if name == b"content-length":
                     lengths.append(value.strip())
                 if name == b"transfer-encoding":
@@ -281,6 +291,7 @@ class HTTPResponse:
                 output.extend(header + b"\r\n\r\n")
                 continue
             self.status = status
+            self.fields = fields
             if lengths:
                 if len(lengths) != 1 or not re.fullmatch(rb"[0-9]{1,20}", lengths[0]):
                     raise ResponseError("invalid-content-length")
@@ -315,7 +326,8 @@ class HTTPResponse:
             else:
                 count = len(data)
             self.body_bytes += count
-            output.extend(data[:count])
+            self.last_body = data[:count]
+            output.extend(self.last_body)
         return bytes(output)
 
     def eof(self):
@@ -323,6 +335,100 @@ class HTTPResponse:
             self.complete = True
         elif not self.complete:
             raise ResponseError("upstream-truncated")
+
+
+def single_field(response, name):
+    values = response.fields.get(name, [])
+    return values[0] if len(values) == 1 else None
+
+
+def identity_response(response):
+    return (b"content-encoding" not in response.fields
+            or single_field(response, b"content-encoding") == b"identity")
+
+
+def response_range(response):
+    value = single_field(response, b"content-range") or b""
+    match = re.fullmatch(rb"bytes ([0-9]{1,20})-([0-9]{1,20})/([0-9]{1,20})", value)
+    if not match:
+        return None
+    start, end, total = map(int, match.groups())
+    if not 0 <= start <= end < total or end - start + 1 != response.content_length:
+        return None
+    return start, end, total
+
+
+class ResumePolicy:
+    """Join only byte-identical, strongly validated ranges of one media entity."""
+    def __init__(self, response):
+        self.etag = single_field(response, b"etag")
+        self.length = response.content_length
+        self.media_type = single_field(response, b"content-type").split(b";")[0].lower()
+
+    @classmethod
+    def for_response(cls, response, request):
+        if (not request.startswith(b"GET ") or response.mode != "content-length"
+                or response.content_length < RESUME_MIN_BYTES
+                or not identity_response(response)):
+            return None
+        etag = single_field(response, b"etag") or b""
+        if not re.fullmatch(rb'"[\x21\x23-\x7e\x80-\xff]*"', etag):
+            return None
+        media_type = (single_field(response, b"content-type") or b"").split(b";")[0].lower()
+        if not (media_type.startswith((b"video/", b"audio/"))
+                or media_type in (b"application/octet-stream", b"application/mp4")):
+            return None
+        if response.status == 206:
+            # A correct full-entity 206 itself proves byte-range support.
+            if response_range(response) != (0, response.content_length - 1,
+                                            response.content_length):
+                return None
+        elif (response.status != 200 or single_field(response, b"accept-ranges") != b"bytes"
+              or b"content-range" in response.fields):
+            return None
+        return cls(response)
+
+    def request(self, original, delivered):
+        lines = original.split(b"\r\n")
+        kept = [line for line in lines[1:] if line and line.partition(b":")[0].lower()
+                not in (b"range", b"if-range", b"accept-encoding")]
+        return (lines[0] + b"\r\n" + b"".join(line + b"\r\n" for line in kept)
+                + f"Range: bytes={delivered}-{self.length - 1}\r\n".encode()
+                + b"If-Range: " + self.etag + b"\r\nAccept-Encoding: identity\r\n\r\n")
+
+    def validate(self, response, delivered):
+        media_types = response.fields.get(b"content-type", [])
+        if (response.status != 206 or response.mode != "content-length"
+                or not identity_response(response)
+                or single_field(response, b"etag") != self.etag
+                or (media_types and (len(media_types) != 1
+                    or media_types[0].split(b";")[0].lower() != self.media_type))
+                or response_range(response) != (delivered, self.length - 1, self.length)):
+            raise ResponseError("resume-response-mismatch")
+
+
+class SlowTransfer:
+    """An eight-second receive-wait window; downstream writes consume no time."""
+    def __init__(self):
+        self.wait = 0.0
+        self.samples = deque()
+
+    def observe(self, wait, count):
+        self.wait += wait
+        # Coalescing bounds storage even when the origin sends tiny TCP writes.
+        bucket = int(self.wait * 4)
+        if self.samples and self.samples[-1][0] == bucket:
+            old = self.samples.pop()
+            count += old[2]
+        self.samples.append((bucket, self.wait, count))
+        cutoff = self.wait - SLOW_WINDOW_SECONDS
+        while self.samples and self.samples[0][1] <= cutoff:
+            self.samples.popleft()
+
+    def slow(self):
+        return (self.wait >= SLOW_WINDOW_SECONDS
+                and sum(sample[2] for sample in self.samples)
+                < SLOW_WINDOW_SECONDS * SLOW_BYTES_PER_SECOND)
 
 
 class DirectHTTPServer:
@@ -369,6 +475,13 @@ class DirectHTTPServer:
         upstream = None
         response_started = False
         response = None
+        active_response = None
+        resume_policy = None
+        resume_attempts = 0
+        resume_validated = True
+        resume_header_deadline = None
+        slow_transfer = None
+        body_forwarded = 0
         started = time.monotonic()
         connect_ms = first_byte_ms = None
         received = forwarded = 0
@@ -382,6 +495,7 @@ class DirectHTTPServer:
             client.settimeout(IDLE_TIMEOUT)
             address, port, outgoing = read_request(client)
             response = HTTPResponse(head=outgoing.startswith(b"HEAD "))
+            active_response = response
             phase = "upstream-connect"
             before = time.monotonic()
             upstream = self.connector(self.interface, address, port)
@@ -395,34 +509,126 @@ class DirectHTTPServer:
             phase = "upstream-write"
             upstream.sendall(outgoing)
             sent_at = time.monotonic()
-            while not self.stopped.is_set() and not response.complete:
+            while not self.stopped.is_set() and not active_response.complete:
                 phase = "upstream-read"
+                if not resume_validated:
+                    remaining = resume_header_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ResponseError("resume-header-timeout")
+                    upstream.settimeout(min(1, remaining))
                 before = time.monotonic()
+                failure = None
+                data = None
                 try:
                     data = upstream.recv(64 * 1024)
+                except TimeoutError:
+                    if resume_policy and resume_validated:
+                        failure = "upstream-poll"
+                    elif resume_header_deadline is not None:
+                        if time.monotonic() >= resume_header_deadline:
+                            raise ResponseError("resume-header-timeout")
+                        continue
+                    else:
+                        raise
+                except OSError:
+                    if resume_policy and resume_validated:
+                        failure = "upstream-read-error"
+                    else:
+                        raise
                 finally:
-                    upstream_wait_ms += (time.monotonic() - before) * 1000
-                if not data:
-                    response.eof()
-                    reason = "upstream-eof"
-                    break
-                received += len(data)
-                if first_byte_ms is None:
-                    first_byte_ms = round((time.monotonic() - sent_at) * 1000, 3)
-                    self.diagnostic(sequence, "first-byte", ttfb_ms=first_byte_ms)
-                outgoing_data = response.feed(data)
-                status = response.status
-                if outgoing_data:
-                    phase = "client-write"
-                    before = time.monotonic()
-                    response_started = True
+                    receive_wait = time.monotonic() - before
+                    upstream_wait_ms += receive_wait * 1000
+                if not resume_validated and time.monotonic() >= resume_header_deadline:
+                    raise ResponseError("resume-header-timeout")
+                if data == b"":
                     try:
-                        client.sendall(outgoing_data)
-                    finally:
-                        client_write_ms += (time.monotonic() - before) * 1000
-                    forwarded += len(outgoing_data)
-                if response.complete:
+                        active_response.eof()
+                    except ResponseError:
+                        if resume_policy and resume_validated:
+                            failure = "upstream-truncated"
+                        else:
+                            raise
+                    if active_response.complete:
+                        reason = "upstream-eof"
+                        break
+                if data:
+                    received += len(data)
+                    if first_byte_ms is None:
+                        first_byte_ms = round((time.monotonic() - sent_at) * 1000, 3)
+                        self.diagnostic(sequence, "first-byte", ttfb_ms=first_byte_ms)
+                    outgoing_data = active_response.feed(data)
+                    status = response.status
+                    if resume_attempts:
+                        # Never expose a retry's headers or bytes before checking
+                        # its identity and exact range, even in the same recv().
+                        if active_response.mode is None:
+                            continue
+                        if not resume_validated:
+                            resume_policy.validate(active_response, body_forwarded)
+                            resume_validated = True
+                            slow_transfer = SlowTransfer()
+                            receive_wait = 0
+                            upstream.settimeout(min(1, SLOW_WINDOW_SECONDS))
+                            self.diagnostic(sequence, "resume-validated",
+                                            attempt=resume_attempts, offset=body_forwarded)
+                        outgoing_data = active_response.last_body
+                    elif resume_policy is None and response.mode is not None:
+                        resume_policy = ResumePolicy.for_response(response, outgoing)
+                        if resume_policy:
+                            slow_transfer = SlowTransfer()
+                            receive_wait = 0
+                            upstream.settimeout(min(1, SLOW_WINDOW_SECONDS))
+                            self.diagnostic(sequence, "resumable", content_length=response.content_length)
+                    if outgoing_data:
+                        phase = "client-write"
+                        before = time.monotonic()
+                        response_started = True
+                        try:
+                            client.sendall(outgoing_data)
+                        finally:
+                            client_write_ms += (time.monotonic() - before) * 1000
+                        forwarded += len(outgoing_data)
+                        body_forwarded += len(active_response.last_body)
+                if active_response.complete:
                     reason = "framing-complete"
+                    break
+                if slow_transfer and resume_validated:
+                    slow_transfer.observe(receive_wait, len(active_response.last_body) if data else 0)
+                    if failure == "upstream-poll" and not slow_transfer.slow():
+                        continue
+                    if failure == "upstream-poll" or slow_transfer.slow():
+                        failure = "upstream-low-speed"
+                if failure:
+                    if self.stopped.is_set():
+                        break
+                    if not resume_policy or not 0 <= body_forwarded < resume_policy.length:
+                        raise ResponseError(failure)
+                    if resume_attempts >= RESUME_MAX_ATTEMPTS:
+                        raise ResponseError("resume-limit")
+                    resume_attempts += 1
+                    self.diagnostic(sequence, "resume", attempt=resume_attempts,
+                                    offset=body_forwarded, reason=failure,
+                                    upstream_wait_ms=round(upstream_wait_ms, 3),
+                                    client_write_ms=round(client_write_ms, 3))
+                    with self.lock:
+                        self.sockets.discard(upstream)
+                    upstream.close()
+                    upstream = None
+                    phase = "resume-connect"
+                    upstream = self.connector(self.interface, address, port)
+                    with self.lock:
+                        self.sockets.add(upstream)
+                    if self.stopped.is_set():
+                        break
+                    # Header acquisition is bounded too; an unvalidated retry
+                    # must never keep the original downstream waiting 90 s.
+                    upstream.settimeout(SLOW_WINDOW_SECONDS)
+                    phase = "resume-write"
+                    upstream.sendall(resume_policy.request(outgoing, body_forwarded))
+                    active_response = HTTPResponse()
+                    resume_validated = False
+                    resume_header_deadline = time.monotonic() + SLOW_WINDOW_SECONDS
+                    slow_transfer = None
         except RequestError as error:
             status = error.status
             reason = "request-rejected"
@@ -449,8 +655,10 @@ class DirectHTTPServer:
                 upstream_bytes=received, forwarded_bytes=forwarded,
                 status=status, framing=response.mode if response else None,
                 content_length=response.content_length if response else None,
-                body_bytes=response.body_bytes if response else 0,
-                body_complete=response.complete if response else False,
+                body_bytes=body_forwarded,
+                body_complete=(body_forwarded == resume_policy.length if resume_policy
+                               else response.complete if response else False),
+                resume_attempts=resume_attempts,
                 reason="server-stop" if self.stopped.is_set() else reason,
                 errno=error_number,
             )
