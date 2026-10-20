@@ -316,6 +316,11 @@ endif
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+# Transparent SVC/NvMap forwarding; diagnostics only run with the Eden SD marker.
+LDFLAGS	+=	-Wl,--wrap=svcMapMemory,--wrap=svcCreateThread,--wrap=nvMapClose
+# Eden-only socket flag/timeout ABI conversion; native console calls pass through.
+LDFLAGS	+=	-Wl,--wrap=socket,--wrap=setsockopt
+LDFLAGS	+=	-Wl,--wrap=audrenInitialize,--wrap=audrvCreate,--wrap=audrenStartAudioRenderer,--wrap=svcCreateTransferMemory,--wrap=audrvUpdate
 
 LIBS	:= -lnx -lm
 

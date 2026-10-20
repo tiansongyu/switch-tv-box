@@ -8,10 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define LOG_QUEUE_CAPACITY 2048
 #define LOG_HISTORY_CAPACITY 4096
 #define LOG_WORKER_STACK_SIZE (32 * 1024)
+#define EDEN_ERROR_FILE_LIMIT (1024 * 1024)
 
 typedef struct
 {
@@ -214,9 +216,58 @@ static void write_line_to_mirror(const char *line, bool mirror_to_socket,
     mutexUnlock(&g_logMutex);
 }
 
+/* Called only by the log worker. Never log failures from this sink: close it
+ * permanently for this run rather than recursively enqueueing or retrying I/O. */
+static void write_eden_error_line(FILE **file, size_t *bytes, const char *line)
+{
+    if (!*file || *bytes >= EDEN_ERROR_FILE_LIMIT)
+        return;
+
+    char prefix[48];
+    int length = snprintf(prefix, sizeof(prefix), "%llu ms ",
+                          (unsigned long long)log_monotonic_ms());
+    if (length < 0 || (size_t)length >= sizeof(prefix))
+        goto failed;
+
+    size_t remaining = EDEN_ERROR_FILE_LIMIT - *bytes;
+    size_t prefix_size = (size_t)length < remaining ? (size_t)length : remaining;
+    if (fwrite(prefix, 1, prefix_size, *file) != prefix_size)
+        goto failed;
+    *bytes += prefix_size;
+    remaining -= prefix_size;
+
+    if (remaining)
+    {
+        /* Reserve a newline and bound even a single unexpectedly large line. */
+        size_t text_size = 0;
+        while (text_size < remaining - 1 && line[text_size])
+            ++text_size;
+        if (fwrite(line, 1, text_size, *file) != text_size)
+            goto failed;
+        *bytes += text_size;
+        if (fputc('\n', *file) == EOF)
+            goto failed;
+        ++*bytes;
+    }
+    if (fflush(*file) != 0)
+        goto failed;
+    if (*bytes < EDEN_ERROR_FILE_LIMIT)
+        return;
+
+failed:
+    fclose(*file);
+    *file = NULL;
+}
+
 static void log_worker_thread(void *arg)
 {
     (void)arg;
+    FILE *eden_errors = NULL;
+    size_t eden_error_bytes = 0;
+    /* Clear the previous run even when this run has no errors. The marker's
+     * parent directory is prepared by the desktop launcher before startup. */
+    if (access("sdmc:/switch/switch-tv-box/eden-compat.flag", F_OK) == 0)
+        eden_errors = fopen("sdmc:/switch/switch-tv-box/eden-errors.log", "w");
 
     while (true)
     {
@@ -258,6 +309,10 @@ static void log_worker_thread(void *arg)
 
         if (line)
         {
+            /* Keep rare startup failures available to desktop diagnostics.
+             * Only this worker writes the file; normal Switch runs never do. */
+            if (strncmp(line, "[ERROR]", 7) == 0)
+                write_eden_error_line(&eden_errors, &eden_error_bytes, line);
             mutexLock(&g_logMutex);
             append_history_locked(line);
             mutexUnlock(&g_logMutex);
@@ -282,6 +337,8 @@ static void log_worker_thread(void *arg)
         }
     }
 
+    if (eden_errors)
+        fclose(eden_errors);
     threadExit();
 }
 

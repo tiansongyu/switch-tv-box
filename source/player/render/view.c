@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "app/platform_compat.h"
 #include "log/log.h"
 #include "player/player.h"
 #include "player/render/internal.h"
@@ -191,7 +192,7 @@ void player_view_deinit(void)
     // until after any render backend/device objects are fully destroyed.
     frontend_close(&g_view, false);
     frontend_shutdown(&g_view);
-    if (restore_console)
+    if (restore_console && !tvbox_eden_compat_enabled())
     {
         consoleInit(NULL);
         consoleClear();

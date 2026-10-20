@@ -1222,8 +1222,15 @@ void userAppExit(void)
 
 int main(int argc, char* argv[])
 {
-    consoleInit(NULL);
-    g_consoleInitialized = true;
+    /* Eden retains a GPU reference to the text console's framebuffer after
+     * deko3d takes over the default window. Its freed heap pages then remain
+     * DeviceShared and cannot be reused for libnx thread/transfer memory.
+     * The graphical frontend is the only display owner in this mode. */
+    if (!tvbox_eden_compat_enabled())
+    {
+        consoleInit(NULL);
+        g_consoleInitialized = true;
+    }
     shutdown_trace_reset();
     shutdown_stdio_trace("[INFO] [shutdown] trace_build=exit-userAppExit-v1\n");
 
@@ -1944,7 +1951,8 @@ int main(int argc, char* argv[])
                 player_view_set_home_state(&home_state);
 
             bool rendered = videoPlatformReady && player_view_render_frame();
-            if (!rendered && (!videoPlatformReady || !player_view_has_foreground_renderer()))
+            if (g_consoleInitialized && !rendered &&
+                (!videoPlatformReady || !player_view_has_foreground_renderer()))
             {
                 render_home_view(&home_state);
                 consoleUpdate(NULL);

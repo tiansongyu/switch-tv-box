@@ -1953,14 +1953,22 @@ static bool libmpv_init(void)
     libmpv_set_option_string_checked("osd-fonts-dir",
                                      "sdmc:/switch/switch-tv-box/fonts");
     libmpv_set_option_string_checked("osd-font", "Source Han Sans CN");
-    // Prefer hardware decode on Switch. If the libmpv package exposes the
-    // explicit nvtegra backend, use it directly; otherwise fall back to mpv's
-    // generic enabled path and let the selected render backend negotiate interop.
+    // Eden's nvtegra surface path can show green frames and retain DeviceShared
+    // backing pages. Decode in software only when the compatibility marker is set.
+    if (tvbox_eden_compat_enabled())
+    {
+        libmpv_set_option_string_checked("hwdec", "no");
+        log_info("[player-libmpv] Eden compatibility: software video decoding\n");
+    }
+    else
+    {
+        // Prefer hardware decode on Switch. Let generic builds negotiate interop.
 #ifdef HAVE_MPV_EXPLICIT_NVTEGRA_HWDEC
-    libmpv_set_option_string_checked("hwdec", "nvtegra");
+        libmpv_set_option_string_checked("hwdec", "nvtegra");
 #else
-    libmpv_set_option_string_checked("hwdec", "yes");
+        libmpv_set_option_string_checked("hwdec", "yes");
 #endif
+    }
     // This is the v0.2.0-tested nvtegra/deko3d surface handoff policy.
     libmpv_set_option_string_checked("vd-lavc-dr", "no");
     libmpv_set_option_string_checked("vd-lavc-threads", "4");

@@ -8,6 +8,7 @@
 #include <GLES2/gl2.h>
 #endif
 
+#include "app/platform_compat.h"
 #include "log/log.h"
 #include "player/player.h"
 #include "player/trace.h"
@@ -161,16 +162,19 @@ static bool frontend_open_gl(ViewContext *ctx)
     u32 height = VIEW_DEFAULT_HEIGHT;
 
     frontend_query_display_size(&width, &height);
-    consoleExit(NULL);
+    if (!tvbox_eden_compat_enabled())
+        consoleExit(NULL);
     if (!frontend_gl_init(ctx))
     {
-        consoleInit(NULL);
+        if (!tvbox_eden_compat_enabled())
+            consoleInit(NULL);
         return false;
     }
     if (!player_video_attach_gl(frontend_gl_get_proc_address, NULL))
     {
         frontend_gl_deinit(ctx);
-        consoleInit(NULL);
+        if (!tvbox_eden_compat_enabled())
+            consoleInit(NULL);
         log_warn("[player-view] render_attach_gl rejected\n");
         return false;
     }
@@ -470,10 +474,12 @@ static bool frontend_open_dk3d(ViewContext *ctx)
     if (!frontend_dk3d_connect(ctx))
         return false;
 
-    consoleExit(NULL);
+    if (!tvbox_eden_compat_enabled())
+        consoleExit(NULL);
     if (!frontend_dk3d_create_swapchain(ctx, width, height))
     {
-        consoleInit(NULL);
+        if (!tvbox_eden_compat_enabled())
+            consoleInit(NULL);
         return false;
     }
 
@@ -494,12 +500,14 @@ static bool frontend_open_sw(ViewContext *ctx)
     u32 height = VIEW_DEFAULT_HEIGHT;
 
     frontend_query_display_size(&width, &height);
-    consoleExit(NULL);
+    if (!tvbox_eden_compat_enabled())
+        consoleExit(NULL);
     memset(&ctx->framebuffer, 0, sizeof(ctx->framebuffer));
 
     if (!player_video_attach_sw())
     {
-        consoleInit(NULL);
+        if (!tvbox_eden_compat_enabled())
+            consoleInit(NULL);
         return false;
     }
 
@@ -512,7 +520,8 @@ static bool frontend_open_sw(ViewContext *ctx)
     if (R_FAILED(rc))
     {
         player_video_detach();
-        consoleInit(NULL);
+        if (!tvbox_eden_compat_enabled())
+            consoleInit(NULL);
         log_error("[player-view] framebufferCreate failed: 0x%08X\n", rc);
         return false;
     }
@@ -523,7 +532,8 @@ static bool frontend_open_sw(ViewContext *ctx)
         framebufferClose(&ctx->framebuffer);
         memset(&ctx->framebuffer, 0, sizeof(ctx->framebuffer));
         player_video_detach();
-        consoleInit(NULL);
+        if (!tvbox_eden_compat_enabled())
+            consoleInit(NULL);
         log_error("[player-view] framebufferMakeLinear failed: 0x%08X\n", rc);
         return false;
     }
@@ -620,7 +630,9 @@ void frontend_close(ViewContext *ctx, bool restore_console)
         return;
 
     had_video_foreground = ctx->status.foreground_video_active || ctx->framebuffer_ready;
-    restore_console_now = restore_console && had_video_foreground;
+    /* Eden can retain DeviceShared pages after releasing the text console. */
+    restore_console_now = restore_console && had_video_foreground &&
+                          !tvbox_eden_compat_enabled();
 
     log_info("[player-view] frontend_close begin restore_console=%d had_video=%d render_path=%d render_api_connected=%d framebuffer_ready=%d\n",
              restore_console ? 1 : 0,
