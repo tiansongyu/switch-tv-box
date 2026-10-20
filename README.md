@@ -34,7 +34,7 @@ switch/switch-tv-box/
   licenses/
 ```
 
-Release 同时提供 `switch-tv-box-v0.1.0-complete.zip`，包含 `sdmc/` 安装目录、
+Release 同时提供 `switch-tv-box-v0.1.1-complete.zip`，包含 `sdmc/` 安装目录、
 `source/` 完整已提交源码与离线规范、`manifest.json` 构建标识。安装时复制
 `sdmc/` 里面的内容到 SD 卡根目录；下载完整性可用 `SHA256SUMS.txt` 核对。
 
