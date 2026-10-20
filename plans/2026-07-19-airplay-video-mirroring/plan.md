@@ -1,0 +1,274 @@
+# Plan: AirPlay Video Mirroring for NX-Cast
+
+> Status: ACTIVE
+> Created: 2026-07-19
+> Last Updated: 2026-07-21
+
+## Goal
+以 NX-Cast 自有 C 协议/媒体模块和现有播放器接口为主体，仅引入固定来源、许可证完整的 GPL PlayFair 兼容子库，实现同一局域网内 iPhone 到 Switch 的非 DRM H.264 屏幕镜像、AAC 同步音频以及 AirPlay URL/HLS 视频投送。
+
+## Assumptions
+- 首个支持场景是 iPhone 与 Switch 连接同一 Wi-Fi；AWDL/点对点 AirPlay 不在本计划范围内。
+- 配对采用可在 Switch UI 显示的 PIN 流程，设备身份和长期密钥保存在 `sdmc:/switch/NX-Cast/airplay/`。
+- 现有 switch-libmpv、FFmpeg、nvtegra 和 deko3d 构建保持不变；实时镜像通过内部流桥接复用该播放链路。
+- 真机网络抓包和 iPhone 行为验证需要用户提供 Switch/iPhone 测试结果；主机端协议、解析、加密向量和媒体夹具由自动测试覆盖。
+- 除 FairPlay 兼容边界外，协议、线程、存储和播放器代码继续依据公开行为独立实现；FairPlay 使用来源固定、许可证完整、与其余代码隔离的 GPL PlayFair 后端。
+
+## Open Questions
+None.
+
+## Spec-Lite
+### Acceptance Criteria
+- [ ] iPhone 的“屏幕镜像”列表能稳定发现 NX-Cast，并能完成 PIN 配对、重连和取消连接。
+- [ ] 第一阶段在 Switch 上通过 nvtegra/deko3d 连续播放 iPhone H.264 镜像视频，支持方向/分辨率变化和关键帧恢复。
+- [ ] 第二阶段播放 AAC 音频，音画同步可在 30 分钟真机测试中保持可接受且不会持续漂移。
+- [ ] 第三阶段接收 AirPlay URL/HLS 的播放、暂停、进度和停止命令，并复用 `renderer_set_uri()` 与现有播放器控制接口。
+- [ ] DLNA、IPTV 与 AirPlay 不并发争用播放器；返回主页、断连、退出程序均能有序释放线程、套接字、密钥和流缓冲。
+- [ ] 连续连接/断开至少 10 次不崩溃；日志不输出会话密钥、PIN、完整配对载荷或解密后的媒体数据。
+
+### Non-goals
+- 完整 AirPlay 2、多房间/多设备同步、HomeKit、独立音乐/纯音频接收器、Apple DRM/FairPlay 商业内容和 MFi 认证。
+- 引入 UxPlay/RPiPlay 的服务器、配对、媒体、GStreamer/OpenMAX 或平台渲染器代码；唯一例外是独立审计和归属明确的 GPL PlayFair 兼容子库。
+- 第一版支持 AWDL、蓝牙发现、互联网中继或跨子网自动发现。
+
+### Edge Cases
+- 不受支持的 DRM、HEVC/高位深、损坏加密包、乱序/丢包、无关键帧、SPS/PPS 变化和突然断电。
+- iPhone 旋转屏幕、锁屏、来电、暂停、应用切换、Wi-Fi 漫游以及控制连接先于媒体连接断开。
+- 配对身份文件缺失/损坏/只读、重复 mDNS 名称、端口占用、旧配对记录和错误 PIN。
+- DLNA/IPTV 正在播放时 AirPlay 连接，或 AirPlay 会话期间用户返回主页/退出程序。
+
+## Design Decisions
+| Decision | Options Considered | Chosen | Confirmed |
+|----------|--------------------|--------|-----------|
+| 参考实现策略 | 完全 clean-room；完整引入 UxPlay/RPiPlay；仅引入 FairPlay 子库 | NX-Cast 保留自有 C 协议/媒体框架，仅接入固定来源和 GPL 归属的 PlayFair 后端 | yes |
+| 控制服务边界 | 扩展 DLNA HTTP server；独立 AirPlay server | 独立的持久 RTSP/HTTP 控制服务，避免改变 DLNA 的短连接语义 | yes |
+| plist 与加密依赖 | libplist+OpenSSL；自有 plist+mbedTLS | 实现所需最小 binary plist 子集，并复用 devkitPro mbedTLS | yes |
+| 实时媒体接入 | 新播放器；GStreamer；libmpv 自定义流 | H.264/AAC 复用 FFmpeg MPEG-TS 封装、有限环形缓冲和 `mpv_stream_cb_add_ro()` | yes |
+| 能力广播 | 一次声明完整 AirPlay 2；按阶段声明 | 只广播已通过真机验收的功能位，阶段完成后再增加能力 | yes |
+| 播放器仲裁 | 多协议同时控制；最后命令获胜 | 单一活动媒体所有者，AirPlay/DLNA/IPTV 显式获取与释放会话 | yes |
+| Ed25519 后端 | 自行实现曲线；mbedTLS PSA；官方 libsodium | 使用 devkitPro/Homebrew libsodium；mbedTLS 2.28 不提供 Ed25519，禁止自写密码学替代 | yes |
+
+## Steps Overview
+| Step | File | Status | Goal |
+|------|------|--------|------|
+| Step 1 | `steps/step-1.md` | COMPLETED | 建立 AirPlay 生命周期外壳、状态契约和主机测试入口 |
+| Step 2 | `steps/step-2.md` | COMPLETED | 实现最小 binary plist 编解码并以夹具锁定行为 |
+| Step 3 | `steps/step-3.md` | COMPLETED | 实现独立持久 RTSP/HTTP 控制服务器和解析器 |
+| Step 4 | `steps/step-4.md` | COMPLETED | 实现持久设备身份、随机数和 mbedTLS 加密原语 |
+| Step 5 | `steps/step-5.md` | COMPLETED | 实现 Pair Setup/Pair Verify 与加密控制会话 |
+| Step 6 | `steps/step-6.md` | COMPLETED | 实现原生 mDNS 广播并让 iPhone 可发现设备 |
+| Step 7 | `steps/step-7.md` | IN_PROGRESS | 打通 iPhone 控制握手至 SETUP/RECORD/TEARDOWN |
+| Step 8 | `steps/step-8.md` | COMPLETED | 实现镜像 H.264 接收、解密、重组和关键帧恢复 |
+| Step 9 | `steps/step-9.md` | COMPLETED | 建立 MPEG-TS 环形缓冲与 libmpv 自定义流桥接 |
+| Step 10 | `steps/step-10.md` | BLOCKED | 完成第一阶段 H.264 硬解镜像真机闭环 |
+| Step 11 | `steps/step-11.md` | BLOCKED | 增加镜像 AAC 接收和音轨输出 |
+| Step 12 | `steps/step-12.md` | BLOCKED | 增加时钟、抖动缓冲和音画同步 |
+| Step 13 | `steps/step-13.md` | BLOCKED | 增加 AirPlay URL/HLS 投送与远程控制 |
+| Step 14 | `steps/step-14.md` | BLOCKED | 完成协议仲裁、UI 状态与安全退出集成 |
+| Step 15 | `steps/step-15.md` | BLOCKED | 完成兼容性、稳定性、CI、文档和发布验收 |
+
+## Validation Commands
+| Purpose | Command | Source | Required? |
+|---|---|---|---|
+| AirPlay host tests | `make test-airplay` | Step 1 adds target following `scripts/test_iptv_channel_list.c` host-test style | yes |
+| Protocol smoke | `python3 scripts/smoke_airplay.py --host 127.0.0.1 --port 7000` | Planned local persistent-session smoke test | yes |
+| Strict Switch build | `make clean && make NXCAST_USE_IMGUI_UI=1 NXCAST_REQUIRE_LIBMPV=1 NXCAST_REQUIRE_DEKO3D=1 -j4` | Existing Makefile/toolchain contract | yes |
+| Attested release build | `make RELEASE_JOBS=4 release-build` | Requires libmpv, deko3d, ImGui and AirPlay Ed25519 before packaging | final step |
+| Release package | `./scripts/package_release.sh` | Existing release packaging path | final step |
+| Media fixture probe | `ffprobe -v error -show_streams build/tests/airplay-mirror.ts` | Planned Step 9 MPEG-TS fixture | yes |
+| Real-device acceptance | `TRACE_MEDIA=1 TRACE_AIRPLAY=1` build + iPhone/Switch test matrix | Planned protocol-specific trace mode; secrets redacted | phase gates |
+
+## Context & Learnings
+### Key Decisions
+- Clean-room implementation: reference projects define expected wire behavior only; NX-Cast owns all code, threading, storage, player integration and tests.
+- FairPlay exception: the user selected the open-source research route on 2026-07-20; GPL PlayFair is accepted as an isolated third-party compatibility backend with exact provenance, license preservation and explicit legal-status disclosure.
+- UxPlay-first reference: its protocol core is current and includes remote-video handling; RPiPlay is retained only to detect regressions against older mirroring flows.
+- Separate control server: AirPlay requires persistent, encrypted, stateful sessions that conflict with the current DLNA server's one-request/close model.
+- Existing media path first: a custom libmpv stream avoids introducing GStreamer or a second renderer and preserves nvtegra/deko3d behavior.
+- Binary plist scope: implement only dict/array/string/data/uint/real/bool with fixed resource limits; fixtures are checked in as reviewable hex.
+- Binary plist integers preserve their raw encoded bit pattern as `uint64_t`, matching the reference API rather than applying a signed interpretation.
+- Persistent control transport uses a separate four-slot server; each worker serializes one connection/session and exposes route plus disconnect cleanup callbacks.
+
+### Gotchas & Warnings
+- AirPlay compatibility contains undocumented and version-sensitive behavior; each advertised feature must be backed by iPhone packet traces and a real-device acceptance gate.
+- FairPlay/DRM content is explicitly unsupported; do not infer that protocol pairing support permits protected commercial streams.
+- Binary plist and RTSP lengths are attacker-controlled network input; every allocation and frame length needs a fixed upper bound.
+- Media callbacks, player commands and UI rendering run on different threads; direct player/UI calls from network threads are forbidden.
+- Trace logs must record sequence/state/length/hash only and must never log PINs, private keys, session keys or full decrypted payloads.
+- Generic plist readers can display a high-bit 64-bit integer as negative even though NX-Cast intentionally exposes the same bits as `uint64_t`.
+- macOS Control Center can own TCP 7000; host smoke tries the requested port first and uses an ephemeral port only for local test isolation.
+- Ed25519 is absent from mbedTLS 2.28; release builds must install `switch-libsodium` and set `NXCAST_REQUIRE_AIRPLAY_ED25519=1` rather than silently using the unavailable backend.
+
+> Append only. Never delete or rewrite existing entries below — only add new rows/facts as steps complete.
+### Working Set
+| Path | Role in this task | Evidence |
+|------|-------------------|----------|
+| `source/protocol/airplay/discovery/mdns.c` | Existing AirPlay placeholder to replace | `rg -n mdns_discover_airplay source` |
+| `source/protocol/http/http_server.c` | DLNA short-connection server boundary | read/search showed global handler and client-close lifecycle |
+| `source/main.c` | Network/player startup and shutdown ordering | `rg -n mdns_discover_airplay source/main.c` and lifecycle read |
+| `source/player/backend/libmpv.c` | Register custom stream and preserve hardware playback | existing libmpv backend read/search |
+| `source/player/core/session.c` | Thread-safe player commands and media ownership integration | `rg -n player_set_uri source/player` |
+| `source/player/renderer.h` | URL/HLS phase public playback facade | `renderer_set_uri()` maps to player API |
+| `makefile` | mbedTLS linkage, trace flag and host tests | `rg -n TRACE_MEDIA\|NXCAST_REQUIRE makefile` |
+| `scripts/` | Host protocol tests and smoke tooling | existing DLNA/IPTV test scripts inspected |
+| `scripts/test_iptv_channel_list.c` | Existing dependency-light C host-test convention for Step 1 | direct source read, 2026-07-19 |
+| `scripts/test_airplay.c` | AirPlay lifecycle host test entry point | normal and ASan/UBSan test runs, Step 1 |
+| `source/protocol/airplay/airplay.h` | Public bounded lifecycle/status/callback contract | source read and strict Switch build, Step 1 |
+| `source/protocol/airplay/airplay.c` | Dependency-free lifecycle implementation | host tests and strict Switch build, Step 1 |
+| `/opt/devkitpro/portlibs/switch` | Dependency inventory for plist decision | focused `find` found no libplist installation, Step 2 |
+| `/tmp/nxcast-airplay-ref.0dZrly/UxPlay` | Primary behavior reference only | shallow clone metadata and protocol file inventory |
+| `/tmp/nxcast-airplay-ref.0dZrly/RPiPlay` | Legacy behavior cross-check only | shallow clone metadata and protocol file inventory |
+| `source/protocol/airplay/protocol/plist.[ch]` | Owned bounded binary plist value tree and codec | full source read, host tests, static analysis and strict Switch build, Step 2 |
+| `scripts/test_airplay_plist.c` | Happy-path, limits, malformed-input and mutation coverage | normal and ASan/UBSan `make test-airplay`, Step 2 |
+| `scripts/fixtures/airplay/plist/*.bplist.hex` | Reviewable valid and malformed binary plist inputs | fixture read and host test execution, Step 2 |
+| `build/tests/airplay-plist-roundtrip.bplist` | Generated interoperability artifact, ignored by git | Python `plistlib` assertions and `plutil -lint`, Step 2 |
+| `source/protocol/airplay/protocol/rtsp.[ch]` | Bounded RTSP/HTTP parse, response and connection-state contract | full source read, unit tests, ASan/UBSan and static analysis, Step 3 |
+| `source/protocol/airplay/server.[ch]` | Portable persistent listener/client ownership and cancellation | TCP smoke, ASan/UBSan, static analysis and strict Switch build, Step 3 |
+| `scripts/test_airplay_rtsp.c` | Parser, response and session edge/error coverage | normal and sanitizer `make test-airplay`, Step 3 |
+| `scripts/smoke_airplay.py` | Real TCP fragmentation, pipelining, timeout, capacity and stop smoke | local runs on requested/ephemeral ports, Step 3 |
+| `source/protocol/airplay/security/crypto.[ch]` | Bounded mbedTLS primitives and libsodium Ed25519 facade | RFC vectors, ASan/UBSan, static analysis and strict Switch build, Step 4 |
+| `source/protocol/airplay/security/identity.[ch]` | Versioned atomic SD identity with secret-preserving signing API | create/reload/corrupt/unwritable tests and source review, Step 4 |
+| `scripts/test_airplay_crypto.c` | Published crypto vectors and identity persistence coverage | normal and sanitizer `make test-airplay`, Step 4 |
+| `source/protocol/airplay/security/srp.[ch]` | Apple-compatible bounded SRP server transcript | fixed independent transcript, negative tests and static analysis, Step 5 |
+| `source/protocol/airplay/security/pairing.[ch]` | PIN Pair Setup, persisted client trust and Pair Verify state | unit transcript, reconnect smoke, sanitizers and strict build, Step 5 |
+| `source/protocol/airplay/security/pairing_store.[ch]` | Versioned and checksummed trusted-client persistence | reload/corruption/update tests and static analysis, Step 5 |
+| `scripts/smoke_airplay_pairing.py` | Real TCP authorization close/reconnect smoke | local requested/ephemeral port runs, Step 5 |
+| `source/protocol/airplay/discovery/dns.[ch]` | Bounded DNS-SD codec with compressed AirPlay record set | unit, sanitizer and static-analysis tests, Step 6 |
+| `source/protocol/airplay/discovery/mdns.[ch]` | Native multicast responder lifecycle and conflict handling | loopback UDP lifecycle smoke and strict build, Step 6 |
+| `source/protocol/airplay/protocol/handlers.[ch]` | Capability-gated AirPlay control endpoint and session state machine | unit transcript, sanitizer/static analysis and strict build, Step 7 |
+| `source/protocol/airplay/security/fairplay.[ch]` | Fail-closed clean-room boundary for proprietary FairPlay negotiation | supported observable phase fixture and explicit unsupported-path tests, Step 7 |
+| `source/protocol/airplay/receiver.[ch]` | Pairing, control server, handlers, lifecycle and optional discovery composition root | real TCP composed receiver smoke and strict build, Step 7 |
+| `scripts/smoke_airplay_receiver.py` | Composed receiver startup, info, authorization and teardown smoke | local ephemeral-port run and ASan/UBSan run, Step 7 |
+| `source/protocol/airplay/mirror/mirror_session.[ch]` | Bounded mirror TCP listener, continuous AES-CTR decryption and reconnect lifecycle | encrypted TCP fixture, sanitizer/static analysis and strict build, Step 8 |
+| `source/protocol/airplay/mirror/video.[ch]` | AVC configuration and length-prefixed NAL to Annex-B access-unit normalization | malformed/reorder/config-change tests and independent ffprobe, Step 8 |
+| `scripts/fixtures/airplay/mirror/` | Sanitized AVC config, IDR and truncated payload fixtures | parser and generated H.264 probe, Step 8 |
+| `source/protocol/airplay/media/stream_bridge.[ch]` | Bounded MPEG-TS mux ring with cancel, EOF, backpressure and monotonic PTS | wrap/cancel tests, sanitizers, ffprobe and strict build, Step 9 |
+| `source/player/backend/libmpv_airplay.h` | Refcounted bridge binding contract for the existing libmpv backend | callback lifetime review and strict build, Step 9 |
+| `scripts/test_airplay_stream_bridge.c` | Slow-consumer, wraparound, cancellation, EOF and restart coverage | normal and sanitizer host runs, Step 9 |
+| `source/protocol/airplay/media/mirror_runtime.[ch]` | Generation-safe mirror transport/bridge/player command owner | encrypted ten-cycle runtime test, sanitizers and strict traced build, Step 10 |
+| `scripts/test_airplay_mirror_runtime.c` | Real encrypted mirror TCP through first-IDR autoplay and teardown | normal and ASan/UBSan host runs, Step 10 |
+| `source/protocol/airplay/mirror/audio.[ch]` | Bounded mirror AAC RTP receive, CBC decrypt, reorder and discontinuity boundary | packet fixtures, UDP smoke, sanitizers and strict build, Step 11 |
+| `scripts/test_airplay_audio.c` | AAC packet loss/reorder/mute/reconnect and dual-stream mux coverage | normal/sanitizer runs and generated TS, Step 11 |
+| `source/protocol/airplay/mirror/clock.[ch]` | Shared wrap-safe video NTP/audio RTP to 90 kHz timeline and metrics | deterministic drift/jump/wrap simulations and strict build, Step 12 |
+| `scripts/test_airplay_clock.c` | Deterministic timing, jitter, drift, discontinuity, pause and restart simulation | normal and ASan/UBSan host runs, Step 12 |
+| `source/protocol/airplay/media/remote_video.[ch]` | Session-owned URL/HLS endpoint parsing and player operation mapping | endpoint tests, sanitizer/static analysis and strict build, Step 13 |
+| `scripts/test_airplay_remote_video.c` | Classic/binary play, rate, scrub, info, stop and malformed input coverage | normal and ASan/UBSan host runs, Step 13 |
+| `scripts/smoke_airplay.py` | Persistent protocol smoke plus direct HLS redirect/relative-segment fixture | local FFmpeg H.264/AAC probe, Step 13 |
+| `source/player/core/ownership.[ch]` | Generation-bearing single-player ownership shared by all media protocols | concurrent/stale-lease host tests and strict build, Step 14 |
+| `source/protocol/airplay/integration.[ch]` | Switch composition root for receiver, remote video, mirror runtime, UI status and shutdown | source review and strict Switch build, Step 14 |
+| `scripts/test_player_ownership.c` | Concurrent claim and stale command/release regression coverage | normal and ASan/UBSan host runs, Step 14 |
+| `Dockerfile`, `.github/workflows/*.yml` | Native AirPlay tests plus strict Ed25519 Switch release gate | shell/YAML parse and source review, Step 15 |
+| `scripts/package_release.sh`, `assets/airplay/README.txt` | AirPlay SD skeleton and secret/capture exclusion gate | real archive staging and listing, Step 15 |
+| `docs/AIRPLAY_DEVELOPMENT.md` | Honest support, architecture, privacy, build and acceptance contract | documentation review, Step 15 |
+
+### Verified Facts
+- Current AirPlay implementation is only a `mdns_discover_airplay()` placeholder returning false — verified by `rg` and source read, 2026-07-19.
+- Existing DLNA HTTP server owns one global listener and closes each accepted client after handling one request — verified by `source/protocol/http/http_server.c`, 2026-07-19.
+- `renderer_set_uri()` delegates to `player_set_uri()` and is already used by IPTV and DLNA — verified by `rg`, 2026-07-19.
+- Installed Switch libmpv exposes `mpv_stream_cb_add_ro()` and installed FFmpeg exposes avformat/avio APIs — verified from `/opt/devkitpro/portlibs/switch/include`, 2026-07-19.
+- mbedTLS headers, static libraries and pkg-config metadata are installed; OpenSSL/libplist are not part of the current Switch toolchain — verified from `/opt/devkitpro/portlibs/switch`, 2026-07-19.
+- UxPlay reference is newer and contains mirror plus remote-video protocol paths; RPiPlay is older and useful primarily for legacy cross-checks — verified from shallow clone history and file inventories, 2026-07-19.
+- Neither reference repository provides a usable protocol test suite for NX-Cast, so fixtures and transcript tests must be created locally — verified by repository inventory, 2026-07-19.
+- `source/main.c` does not call AirPlay startup and contains only a commented mDNS placeholder, so adding the Step 1 module cannot advertise a network service — verified by source read, 2026-07-19.
+- The makefile already scans `source/protocol/airplay/*.c`, while host tests use small standalone C executables with `-Isource` — verified by makefile and `scripts/test_iptv_channel_list.c`, 2026-07-19.
+- AirPlay lifecycle accepts only non-empty names up to 63 bytes and non-zero ports, copies configuration into bounded storage, emits isolated optional callbacks and clears state on stop — verified by `make test-airplay` plus ASan/UBSan, Step 1.
+- Adding `airplay.c` compiles into the required libmpv/deko3d Switch build without enabling runtime discovery because `main.c` remains unchanged — verified by strict build and source/status review, Step 1.
+- UxPlay and RPiPlay AirPlay handlers use only plist dict, array, string, data, unsigned integer, real and boolean constructors/getters — verified by focused `rg` over both reference `lib/` trees, Step 2.
+- The installed Switch portlibs contain no libplist headers, library or pkg-config file — verified by focused `find /opt/devkitpro/portlibs/switch`, Step 2.
+- The custom codec rejects invalid UTF-8, malformed tables/references, cycles, over-depth/over-size values and unsupported markers under fixed allocation limits — verified by fixture, truncation, mutation and ASan/UBSan tests, Step 2.
+- Encoded dictionaries, extended arrays, UTF-16 surrogate pairs, empty data and raw 64-bit integers decode correctly in NX-Cast; the generated file is also accepted by Python `plistlib` and macOS `plutil` — verified by host assertions and independent readers, Step 2.
+- `plist.c` compiles into the required libmpv/deko3d NRO without enabling AirPlay network behavior — verified by strict Switch build and unchanged runtime startup path, Step 2.
+- Existing DLNA HTTP handling is one-request/close and cannot preserve AirPlay CSeq/security state — verified by complete `http_server.c` lifecycle read, Step 3.
+- The RTSP parser caps headers at 32 KiB and bodies at 1 MiB, rejects ambiguous framing, and preserves pipelined bytes in order — verified by unit, truncation and real TCP smoke tests, Step 3.
+- Server stop atomically takes socket-close ownership, unblocks partial reads, joins all fixed client workers and invokes a disconnect cleanup hook — verified by ASan/UBSan saturation/shutdown smoke and source review, Step 3.
+- `server.c` and `rtsp.c` compile and link into the required libmpv/deko3d Switch NRO without starting a listener from `main.c` — verified by strict build and startup-path review, Step 3.
+- Switch and host mbedTLS are version 2.28.10 with Curve25519, AES, ChaCha20-Poly1305, HKDF and platform entropy enabled; Ed25519 is not implemented — verified from headers, pkg-config and RFC vector execution, Step 4.
+- The crypto facade passes SHA-2, HMAC, HKDF, X25519, AES-CTR, ChaCha20-Poly1305 and Ed25519 published vectors, rejects low-order X25519 and invalid AEAD tags, and clears failed outputs — verified by normal and ASan/UBSan tests, Step 4.
+- Device identity creation/reload, checksum corruption recovery and unwritable paths preserve the opaque seed boundary and deterministic public identity — verified by host tests and static analysis, Step 4.
+- The selected legacy PIN flow uses `/pair-pin-start`, three binary-plist `/pair-setup-pin` exchanges and two raw `/pair-verify` exchanges; later RTSP is authorized by verified session state rather than a separate encrypted record layer — verified from reference behavior inventory and transcript tests, Step 5.
+- Pair Setup/Verify passes an independent SRP fixture, persistent reconnect, wrong proof, malformed plist, replay and disconnect tests; real TCP smoke confirms protected SETUP returns generic 470/close and the listener accepts an immediate new connection — verified by normal/sanitizer tests and local smoke, Step 5.
+- Strict Switch builds pass with AirPlay trace disabled and enabled, but this workstation lacks `switch-libsodium`; release CI must enforce `NXCAST_REQUIRE_AIRPLAY_ED25519=1` after installing that official package — verified by build output and explicit dependency gate, Step 5.
+- `_airplay._tcp.local` DNS-SD packets contain compressed and mutually consistent PTR/SRV/TXT/A records, reject malformed/self-referential names, and cap packets at 1500 bytes — verified by C tests, ASan/UBSan and static analysis, Step 6.
+- The native responder honors QU queries, announces periodically, renames on conflicting unique records and emits TTL=0 goodbye before socket teardown — verified by isolated real UDP smoke, Step 6.
+- `/info`, observable 164-byte `/fp-setup`, SETUP/RECORD/GET_PARAMETER/TEARDOWN state handling and disconnect cleanup pass deterministic unit transcripts; the composed receiver also serves binary-plist info, rejects unverified SETUP with 470/close and immediately accepts a new connection — verified by normal/sanitizer tests and real TCP smoke, Step 7.
+- The standard 16-byte FairPlay challenge requires a proprietary 142-byte response and wrapped-key algorithm that cannot be independently derived from public behavior; NX-Cast returns 501 and does not advertise mirroring unless an audited unwrap/media backend is supplied — verified by source review, fixtures and receiver capability tests, Step 7.
+- Step 7 Switch builds pass with `TRACE_AIRPLAY=0` and `=1`; traces include only endpoint/state/sequence/length/result metadata and never payloads, PINs or keys — verified by strict builds and trace macro/source review, Step 7.
+- The mirror transport parses the observed 128-byte little-endian header, caps payloads at 8 MiB, derives stream AES key/IV with SHA-512 labels, preserves CTR state across video packets and resets it on TCP reconnect — verified by deterministic vectors, encrypted socket tests, sanitizers and source review, Step 8.
+- H.264 AVC configuration is converted to Annex B, configuration changes force IDR resynchronization, reordered/truncated/oversized access units are dropped or rejected, and the generated fixture is recognized as 64x64 Constrained Baseline H.264 by host `ffprobe` — verified by tests and independent probe, Step 8.
+- The AirPlay media bridge converts raw NTP 32.32 timestamps to monotonic 90 kHz MPEG-TS PTS, bounds queued output, and unblocks both producer and consumer on cancellation — verified by wrap/backpressure/cancel tests and ASan/UBSan, Step 9.
+- `airplay://mirror` is registered before `mpv_initialize()`; callbacks retain their bridge cookie, enforce one reader, and never call libmpv — verified against installed `stream_cb.h`, source review and strict Switch build, Step 9.
+- The generated 97,760-byte TS fixture is independently identified as 64x64 H.264 with a 1/90000 time base — verified by host `ffprobe`, Step 9.
+- Mirror RTSP callbacks can be isolated from player/UI calls by a fixed 32-command media worker; stale load/play work is discarded by session generation and teardown always cancels the bridge before joining transport — verified by source review, sanitizers and ten encrypted TCP cycles, Step 10.
+- The traced strict Switch build contains the media runtime and existing nvtegra/deko3d backend, but real iPhone rendering cannot be claimed while standard FairPlay unwrap remains unavailable — verified build fact and inherited Step 7 blocker, Step 10.
+- Mirrored audio type 96 uses 12-byte RTP headers, AAC-LC (`ct=4`) or AAC-ELD (`ct=8`), a per-packet AES-CBC IV reset and a clear unaligned tail in both references — verified by focused clean-room behavior inventory, Step 11.
+- The generated dual-stream MPEG-TS is independently detected as 64x64 H.264 plus 44.1 kHz stereo AAC; loss/reorder/mute/reconnect tests, ASan/UBSan, static analysis and the strict Switch build pass, but audible iPhone acceptance remains blocked by Step 7 — verified host/build facts, Step 11.
+- Audio control type `0x54` maps a 32-bit 44.1 kHz RTP timestamp to remote NTP 32.32, while mirror video already carries the same remote NTP domain; mapping both once before muxing avoids player-side clock guessing — verified from both references and deterministic tests, Step 12.
+- The shared clock survives RTP and NTP wrap, bounds sync correction, resets audio on video discontinuity and exposes redacted jitter/skew/drift/drop counters; sanitizer/static/strict builds pass, while the 30-minute iPhone soak remains blocked by Step 7 — verified host/build facts, Step 12.
+- AirPlay remote video accepts bounded credential-free HTTP(S) URLs, maps classic and binary-plist play/rate/scrub/info/stop requests to player operations, and isolates ownership by control session — verified endpoint, handler lifecycle and sanitizer tests, Step 13.
+- Host FFmpeg follows an HTTP redirect and resolves a relative HLS segment without any NX-Cast gateway or Content-Type rewrite; the strict Switch build passes, while real iPhone URL/HLS control remains an explicit hardware/Step 7 acceptance blocker — verified local smoke/build facts, Step 13.
+- DLNA, IPTV, AirPlay remote video and mirroring now claim generation-bearing player leases; newer claims invalidate stale commands and release attempts, while host concurrency/sanitizer tests and the strict Switch build pass — verified host/build facts, Step 14.
+- AirPlay starts only after network/player readiness and is stopped before DLNA/player/UI/network teardown; real mixed-protocol switching and + exit remain a hardware acceptance blocker — verified source/order review and strict build, Step 14.
+- CI now installs official `switch-libsodium`, runs the complete AirPlay host suite, and requires Ed25519 in strict Switch builds; local scripts/YAML parse, while the actual Docker run is unavailable on this workstation — verified static/local facts, Step 15.
+- The first GitHub Actions Docker run built the image successfully and identified Debian's missing `mbedcrypto.pc`; Makefile host detection now has a header/library fallback while keeping pkg-config preferred — verified remote run 29694789656, Step 15.
+- The local package-layout archive preserves the 25,285,306-byte NRO and complete IPTV presets, adds only AirPlay/privacy/legal assets, and contains no runtime identities, pairings, keys, logs, traces, dumps, captures or reference source; publishable packages additionally require the strict release-build attestation — verified package staging/listing and negative gate test, Step 15.
+- `make test-airplay` now executes the persistent RTSP, pairing authorization, mDNS lifecycle, composed receiver and direct-HLS loopback smokes after all C tests; the complete target passes locally — verified run output, Step 15.
+- GitHub Actions run 29695349829 passes the Docker image, complete host suite, strict Ed25519/libmpv/deko3d/ImGui Switch build, SD package, artifact upload and continuous Release update — verified remote job 88215042401 and artifact 8444833939, Step 15.
+- The published continuous SD archive is 19,647,201 bytes with a 25,354,938-byte NRO, preserves the three intended IPTV source entries, and contains no runtime identity, pairing, key, log, trace, dump or capture file — verified downloaded archive SHA-256 `74a3a2814c7dd92cec4ec310858d31efb0c44678f77cd6a2128a309fbd04f8cb`, Step 15.
+- The pinned official devkitPro image installs `switch-portlibs`, which has included `switch-libsodium` since 2019; CI now verifies that package locally and never runs an online `dkp-pacman -S`, avoiding devkitPro package-server policy failures — verified image metadata, official package history and Dockerfile audit, Step 15.
+- GitHub Actions build 96 failed only while updating the continuous Release during a GitHub API incident (`Error creating policy`); rerunning the same commit completed the full build and release job successfully with no source change — verified run 29709604848 attempt 2, Step 15.
+- The composed receiver now has a regression that deliberately requests mirroring without a FairPlay unwrap backend and proves binary `/info` publishes only video, HLS and legacy pairing; mirror and rotation bits stay clear — verified composed receiver smoke, Step 15.
+- `airplay_server_send_error()` previously placed a roughly 100 KiB RTSP response on a 64 KiB Switch client-thread stack; moving it to the heap eliminates the ASan stack overflow and the complete ASan/UBSan, normal host and strict deko3d Switch builds pass — verified sanitizer and build output, Step 15.
+- GitHub Actions build 98 passes the complete host suite, official devkitPro Docker build, strict Ed25519/libmpv/deko3d/ImGui Switch build, package checks, artifact upload and continuous Release update for commit `d1a4763` — verified run `29724055626` and 32,384,049-byte artifact `8453509701`, Step 15.
+- Superseding the earlier fail-closed boundary, NX-Cast now vendors only UxPlay's GPL PlayFair subset at commit `3ca7526387e894d6848b84c209de361c3bedd1ec`; all four stage-one responses, legal stage-two modes, wrapped-key output, state reset and receiver feature publication pass deterministic tests — verified by strict host compilation, source diff and receiver smoke, Step 7 GPL backend.
+- A synthetic stage-two request initially exposed that the imported algorithm trusts `request[12]`; NX-Cast now rejects modes outside 0..3 before dispatch, and the legal mode-0 vector matches unmodified UxPlay under ASan/UBSan — verified by upstream comparison and sanitizer runs, Step 7 GPL backend.
+- The local Switch development build links the PlayFair sources and produces `NX-Cast.nro`; the attested release build remains delegated to CI because this workstation still lacks `switch-libsodium` — verified by local build and the existing dependency gate, Step 7 GPL backend.
+- GitHub Actions run `29728903616` passes the host suite, official devkitPro Docker build, strict Switch release build, package checks, artifact upload and continuous Release update for commit `f5e21b2`; artifact `8455447635` is 32,614,855 bytes — verified remote release fact, Step 7 GPL backend.
+- The first physical discovery test uploaded a 25,391,802-byte local NRO without `switch-libsodium`; Ed25519 identity creation failed before receiver/mDNS startup. Strict local launch gates and stage-specific WARN-visible diagnostics now prevent and identify this condition — verified nxlink log, local pkg-config inventory, normal/sanitizer host suites and traced Switch compile, Step 7 hardware attempt 1.
+- GitHub Actions run `29745733797` passes the complete strict release pipeline for `c6fd4ca`; artifact `8462340191` is 32,615,208 bytes, and its 25,461,434-byte NRO was downloaded for the second discovery attempt — verified remote run, Release target and local SHA-256, Step 7 hardware attempt 1 fix.
+- Installing `switch-libsodium` exposed a separate startup abort: its generic sysrandom backend opens `/dev/urandom` and terminates through `sodium_misuse()` when unavailable on libnx. NX-Cast now installs a `randomGet()`-backed randombytes implementation before `sodium_init()` and attests the marker in release builds — verified package archive/disassembly, sanitizer tests, strict traced Switch build and final-binary inspection, Step 7 hardware attempt 2 fix.
+- GitHub Actions run `29748063877` passes the complete official build/package/release workflow for `bca12bc`; artifact `8463310854` is 32,614,837 bytes and the continuous Release contains the corrected 25,461,434-byte NRO — verified GitHub run, artifact and Release APIs, Step 7 hardware attempt 2 fix.
+- Hardware attempt 3 proved libsodium identity/TXT startup now succeeds but the queued trace ended at handler creation while the UI remained black for about five seconds. AirPlay initialization is now a cancellable/joined background worker, startup traces flush synchronously with timestamps, Switch address lookup uses NIFM, and DNS-SD includes the identity-derived `pi` plus audio/no-separate-RAOP capability parity — verified normal/TRACE/sanitizer host suites and non-TRACE/TRACE Switch builds, Step 7 hardware attempt 3 fix.
+- GitHub Actions run `29750313369` passes the complete host, official devkitPro container, strict release, package, artifact and continuous Release pipeline for `25cc6a3`; artifact `8464258928` is 32,613,962 bytes and the published NRO is 25,461,434 bytes — verified GitHub run, job, artifact and Release APIs, Step 7 hardware attempt 3 CI.
+- Hardware attempt 4 reset nxlink after mDNS bind/join at the mDNS worker-start boundary and before any `/info`, pairing, FairPlay, SETUP or media request trace. The Switch-only NIFM init/exit path is superseded by the same UDP route lookup already used by DLNA, and synchronous markers now distinguish mDNS create/start/entry from the first accepted control request — verified latest nxlink log, impact search, normal and ASan/UBSan host suites, Clang analysis and strict TRACE Switch build, Step 7 hardware attempt 4 fix.
+- Hardware attempt 5 proves mDNS creation/start/entry succeeds and the iPhone reaches an accepted TCP control worker, which then resets before parsing its first request. Cross-compiler stack accounting found `airplay_rtsp_parse_request()` used 102,672 bytes on a 65,536-byte client stack; heap-staging the fixed request table reduces that frame to 224 bytes, and a 32 KiB compile-time frame gate now prevents regression — verified latest nxlink log, `-fstack-usage`, normal and ASan/UBSan host suites and strict TRACE Switch build, Step 7 hardware attempt 5 fix.
+- Hardware attempts 6-7 prove PIN/SRP setup succeeds across a TCP reconnect and reaches Pair Verify, while the persistent home-screen WAIT comes from the startup thread blocking in a concurrent initial mDNS send. Setup is now service-owned, Verify finish returns the required empty `application/octet-stream` response, and initial mDNS announcement is worker-owned — verified real-device traces, audited UxPlay behavior, cross-connection tests, normal/sanitizer/static checks and strict TRACE Switch build, Step 7 hardware attempts 6-7 fixes.
+- Hardware attempt 8 completes Pair Verify twice with status 200 but sends no `/fp-setup` or `SETUP`; NX-Cast responses lacked UxPlay's common `Server` and `Audio-Jack-Status` control headers. The same trace measures a 21.9-second delay after mDNS readiness inside the receiver's final async log call, so readiness now commits before optional logging and response/close traces expose send success without payload data — verified against UxPlay commit `acfb5494fb2b52ca358e62ef59d6ee0ab20dec49`, normal/sanitizer host suites, Clang analysis and strict TRACE Switch build, Step 7 hardware attempt 8 fix.
+- Hardware attempt 9 supersedes the prior readiness diagnosis: removing the final log did not remove the 31-second delay, and the integration worker resumed only when a control accept changed scheduling. Startup now runs at receiver priority `0x2b`; the still post-Verify client abort is addressed by publishing UxPlay-compatible `_airplay._tcp` and `_raop._tcp` identities on one control port, while player-to-home transitions stop and drain libmpv before switching deko3d views — verified normal/sanitizer host suites, dual-service UDP smoke, Clang analysis and strict TRACE Switch build, Step 7 hardware attempt 9 fix.
+- Hardware attempt 10 reaches `/info` and completes both Pair Verify stages with successful responses, then iOS closes before `/fp-setup`. NX-Cast advertised `0x48000391`, which omitted UxPlay's FairPlay/authentication bits and asserted opposite legacy video/HLS/rotation bits; production now uses the UxPlay legacy-PIN mirroring profile `0x5A7FFEE6` consistently in AirPlay TXT, RAOP TXT and `/info` — verified latest nxlink trace, upstream feature inventory, normal/sanitizer host suites, dual-service UDP smoke and strict TRACE Switch build, Step 7 hardware attempt 10 fix.
+
+## Implementation Log
+| Date | Step | Summary |
+|------|------|---------|
+| 2026-07-19 | Step 1 | Added and verified the AirPlay lifecycle/status facade and `make test-airplay`; no network behavior enabled. |
+| 2026-07-20 | Step 2 | Added and verified a bounded clean-room binary plist codec, adversarial fixtures and independent interoperability checks. |
+| 2026-07-20 | Step 3 | Added and verified the independent persistent RTSP/HTTP server, bounded parser, session state and socket smoke suite. |
+| 2026-07-20 | Step 4 | Added and verified atomic device identity plus mbedTLS/libsodium crypto primitives and published-vector tests. |
+| 2026-07-20 | Step 5 | Added Apple-compatible PIN Pair Setup/Verify, persistent trusted clients, authorization routing and real TCP reconnect validation. |
+| 2026-07-20 | Step 6 | Added a bounded DNS-SD codec and native mDNS responder with query, announce, conflict and goodbye lifecycle tests. |
+| 2026-07-20 | Step 7 | Added the composed control handshake runtime and fail-closed FairPlay boundary; host and Switch checks pass, but a real iPhone RECORD flow remains blocked on independently unavailable FairPlay compatibility. |
+| 2026-07-20 | Step 8 | Added bounded H.264 mirror TCP/decrypt/reassembly modules, sanitized fixtures, IDR recovery and reconnect tests; real iPhone key material remains gated by Step 7. |
+| 2026-07-20 | Step 9 | Added the bounded MPEG-TS media bridge and refcounted libmpv custom stream registration with wrap, cancellation, sanitizer, ffprobe and strict Switch validation. |
+| 2026-07-20 | Step 10 | Added a generation-safe mirror media worker and first-IDR autoplay with ten encrypted reconnect tests; real iPhone hardware acceptance remains blocked by the Step 7 FairPlay boundary. |
+| 2026-07-20 | Step 11 | Added bounded mirror AAC RTP/decryption/reorder handling and dual-stream MPEG-TS output; host and Switch builds pass while real audible acceptance remains blocked by Step 7. |
+| 2026-07-20 | Step 12 | Added a shared wrap-safe media clock, sync/retransmit control handling and bounded drift/skew policy; deterministic validation passes while real soak remains blocked by Step 7. |
+| 2026-07-20 | Step 13 | Added session-owned AirPlay URL/HLS play, rate, scrub, info and stop endpoints with direct FFmpeg HLS redirect/relative-segment validation; real iPhone acceptance remains blocked. |
+| 2026-07-20 | Step 14 | Added single-player ownership arbitration, the Switch AirPlay composition/UI root and network-before-player shutdown ordering; host/build checks pass while the real mixed-protocol matrix remains blocked. |
+| 2026-07-20 | Step 15 | Added AirPlay host/Ed25519 CI gates, release secret scanning, SD/license assets and honest support documentation; Docker and physical iPhone/Switch acceptance remain blocked locally. |
+| 2026-07-20 | Step 15 hardening | Fixed GCC path diagnostics, Debian mbedTLS discovery, FFmpeg 5/8 AVIO compatibility and Linux feature macros; remote Docker release CI is green and all loopback network smokes now run under `make test-airplay`. |
+| 2026-07-20 | Step 15 CI policy | Removed the redundant online devkitPro package install, retained a local package assertion and documented build 96's transient GitHub Release API failure and successful rerun; only physical/FairPlay acceptance remains blocked. |
+| 2026-07-20 | Step 15 capability/stack hardening | Added fail-closed `/info` capability assertions and removed a real 64 KiB Switch worker-stack overflow from the RTSP error path; sanitizer, host and strict Switch validation pass. |
+| 2026-07-20 | Step 15 final CI | Build 98 passed every host, Docker, strict Switch, package, upload and continuous Release stage; the plan remains blocked only on proprietary FairPlay compatibility and physical-device acceptance. |
+| 2026-07-20 | Step 7 GPL backend | Vendored the fixed UxPlay PlayFair subset with provenance/license preservation, added bounded stage-one/stage-two/key adaptation, fixed two imported undefined-arithmetic cases, enabled truthful mirror capability publication, and passed normal/sanitizer/receiver/package/Switch development checks; physical iPhone/Switch acceptance remains. |
+| 2026-07-20 | Step 7 GPL backend CI | Run `29728903616` passed every host, Docker, strict Switch, package, artifact and continuous Release stage for `f5e21b2`; only physical iPhone/Switch protocol and playback acceptance remains. |
+| 2026-07-21 | Step 7 hardware attempt 1 | Explained the pre-discovery failure as an Ed25519-disabled local NRO, made VS Code/nxlink builds require `switch-libsodium`, exposed redacted startup stages, and verified normal/sanitizer/target builds; discovery must be retried with a strict artifact. |
+| 2026-07-21 | Step 7 hardware attempt 1 fix | Run `29745733797` passed all strict CI stages and its continuous NRO replaced the incompatible local artifact; the next test can proceed directly with upload-only nxlink. |
+| 2026-07-21 | Step 7 hardware attempt 2 fix | Replaced libsodium's fatal `/dev/urandom` startup path with an atomic libnx `randomGet()` backend, added receiver startup boundaries and release attestation; physical startup/discovery retest remains. |
+| 2026-07-21 | Step 7 hardware attempt 2 CI | Run `29748063877` passed every host, Docker, strict Switch, package, artifact and continuous Release stage for code commit `bca12bc`; physical startup/discovery retest remains. |
+| 2026-07-21 | Step 7 hardware attempt 3 fix | Removed synchronous AirPlay work from the first-frame path, added crash-proof timed startup stages, replaced external-route address probing with NIFM, and aligned DNS-SD pairing/audio/RAOP metadata with UxPlay behavior; automated validation passes and physical discovery remains. |
+| 2026-07-21 | Step 7 hardware attempt 3 CI | Run `29750313369` passed every host, container, strict Switch, package, artifact and continuous Release stage for `25cc6a3`; physical discovery and pairing remain the next gate. |
+| 2026-07-21 | Step 7 hardware attempt 4 fix | Localized the reset before all control traffic, removed AirPlay's isolated NIFM service lifecycle in favor of DLNA's stable UDP address lookup, and added crash-visible mDNS/control boundaries; physical discovery and first request remain the acceptance gate. |
+| 2026-07-21 | Step 7 hardware attempt 5 fix | Proved the accepted control worker overflowed its 64 KiB stack before parsing, moved the 100 KiB parser staging object to the heap, and added a 32 KiB production stack-frame build gate; physical handshake retest remains. |
+| 2026-07-21 | Step 7 hardware attempts 6-7 fixes | Preserved PIN/SRP setup across control reconnects, completed all three real-device Setup stages, aligned the empty Pair Verify completion response with UxPlay, and moved initial mDNS announcement onto its socket-owning worker so integration can leave WAIT; physical `/fp-setup`/SETUP retest remains. |
+| 2026-07-21 | Step 7 hardware attempt 8 fix | Proved Pair Verify succeeds but iOS stops before FairPlay, added UxPlay-compatible common RTSP response headers and secret-safe response/close diagnostics, and removed the final logging dependency from AirPlay readiness; physical `/fp-setup`/SETUP retest remains. |
+| 2026-07-21 | Step 7 hardware attempt 9 fix | Corrected the readiness diagnosis, aligned startup thread priority, added bounded dual AirPlay/RAOP DNS-SD publication, and serialized player stop before returning to the home deko3d renderer; physical `/fp-setup`/SETUP and Home recovery retest remains. |
+| 2026-07-21 | Step 7 hardware attempt 10 fix | Localized the remaining abort after successful Pair Verify, replaced the incomplete `0x48000391` advertisement with UxPlay's `0x5A7FFEE6` legacy-PIN mirroring profile across discovery and `/info`, and added dual-service wire assertions plus final-mask diagnostics; physical `/fp-setup`/SETUP retest remains. |

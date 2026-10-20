@@ -1,0 +1,1050 @@
+#include "../handler.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#include "../handler_internal.h"
+#include "app/protocol_coordinator.h"
+#include "log/log.h"
+#include "player/renderer.h"
+#include "player/seek_target.h"
+#include "player/trace.h"
+#include "protocol/dlna/control/controller_session.h"
+
+#define AVTRANSPORT_COUNTER_UNKNOWN 2147483647
+#define AVTRANSPORT_TRACE_URL_MAX 160
+#define DLNA_PLAYER_OWNER_TOKEN 1u
+#define DLNA_PLAYER_COMMAND_TIMEOUT_MS 750u
+#define DLNA_RESOURCE_TRANSITION_TIMEOUT_MS 6000u
+
+static void avtransport_note_controller_poll(void)
+{
+    uint64_t now_ms = dlna_controller_session_now_ms();
+
+    if (dlna_controller_session_note_poll_at(now_ms))
+    {
+        DlnaControllerSessionSnapshot snapshot = {0};
+
+        (void)dlna_controller_session_get_snapshot(&snapshot);
+        log_info("[dlna-control] event=session-armed polls=%u "
+                 "last_poll_ms=%llu\n",
+                 snapshot.poll_count,
+                 (unsigned long long)snapshot.last_poll_ms);
+    }
+}
+
+static void avtransport_refresh_controller(void)
+{
+    dlna_controller_session_refresh_at(dlna_controller_session_now_ms());
+}
+
+static bool avtransport_submit_leased_command(
+    const PlayerOwnershipLease *lease, PlayerCommandKind kind,
+    const char *text, int value)
+{
+    PlayerCommandRequest request;
+    PlayerCommandStatus status;
+
+    if (!lease)
+        return false;
+    memset(&request, 0, sizeof(request));
+    request.kind = kind;
+    request.source = PLAYER_COMMAND_SOURCE_DLNA;
+    request.lease = *lease;
+    request.text = text;
+    request.value = value;
+    status = player_submit_command_wait(&request,
+                                        DLNA_PLAYER_COMMAND_TIMEOUT_MS);
+    return player_command_status_succeeded(status);
+}
+
+static bool avtransport_submit_owned_command(PlayerCommandKind kind,
+                                             const char *text,
+                                             int value)
+{
+    ProtocolMediaGuard guard;
+    bool submitted;
+
+    if (!protocol_coordinator_media_guard_begin(
+            PLAYER_MEDIA_OWNER_DLNA, DLNA_PLAYER_OWNER_TOKEN, &guard))
+        return false;
+    submitted = avtransport_submit_leased_command(&guard.lease, kind, text,
+                                                  value);
+    protocol_coordinator_media_guard_end(&guard);
+    return submitted;
+}
+
+#if defined(NXCAST_EXCLUSIVE_MEDIA_RESOURCES) && \
+    NXCAST_EXCLUSIVE_MEDIA_RESOURCES
+static bool avtransport_submit_play_command(void)
+{
+    ProtocolMediaGuard guard;
+    ProtocolMediaTransaction transaction;
+    bool submitted;
+
+    if (protocol_coordinator_media_guard_begin(
+            PLAYER_MEDIA_OWNER_DLNA, DLNA_PLAYER_OWNER_TOKEN, &guard))
+    {
+        submitted = avtransport_submit_leased_command(
+            &guard.lease, PLAYER_COMMAND_PLAY, NULL, 0);
+        protocol_coordinator_media_guard_end(&guard);
+        return submitted;
+    }
+
+    if (!protocol_coordinator_media_begin(PLAYER_MEDIA_OWNER_DLNA,
+                                          DLNA_PLAYER_OWNER_TOKEN,
+                                          &transaction))
+        return false;
+    if (!protocol_coordinator_media_wait_resources(
+            &transaction.lease, DLNA_RESOURCE_TRANSITION_TIMEOUT_MS))
+    {
+        protocol_coordinator_media_abort(&transaction);
+        return false;
+    }
+    submitted = avtransport_submit_leased_command(
+        &transaction.lease, PLAYER_COMMAND_PLAY, NULL, 0);
+    if (submitted)
+        protocol_coordinator_media_end(&transaction);
+    else
+        protocol_coordinator_media_abort(&transaction);
+    return submitted;
+}
+#endif
+
+static bool avtransport_submit_stop_and_release(void)
+{
+#if defined(NXCAST_EXCLUSIVE_MEDIA_RESOURCES) && \
+    NXCAST_EXCLUSIVE_MEDIA_RESOURCES
+    ProtocolMediaGuard guard;
+    PlayerOwnershipLease lease;
+    bool submitted;
+
+    if (!protocol_coordinator_media_guard_begin(
+            PLAYER_MEDIA_OWNER_DLNA, DLNA_PLAYER_OWNER_TOKEN, &guard))
+    {
+        PlayerOwnershipLease current = {0};
+
+        return !protocol_coordinator_media_current(&current);
+    }
+    lease = guard.lease;
+    submitted = avtransport_submit_leased_command(
+        &lease, PLAYER_COMMAND_STOP, NULL, 0);
+    protocol_coordinator_media_guard_end(&guard);
+    if (submitted)
+        (void)protocol_coordinator_media_release(&lease);
+    return submitted;
+#else
+    return avtransport_submit_owned_command(PLAYER_COMMAND_STOP, NULL, 0);
+#endif
+}
+
+static bool avtransport_run_owned_seek_ms(int position_ms)
+{
+    return avtransport_submit_owned_command(PLAYER_COMMAND_SEEK_MS, NULL,
+                                            position_ms);
+}
+
+static bool avtransport_run_owned_seek_target(const char *target)
+{
+    return avtransport_submit_owned_command(PLAYER_COMMAND_SEEK_TARGET,
+                                            target, 0);
+}
+
+static void avtransport_get_snapshot(RendererSnapshot *snapshot)
+{
+    ProtocolMediaGuard guard;
+
+    if (!snapshot)
+        return;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!protocol_coordinator_media_guard_begin(
+            PLAYER_MEDIA_OWNER_DLNA, DLNA_PLAYER_OWNER_TOKEN, &guard))
+    {
+        snapshot->has_media = dlna_protocol_state_view()->av_transport_uri[0] != '\0';
+        snapshot->state = snapshot->has_media ? PLAYER_STATE_STOPPED
+                                              : PLAYER_STATE_IDLE;
+        return;
+    }
+    if (renderer_get_snapshot(snapshot))
+    {
+        protocol_coordinator_media_guard_end(&guard);
+        return;
+    }
+
+    snapshot->state = renderer_get_state();
+    snapshot->position_ms = renderer_get_position_ms();
+    snapshot->duration_ms = renderer_get_duration_ms();
+    snapshot->volume = renderer_get_volume();
+    snapshot->mute = renderer_get_mute();
+    snapshot->seekable = renderer_is_seekable();
+    snapshot->has_media = dlna_protocol_state_view()->av_transport_uri[0] != '\0';
+    protocol_coordinator_media_guard_end(&guard);
+}
+
+static unsigned int avtransport_current_actions(const RendererSnapshot *snapshot)
+{
+    unsigned int actions = 0;
+
+    if (!snapshot || !snapshot->has_media)
+        return 0;
+
+    switch (snapshot->state)
+    {
+    case PLAYER_STATE_STOPPED:
+    case PLAYER_STATE_PAUSED:
+        actions |= 1u << 0; /* Play */
+        actions |= 1u << 1; /* Stop */
+        if (snapshot->seekable)
+            actions |= 1u << 3; /* Seek */
+        break;
+    case PLAYER_STATE_BUFFERING:
+    case PLAYER_STATE_LOADING:
+    case PLAYER_STATE_SEEKING:
+        actions |= 1u << 1; /* Stop */
+        break;
+    case PLAYER_STATE_PLAYING:
+        actions |= 1u << 1; /* Stop */
+        actions |= 1u << 2; /* Pause */
+        if (snapshot->seekable)
+            actions |= 1u << 3; /* Seek */
+        break;
+    case PLAYER_STATE_IDLE:
+    case PLAYER_STATE_ERROR:
+    default:
+        break;
+    }
+
+    return actions;
+}
+
+static char *avtransport_format_actions_alloc(unsigned int actions)
+{
+    bool first = true;
+    char *out = strdup("");
+    char *next = NULL;
+
+    if (!out)
+        return NULL;
+
+    if (actions & (1u << 0))
+    {
+        next = soap_handler_strdup_printf("%s%sPlay", out, first ? "" : ",");
+        free(out);
+        out = next;
+        if (!out)
+            return NULL;
+        first = false;
+    }
+    if (actions & (1u << 1))
+    {
+        next = soap_handler_strdup_printf("%s%sStop", out, first ? "" : ",");
+        free(out);
+        out = next;
+        if (!out)
+            return NULL;
+        first = false;
+    }
+    if (actions & (1u << 2))
+    {
+        next = soap_handler_strdup_printf("%s%sPause", out, first ? "" : ",");
+        free(out);
+        out = next;
+        if (!out)
+            return NULL;
+        first = false;
+    }
+    if (actions & (1u << 3))
+    {
+        next = soap_handler_strdup_printf("%s%sSeek", out, first ? "" : ",");
+        free(out);
+        out = next;
+    }
+
+    return out;
+}
+
+static char *avtransport_normalize_seek_target_alloc(const char *target)
+{
+    int position_ms = 0;
+
+    if (!target)
+        return NULL;
+    if (player_seek_target_parse_ms(target, &position_ms))
+        return player_seek_target_format_hhmmss_alloc(position_ms);
+    return strdup(target);
+}
+
+static bool avtransport_try_instance_id(const SoapActionContext *ctx,
+                                        SoapActionOutput *out,
+                                        const char *action_name,
+                                        char **instance_id_out)
+{
+    if (!ctx || !out || !action_name || !instance_id_out)
+        return false;
+
+    *instance_id_out = NULL;
+    if (soap_handler_try_arg_alloc(ctx, "InstanceID", instance_id_out))
+        return true;
+
+    *instance_id_out = strdup("0");
+    if (!*instance_id_out)
+    {
+        soap_handler_set_fault(out, 501, "Action Failed");
+        return false;
+    }
+    log_debug("[avtransport] default InstanceID=0 for %s\n", action_name);
+    return true;
+}
+
+static char *avtransport_escape_alloc(const char *value, SoapActionOutput *out)
+{
+    char *escaped = soap_handler_xml_escape_alloc(value);
+    if (!escaped)
+    {
+        soap_handler_set_fault(out, 501, "Action Failed");
+        return NULL;
+    }
+
+    return escaped;
+}
+
+static bool avtransport_write_text_element(SoapActionOutput *out, const char *tag, const char *value)
+{
+    if (soap_writer_element_text(out, tag, value))
+        return true;
+    soap_handler_set_fault(out, 501, "Action Failed");
+    return false;
+}
+
+static bool avtransport_write_raw_element(SoapActionOutput *out, const char *tag, const char *value)
+{
+    if (soap_writer_element_raw(out, tag, value))
+        return true;
+    soap_handler_set_fault(out, 501, "Action Failed");
+    return false;
+}
+
+static bool avtransport_write_int_element(SoapActionOutput *out, const char *tag, long value)
+{
+    if (soap_writer_element_int(out, tag, value))
+        return true;
+    soap_handler_set_fault(out, 501, "Action Failed");
+    return false;
+}
+
+static void avtransport_log_trace(const char *action, const char *phase, const char *uri, const char *detail)
+{
+    char summary[AVTRANSPORT_TRACE_URL_MAX];
+    uint32_t seq = player_trace_current_media_seq();
+    uint32_t hash = uri && uri[0] ? player_trace_uri_hash(uri) : player_trace_current_media_hash();
+
+    if (phase && strcmp(phase, "failed") == 0)
+    {
+        player_trace_warn("[media-trace] seq=%u t_ms=%llu layer=soap action=%s phase=%s url_hash=%08x detail=%s url=%s\n",
+                          seq,
+                          (unsigned long long)player_trace_elapsed_ms(),
+                          action ? action : "(unknown)",
+                          phase,
+                          hash,
+                          detail ? detail : "-",
+                          player_trace_uri_summary(uri, summary, sizeof(summary)));
+        return;
+    }
+
+    player_trace_log("[media-trace] seq=%u t_ms=%llu layer=soap action=%s phase=%s url_hash=%08x detail=%s url=%s\n",
+                     seq,
+                     (unsigned long long)player_trace_elapsed_ms(),
+                     action ? action : "(unknown)",
+                     phase ? phase : "(unknown)",
+                     hash,
+                     detail ? detail : "-",
+                     player_trace_uri_summary(uri, summary, sizeof(summary)));
+}
+
+static bool parse_track_number(const char *value, int *out_track)
+{
+    char *end = NULL;
+    long track;
+
+    if (!value || !out_track)
+        return false;
+
+    track = strtol(value, &end, 10);
+    if (!end || *end != '\0' || track < 1 || track > 2147483647L)
+        return false;
+
+    *out_track = (int)track;
+    return true;
+}
+
+static bool avtransport_seek_track_number(const DlnaProtocolStateView *state, SoapActionOutput *out, const char *target)
+{
+    int track = 0;
+
+    if (!state || !out || !target)
+        return false;
+
+    if (!parse_track_number(target, &track))
+    {
+        soap_handler_set_fault(out, 711, "Illegal seek target");
+        return false;
+    }
+
+    if (state->number_of_tracks <= 0 || track > state->number_of_tracks)
+    {
+        soap_handler_set_fault(out, 711, "Illegal seek target");
+        return false;
+    }
+
+    if (track != state->current_track)
+    {
+        soap_handler_set_fault(out, 711, "Illegal seek target");
+        return false;
+    }
+
+    if (!avtransport_run_owned_seek_ms(0))
+    {
+        soap_handler_set_fault(out, 701, "Transition not available");
+        return false;
+    }
+
+    dlna_protocol_state_apply_seek_target("00:00:00");
+    dlna_protocol_state_set_transport_status("OK");
+    return true;
+}
+
+static bool avtransport_track_nav(const SoapActionContext *ctx,
+                                  SoapActionOutput *out,
+                                  const char *action_name,
+                                  int delta)
+{
+    char *instance_id = NULL;
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+    int target_track;
+
+    if (!ctx || !out || !action_name)
+        return false;
+
+    if (!avtransport_try_instance_id(ctx, out, action_name, &instance_id))
+        return false;
+
+    if (state->av_transport_uri[0] == '\0')
+    {
+        free(instance_id);
+        soap_handler_set_fault(out, 701, "Transition not available");
+        return false;
+    }
+
+    target_track = state->current_track + delta;
+    if (state->number_of_tracks <= 0 || target_track < 1 || target_track > state->number_of_tracks)
+    {
+        free(instance_id);
+        soap_handler_set_fault(out, 711, "Illegal seek target");
+        return false;
+    }
+
+    free(instance_id);
+    soap_handler_set_fault(out, 701, "Transition not available");
+    return false;
+}
+
+bool avtransport_set_uri(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    char *uri = NULL;
+    char *metadata = NULL;
+    uint32_t seq = 0;
+    char summary[AVTRANSPORT_TRACE_URL_MAX];
+    ProtocolMediaTransaction transaction;
+    PlayerCommandRequest request;
+    PlayerCommandStatus command_status;
+
+    if (!ctx || !out)
+        return false;
+
+    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", &instance_id))
+        return false;
+
+    if (!soap_handler_require_arg_alloc(ctx, out, "CurrentURI", &uri))
+    {
+        free(instance_id);
+        return false;
+    }
+
+    if (!soap_handler_try_arg_alloc(ctx, "CurrentURIMetaData", &metadata))
+    {
+        metadata = strdup("");
+        if (!metadata)
+        {
+            free(instance_id);
+            free(uri);
+            soap_handler_set_fault(out, 501, "Action Failed");
+            return false;
+        }
+    }
+
+    seq = player_trace_begin_media("SetAVTransportURI", uri, metadata);
+    player_trace_log("[media-trace] seq=%u t_ms=%llu layer=soap action=SetAVTransportURI phase=dispatch instance=%s url_hash=%08x url=%s\n",
+                     seq,
+                     (unsigned long long)player_trace_elapsed_ms(),
+                     instance_id,
+                     player_trace_uri_hash(uri),
+                     player_trace_uri_summary(uri, summary, sizeof(summary)));
+
+    if (!protocol_coordinator_media_begin(PLAYER_MEDIA_OWNER_DLNA,
+                                          DLNA_PLAYER_OWNER_TOKEN,
+                                          &transaction))
+    {
+        free(instance_id);
+        free(uri);
+        free(metadata);
+        soap_handler_set_fault(out, 501, "Action Failed");
+        return false;
+    }
+    if (!protocol_coordinator_media_wait_resources(
+            &transaction.lease, DLNA_RESOURCE_TRANSITION_TIMEOUT_MS))
+    {
+        protocol_coordinator_media_abort(&transaction);
+        player_trace_warn("[media-trace] seq=%u t_ms=%llu layer=soap "
+                          "action=SetAVTransportURI phase=failed "
+                          "reason=resource-transition url_hash=%08x url=%s\n",
+                          seq,
+                          (unsigned long long)player_trace_elapsed_ms(),
+                          player_trace_uri_hash(uri),
+                          player_trace_uri_summary(uri, summary,
+                                                   sizeof(summary)));
+        free(instance_id);
+        free(uri);
+        free(metadata);
+        soap_handler_set_fault(out, 501, "Action Failed");
+        return false;
+    }
+    memset(&request, 0, sizeof(request));
+    request.kind = PLAYER_COMMAND_OPEN;
+    request.source = PLAYER_COMMAND_SOURCE_DLNA;
+    request.lease = transaction.lease;
+    request.uri = uri;
+    request.metadata = metadata;
+    command_status = player_submit_command_wait(
+        &request, DLNA_PLAYER_COMMAND_TIMEOUT_MS);
+    if (!player_command_status_succeeded(command_status))
+    {
+        protocol_coordinator_media_abort(&transaction);
+        player_trace_warn("[media-trace] seq=%u t_ms=%llu layer=soap action=SetAVTransportURI phase=failed reason=%s url_hash=%08x url=%s\n",
+                          seq,
+                          (unsigned long long)player_trace_elapsed_ms(),
+                          player_command_status_name(command_status),
+                          player_trace_uri_hash(uri),
+                          player_trace_uri_summary(uri, summary, sizeof(summary)));
+        free(instance_id);
+        free(uri);
+        free(metadata);
+        soap_handler_set_fault(out, 501, "Action Failed");
+        return false;
+    }
+    protocol_coordinator_media_end(&transaction);
+
+    dlna_controller_session_reset();
+    dlna_protocol_state_apply_set_uri(uri, metadata);
+    player_trace_log("[media-trace] seq=%u t_ms=%llu layer=soap action=SetAVTransportURI phase=done url_hash=%08x url=%s\n",
+                     seq,
+                     (unsigned long long)player_trace_elapsed_ms(),
+                     player_trace_uri_hash(uri),
+                     player_trace_uri_summary(uri, summary, sizeof(summary)));
+
+    free(instance_id);
+    free(uri);
+    free(metadata);
+    soap_handler_set_success(out, "");
+    return true;
+}
+
+bool avtransport_play(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    char *speed = NULL;
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+
+    if (!ctx || !out)
+        return false;
+
+    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", &instance_id))
+        return false;
+
+    if (!soap_handler_require_arg_alloc(ctx, out, "Speed", &speed))
+    {
+        free(instance_id);
+        return false;
+    }
+
+    if (state->av_transport_uri[0] == '\0')
+    {
+        free(instance_id);
+        free(speed);
+        soap_handler_set_fault(out, 701, "Transition not available");
+        return false;
+    }
+
+    avtransport_log_trace("Play", "begin", state->av_transport_uri, speed);
+#if defined(NXCAST_EXCLUSIVE_MEDIA_RESOURCES) && \
+    NXCAST_EXCLUSIVE_MEDIA_RESOURCES
+    if (!avtransport_submit_play_command())
+#else
+    if (!avtransport_submit_owned_command(PLAYER_COMMAND_PLAY, NULL, 0))
+#endif
+    {
+        avtransport_log_trace("Play", "failed", state->av_transport_uri, "player-command");
+        free(instance_id);
+        free(speed);
+        soap_handler_set_fault(out, 704, "Playing failed");
+        return false;
+    }
+
+    dlna_protocol_state_set_transport_speed(speed);
+    dlna_protocol_state_apply_play();
+    avtransport_refresh_controller();
+    avtransport_log_trace("Play", "done", state->av_transport_uri, speed);
+    free(instance_id);
+    free(speed);
+    soap_handler_set_success(out, "");
+    return true;
+}
+
+bool avtransport_pause(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+
+    if (!ctx || !out)
+        return false;
+
+    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", &instance_id))
+        return false;
+
+    if (state->av_transport_uri[0] == '\0')
+    {
+        free(instance_id);
+        soap_handler_set_fault(out, 701, "Transition not available");
+        return false;
+    }
+
+    avtransport_log_trace("Pause", "begin", state->av_transport_uri, "-");
+    if (!avtransport_submit_owned_command(PLAYER_COMMAND_PAUSE, NULL, 0))
+    {
+        avtransport_log_trace("Pause", "failed", state->av_transport_uri, "player-command");
+        free(instance_id);
+        soap_handler_set_fault(out, 701, "Transition not available");
+        return false;
+    }
+
+    dlna_protocol_state_apply_pause();
+    avtransport_refresh_controller();
+    avtransport_log_trace("Pause", "done", state->av_transport_uri, "-");
+    free(instance_id);
+    soap_handler_set_success(out, "");
+    return true;
+}
+
+bool avtransport_stop(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+
+    if (!ctx || !out)
+        return false;
+
+    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", &instance_id))
+        return false;
+
+    avtransport_log_trace("Stop", "begin", dlna_protocol_state_view()->av_transport_uri, "-");
+    if (!avtransport_submit_stop_and_release())
+    {
+        avtransport_log_trace("Stop", "failed", dlna_protocol_state_view()->av_transport_uri, "player-command");
+        free(instance_id);
+        soap_handler_set_fault(out, 701, "Transition not available");
+        return false;
+    }
+
+    dlna_protocol_state_apply_stop();
+    dlna_controller_session_request_home();
+    avtransport_log_trace("Stop", "done", dlna_protocol_state_view()->av_transport_uri, "-");
+    free(instance_id);
+    soap_handler_set_success(out, "");
+    return true;
+}
+
+bool avtransport_get_transport_info(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+
+    if (!ctx || !out)
+        return false;
+
+    // Some mobile control points omit InstanceID for read-only queries.
+    // Treat missing value as "0" for compatibility.
+    if (!avtransport_try_instance_id(ctx, out, "GetTransportInfo", &instance_id))
+        return false;
+
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+
+    soap_writer_clear(out);
+    if (!avtransport_write_text_element(out, "CurrentTransportState", state->transport_state) ||
+        !avtransport_write_text_element(out, "CurrentTransportStatus", state->transport_status) ||
+        !avtransport_write_text_element(out, "CurrentSpeed", state->transport_play_speed))
+    {
+        free(instance_id);
+        return false;
+    }
+
+    free(instance_id);
+    soap_handler_set_success(out, NULL);
+    avtransport_note_controller_poll();
+    return true;
+}
+
+bool avtransport_get_device_capabilities(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+
+    if (!ctx || !out)
+        return false;
+
+    if (!avtransport_try_instance_id(ctx, out, "GetDeviceCapabilities", &instance_id))
+        return false;
+
+    soap_writer_clear(out);
+    if (!avtransport_write_text_element(out, "PlayMedia", "NETWORK") ||
+        !avtransport_write_text_element(out, "RecMedia", "NOT_IMPLEMENTED") ||
+        !avtransport_write_text_element(out, "RecQualityModes", "NOT_IMPLEMENTED"))
+    {
+        free(instance_id);
+        return false;
+    }
+
+    free(instance_id);
+    soap_handler_set_success(out, NULL);
+    return true;
+}
+
+bool avtransport_get_transport_settings(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+
+    if (!ctx || !out)
+        return false;
+
+    if (!avtransport_try_instance_id(ctx, out, "GetTransportSettings", &instance_id))
+        return false;
+
+    soap_writer_clear(out);
+    if (!avtransport_write_text_element(out, "PlayMode", state->current_play_mode) ||
+        !avtransport_write_text_element(out, "RecQualityMode", "NOT_IMPLEMENTED"))
+    {
+        free(instance_id);
+        return false;
+    }
+
+    free(instance_id);
+    soap_handler_set_success(out, NULL);
+    return true;
+}
+
+bool avtransport_get_current_transport_actions(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    RendererSnapshot snapshot;
+    unsigned int actions;
+    char *action_list = NULL;
+    if (!ctx || !out)
+        return false;
+
+    if (!avtransport_try_instance_id(ctx, out, "GetCurrentTransportActions", &instance_id))
+        return false;
+
+    avtransport_get_snapshot(&snapshot);
+    actions = avtransport_current_actions(&snapshot);
+    action_list = avtransport_format_actions_alloc(actions);
+    renderer_snapshot_clear(&snapshot);
+    if (!action_list)
+    {
+        free(instance_id);
+        soap_handler_set_fault(out, 501, "Action Failed");
+        return false;
+    }
+
+    soap_writer_clear(out);
+    if (!avtransport_write_text_element(out, "Actions", action_list))
+    {
+        free(instance_id);
+        free(action_list);
+        return false;
+    }
+
+    free(instance_id);
+    free(action_list);
+    soap_handler_set_success(out, NULL);
+    return true;
+}
+
+bool avtransport_get_media_info(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+
+    if (!ctx || !out)
+        return false;
+
+    if (!avtransport_try_instance_id(ctx, out, "GetMediaInfo", &instance_id))
+        return false;
+
+    RendererSnapshot snapshot;
+    int duration_ms = 0;
+    int position_ms = 0;
+
+    avtransport_get_snapshot(&snapshot);
+    duration_ms = snapshot.duration_ms;
+    position_ms = snapshot.position_ms;
+    renderer_snapshot_clear(&snapshot);
+
+    dlna_protocol_state_set_transport_timing(duration_ms, position_ms);
+
+    char *escaped_uri = avtransport_escape_alloc(state->av_transport_uri, out);
+    char *escaped_metadata = avtransport_escape_alloc(state->av_transport_uri_metadata, out);
+    if (!escaped_uri || !escaped_metadata)
+    {
+        free(instance_id);
+        free(escaped_uri);
+        free(escaped_metadata);
+        return false;
+    }
+
+    soap_writer_clear(out);
+    bool ok = avtransport_write_int_element(out, "NrTracks", state->number_of_tracks) &&
+              avtransport_write_text_element(out, "MediaDuration", state->current_media_duration) &&
+              avtransport_write_raw_element(out, "CurrentURI", escaped_uri) &&
+              avtransport_write_raw_element(out, "CurrentURIMetaData", escaped_metadata) &&
+              avtransport_write_text_element(out, "NextURI", state->next_av_transport_uri) &&
+              avtransport_write_text_element(out, "NextURIMetaData", state->next_av_transport_uri_metadata) &&
+              avtransport_write_text_element(out, "PlayMedium", state->playback_storage_medium) &&
+              avtransport_write_text_element(out, "RecordMedium", "NOT_IMPLEMENTED") &&
+              avtransport_write_text_element(out, "WriteStatus", "NOT_IMPLEMENTED");
+    free(escaped_uri);
+    free(escaped_metadata);
+    if (!ok)
+    {
+        free(instance_id);
+        return false;
+    }
+
+    free(instance_id);
+    soap_handler_set_success(out, NULL);
+    return true;
+}
+
+bool avtransport_get_position_info(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+    if (!ctx || !out)
+        return false;
+
+    if (!avtransport_try_instance_id(ctx, out, "GetPositionInfo", &instance_id))
+        return false;
+
+    RendererSnapshot snapshot;
+    bool has_snapshot = false;
+    int position_ms = 0;
+    int duration_ms = 0;
+
+    avtransport_get_snapshot(&snapshot);
+    has_snapshot = snapshot.has_media;
+    position_ms = snapshot.position_ms;
+    duration_ms = snapshot.duration_ms;
+    renderer_snapshot_clear(&snapshot);
+
+    dlna_protocol_state_set_transport_timing(duration_ms, position_ms);
+    (void)has_snapshot;
+
+    char *escaped_uri = avtransport_escape_alloc(state->current_track_uri, out);
+    char *escaped_metadata = avtransport_escape_alloc(state->current_track_metadata, out);
+    if (!escaped_uri || !escaped_metadata)
+    {
+        free(instance_id);
+        free(escaped_uri);
+        free(escaped_metadata);
+        return false;
+    }
+
+    soap_writer_clear(out);
+    bool ok = avtransport_write_int_element(out, "Track", state->current_track) &&
+              avtransport_write_text_element(out, "TrackDuration", state->current_track_duration) &&
+              avtransport_write_raw_element(out, "TrackMetaData", escaped_metadata) &&
+              avtransport_write_raw_element(out, "TrackURI", escaped_uri) &&
+              avtransport_write_text_element(out, "RelTime", state->relative_time_position) &&
+              avtransport_write_text_element(out, "AbsTime", state->absolute_time_position) &&
+              avtransport_write_int_element(out, "RelCount", state->relative_counter_position) &&
+              avtransport_write_int_element(out, "AbsCount", state->absolute_counter_position);
+    free(escaped_uri);
+    free(escaped_metadata);
+    if (!ok)
+    {
+        free(instance_id);
+        return false;
+    }
+
+    free(instance_id);
+    soap_handler_set_success(out, NULL);
+    avtransport_note_controller_poll();
+    return true;
+}
+
+bool avtransport_seek(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    char *unit = NULL;
+    char *target = NULL;
+    char *normalized_target = NULL;
+    const char *effective_target = NULL;
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+
+    if (!ctx || !out)
+        return false;
+
+    if (!avtransport_try_instance_id(ctx, out, "Seek", &instance_id))
+        return false;
+
+    if (!soap_handler_try_arg_alloc(ctx, "Unit", &unit))
+    {
+        unit = strdup("REL_TIME");
+        if (!unit)
+        {
+            free(instance_id);
+            soap_handler_set_fault(out, 501, "Action Failed");
+            return false;
+        }
+        log_debug("[avtransport] default Unit=REL_TIME for Seek\n");
+    }
+
+    if (!soap_handler_try_arg_alloc(ctx, "Target", &target))
+    {
+        target = strdup("00:00:00");
+        if (!target)
+        {
+            free(instance_id);
+            free(unit);
+            soap_handler_set_fault(out, 501, "Action Failed");
+            return false;
+        }
+        log_debug("[avtransport] default Target=00:00:00 for Seek\n");
+    }
+
+    if (strcasecmp(unit, "REL_TIME") != 0 &&
+        strcasecmp(unit, "ABS_TIME") != 0 &&
+        strcasecmp(unit, "TRACK_NR") != 0)
+    {
+        free(instance_id);
+        free(unit);
+        free(target);
+        soap_handler_set_fault(out, 710, "Seek mode not supported");
+        return false;
+    }
+
+    if (state->av_transport_uri[0] == '\0')
+    {
+        free(instance_id);
+        free(unit);
+        free(target);
+        soap_handler_set_fault(out, 701, "Transition not available");
+        return false;
+    }
+
+    if (strcasecmp(unit, "TRACK_NR") == 0)
+    {
+        avtransport_log_trace("Seek", "begin", state->av_transport_uri, target);
+        bool ok = avtransport_seek_track_number(state, out, target);
+        free(instance_id);
+        free(unit);
+        free(target);
+        avtransport_log_trace("Seek", ok ? "done" : "failed", state->av_transport_uri, "TRACK_NR");
+        if (!ok)
+            return false;
+        avtransport_refresh_controller();
+        soap_handler_set_success(out, "");
+        return true;
+    }
+
+    normalized_target = avtransport_normalize_seek_target_alloc(target);
+    effective_target = normalized_target ? normalized_target : target;
+    if (normalized_target && strcmp(normalized_target, target) != 0)
+        log_debug("[avtransport] normalize seek target raw=%s normalized=%s\n", target, normalized_target);
+
+    avtransport_log_trace("Seek", "begin", state->av_transport_uri, effective_target);
+    if (!avtransport_run_owned_seek_target(effective_target))
+    {
+        avtransport_log_trace("Seek", "failed", state->av_transport_uri, "player-command");
+        free(instance_id);
+        free(unit);
+        free(target);
+        free(normalized_target);
+        soap_handler_set_fault(out, 701, "Transition not available");
+        return false;
+    }
+
+    dlna_protocol_state_apply_seek_target(effective_target);
+    dlna_protocol_state_set_transport_status("OK");
+    avtransport_refresh_controller();
+    avtransport_log_trace("Seek", "done", state->av_transport_uri, effective_target);
+    free(instance_id);
+    free(unit);
+    free(target);
+    free(normalized_target);
+    soap_handler_set_success(out, "");
+    return true;
+}
+
+bool avtransport_next(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    return avtransport_track_nav(ctx, out, "Next", +1);
+}
+
+bool avtransport_previous(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    return avtransport_track_nav(ctx, out, "Previous", -1);
+}
+
+bool avtransport_set_play_mode(const SoapActionContext *ctx, SoapActionOutput *out)
+{
+    char *instance_id = NULL;
+    char *play_mode = NULL;
+
+    if (!ctx || !out)
+        return false;
+
+    if (!avtransport_try_instance_id(ctx, out, "SetPlayMode", &instance_id))
+        return false;
+
+    if (!soap_handler_require_arg_alloc(ctx, out, "NewPlayMode", &play_mode))
+    {
+        free(instance_id);
+        return false;
+    }
+
+    if (strcasecmp(play_mode, "NORMAL") != 0)
+    {
+        free(instance_id);
+        free(play_mode);
+        soap_handler_set_fault(out, 712, "Play mode not supported");
+        return false;
+    }
+
+    dlna_protocol_state_set_current_play_mode("NORMAL");
+    avtransport_refresh_controller();
+    free(instance_id);
+    free(play_mode);
+    soap_handler_set_success(out, "");
+    return true;
+}

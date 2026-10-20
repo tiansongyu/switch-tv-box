@@ -1,0 +1,94 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  toolchain:
+    uses: ./.github/workflows/toolchain.yml
+
+  build:
+    needs: toolchain
+    runs-on: ubuntu-latest
+    env:
+      TOOLCHAIN_IMAGE: ${{ needs.toolchain.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Test UI navigation and language
+        run: sh scripts/test_ui.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build NX-Cast in devkitPro container
+        run: |
+          docker run --rm \
+            -e DEVKITPRO=/opt/devkitpro \
+            -e NXCAST_MIN_NRO_SIZE=5000000 \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${TOOLCHAIN_IMAGE}" \
+            bash -lc 'set -euo pipefail; /usr/local/bin/verify_switch_ffmpeg_airplay.sh /opt/devkitpro/portlibs/switch; host_pc="/usr/lib/$(gcc -print-multiarch)/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig"; PKG_CONFIG_PATH="${host_pc}" make test-airplay; make RELEASE_JOBS=$(nproc) release-build'
+
+      - name: Package SD card layout
+        env:
+          NXCAST_MIN_NRO_SIZE: 5000000
+        run: ./scripts/package_release.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: nx-cast-${{ github.sha }}
+          path: |
+            dist/NX-Cast-sdmc.zip
+          if-no-files-found: error
+
+      - name: Prepare continuous GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        env:
+          CONTINUOUS_TAG: continuous
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${CONTINUOUS_TAG}" "${GITHUB_SHA}"
+          git push -f origin "refs/tags/${CONTINUOUS_TAG}"
+
+          notes_file="${RUNNER_TEMP}/nxcast-continuous-notes.md"
+          cat .github/continuous-release-notes.md > "${notes_file}"
+          printf '\n\n## Continuous Build\n\nAutomatic development build from `%s` at `%s`.\n' \
+            "${GITHUB_REF_NAME}" "${GITHUB_SHA}" >> "${notes_file}"
+
+      - name: Update continuous GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: continuous
+          target_commitish: ${{ github.sha }}
+          name: "DO NOT DOWNLOAD - NX-Cast Continuous (Development Build)"
+          body_path: ${{ runner.temp }}/nxcast-continuous-notes.md
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/NX-Cast-sdmc.zip

@@ -1,0 +1,33 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "NX-Cast: Rebuild & Upload",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "echo \"[NX-Cast] Task finished. Review the task terminal for details.\"",
+      "preLaunchTask": "NX-Cast: Rebuild + Upload"
+    },
+    {
+      "name": "NX-Cast: Full Trace & Upload + Logs",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "echo \"[NX-Cast] Task finished. Review the task terminal for details.\"",
+      "preLaunchTask": "NX-Cast: Full Trace + Upload + Logs"
+    },
+    {
+      "name": "NX-Cast: Upload Only",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "echo \"[NX-Cast] Task finished. Review the task terminal for details.\"",
+      "preLaunchTask": "NX-Cast: Upload"
+    },
+    {
+      "name": "NX-Cast: Publish GitHub Release",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "echo \"[NX-Cast] Task finished. Review the task terminal for details.\"",
+      "preLaunchTask": "NX-Cast: Publish GitHub Release"
+    }
+  ]
+}

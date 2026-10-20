@@ -1,0 +1,2823 @@
+#include "iptv/iptv.h"
+
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+
+#include <libavformat/avformat.h>
+#include <switch.h>
+
+#include "app/protocol_coordinator.h"
+#include "iptv/fetch.h"
+#include "iptv/data.h"
+#include "iptv/url.h"
+#include "iptv/xmltv.h"
+#include "log/log.h"
+#include "player/renderer.h"
+#include "player/trace.h"
+#include "player/ui/home.h"
+
+#define IPTV_BASE_DIR "sdmc:/switch/NX-Cast"
+#define IPTV_CACHE_DIR IPTV_ROOT_DIR "/cache"
+#define IPTV_PLAYLIST_CACHE_DIR IPTV_CACHE_DIR "/playlists"
+#define IPTV_EPG_CACHE_DIR IPTV_CACHE_DIR "/epg"
+#define IPTV_LOGO_CACHE_DIR IPTV_CACHE_DIR "/logos"
+#define IPTV_SOURCES_FILE IPTV_ROOT_DIR "/sources.tsv"
+#define IPTV_FAVORITES_FILE IPTV_ROOT_DIR "/favorites.txt"
+#define IPTV_RECENT_FILE IPTV_ROOT_DIR "/recent.txt"
+#define IPTV_REMOTE_PLAYLIST_LIMIT (16U * 1024U * 1024U)
+#define IPTV_XMLTV_LIMIT (64U * 1024U * 1024U)
+#define IPTV_LOGO_LIMIT (4U * 1024U * 1024U)
+#define IPTV_WORKER_STACK_SIZE 0x80000
+#define IPTV_RESOURCE_TRANSITION_TIMEOUT_MS 6000u
+#define IPTV_BACKGROUND_QUIESCE_TIMEOUT_MS 4000u
+#define IPTV_FALLBACK_NAME "IPTV Channel"
+
+typedef struct
+{
+    IptvChannel *channels;
+    size_t channel_capacity;
+    int channel_count;
+    IptvSource *sources;
+    size_t source_capacity;
+    int source_count;
+    char (*groups)[IPTV_GROUP_MAX];
+    size_t group_capacity;
+    int group_count;
+    bool failed;
+    bool preinstalled_refresh_needed;
+    int preinstalled_changed_count;
+    int hls_stream_count;
+    int logo_cached_count;
+    int epg_channel_count;
+} IptvCatalog;
+
+static Mutex g_mutex;
+/* Serializes disk rebuilds; never held by playback. */
+static Mutex g_catalog_mutex;
+static CondVar g_worker_cond;
+static Thread g_worker_thread;
+static bool g_sync_initialized;
+static bool g_worker_started;
+static atomic_bool g_worker_stop = false;
+static bool g_worker_busy;
+static atomic_bool g_background_suspended = false;
+static bool g_refresh_all_requested;
+static uint32_t g_refresh_source_requested;
+static bool g_logo_requested;
+static uint32_t g_logo_channel_id;
+static char g_logo_url[IPTV_LOGO_URL_MAX];
+static char g_logo_path[IPTV_PATH_MAX];
+
+static IptvChannel *g_channels;
+static int g_channel_count;
+static IptvSource *g_sources;
+static size_t g_source_capacity;
+static int g_source_count;
+static char (*g_groups)[IPTV_GROUP_MAX];
+static int g_group_count;
+static int *g_visible;
+static int g_visible_count;
+static int g_selected_index;
+static int g_source_selected_index;
+static int g_filter_index;
+static uint32_t g_source_filter_id;
+static uint32_t g_playing_channel_id;
+static int *g_filter_counts;
+static int g_favorite_count;
+static int g_recent_channel_count;
+static uint32_t g_recent_ids[IPTV_MAX_RECENT];
+static int g_recent_count;
+static bool g_initialized;
+static bool g_loaded;
+static bool g_refreshing;
+static uint32_t g_refreshing_source_id;
+static int g_hls_stream_count;
+static int g_logo_cached_count;
+static int g_epg_channel_count;
+static char g_search[IPTV_SEARCH_MAX];
+static char g_status[IPTV_STATUS_MAX];
+static char g_last_name[IPTV_NAME_MAX];
+static char g_last_url[IPTV_URL_MAX];
+static uint64_t g_playback_token;
+static bool g_preinstalled_refresh_needed;
+static int g_preinstalled_changed_count;
+
+static void iptv_queue_selected_logo_locked(void);
+
+static bool iptv_background_fetch_cancelled(void *context)
+{
+    (void)context;
+    return atomic_load(&g_background_suspended) ||
+           atomic_load(&g_worker_stop);
+}
+
+static const IptvFetchControl g_background_fetch_control = {
+    .cancelled = iptv_background_fetch_cancelled,
+    .context = NULL,
+};
+
+static void iptv_copy(char *out, size_t out_size, const char *value)
+{
+    size_t length;
+
+    if (!out || out_size == 0)
+        return;
+    if (!value)
+        value = "";
+    length = strlen(value);
+    if (length >= out_size)
+        length = out_size - 1;
+    memmove(out, value, length);
+    out[length] = '\0';
+}
+
+/* Store canonical status strings; translate copies at the UI boundary so a
+ * language switch also updates messages produced earlier by the worker. */
+static const char *iptv_text(const char *text)
+{
+    static const struct { const char *en; const char *zh; } messages[] = {
+        {"All channels", "全部频道"}, {"Favorites", "收藏"}, {"Recent", "最近播放"},
+        {"Local HLS", "本地 HLS"}, {"Remote HLS", "远程 HLS"},
+        {"Direct IPTV URL", "直接播放 IPTV 地址"},
+        {"Playing IPTV: Direct IPTV URL", "正在播放 IPTV：直接播放地址"},
+        {"Disabled", "已停用"},
+        {"Not cached - refresh this source", "尚未缓存，请刷新此来源"},
+        {"No playable channels", "没有可播放的频道"},
+        {"Sources loaded. Refresh remote sources or add local M3U files.", "来源已加载。请刷新远程来源或添加本地 M3U 文件。"},
+        {"No IPTV sources. Add a remote source or copy M3U files to the IPTV folder.", "没有 IPTV 来源。请添加远程来源或将 M3U 文件复制到 IPTV 文件夹。"},
+        {"IPTV catalog load failed: memory budget, allocation, or SD read/write error. Previous catalog retained.", "IPTV 列表加载失败：内存预算、分配或 SD 卡读写错误。已保留原列表。"},
+        {"IPTV sources refreshed.", "IPTV 来源已刷新。"},
+        {"IPTV refresh failed: not enough memory for source snapshot.", "IPTV 刷新失败：没有足够内存保存来源快照。"},
+        {"Selected IPTV source no longer exists.", "所选 IPTV 来源已不存在。"},
+        {"IPTV background work paused during playback.", "播放期间已暂停 IPTV 后台任务。"},
+        {"IPTV background work is paused during playback.", "播放期间已暂停 IPTV 后台任务。"},
+        {"IPTV loaded, but background refresh is unavailable.", "IPTV 已加载，但后台刷新不可用。"},
+        {"Refreshing preinstalled IPTV sources...", "正在刷新预装 IPTV 来源…"},
+        {"Wait for the current IPTV refresh to finish.", "请等待当前 IPTV 刷新完成。"},
+        {"Remote source must use HTTP or HTTPS.", "远程来源必须使用 HTTP 或 HTTPS。"},
+        {"IPTV source URL is too long.", "IPTV 来源地址过长。"},
+        {"IPTV source already exists; refreshing it.", "IPTV 来源已存在，正在刷新。"},
+        {"IPTV source allocation failed or memory budget exceeded.", "IPTV 来源内存分配失败或超出内存预算。"},
+        {"Failed to save IPTV source.", "无法保存 IPTV 来源。"},
+        {"IPTV source was saved, but the catalog could not be reloaded.", "IPTV 来源已保存，但无法重新加载列表。"},
+        {"Local playlist: add url-tvg=\"guide.xml URL\" to the #EXTM3U header.", "本地播放列表：请在 #EXTM3U 文件头添加 url-tvg=\"节目单地址\"。"},
+        {"Programme guide address must use HTTP or HTTPS.", "节目单地址必须使用 HTTP 或 HTTPS。"},
+        {"Failed to save the programme guide address.", "无法保存节目单地址。"},
+        {"Local M3U sources are removed by deleting their SD card file.", "删除 SD 卡上的对应文件即可移除本地 M3U 来源。"},
+        {"Failed to remove the source from sources.txt.", "无法从 sources.txt 移除来源。"},
+        {"Failed to update IPTV source list.", "无法更新 IPTV 来源列表。"},
+        {"IPTV source, playlist cache, and programme guide removed.", "IPTV 来源、播放列表缓存和节目单已移除。"},
+        {"An IPTV refresh is already running.", "IPTV 刷新已在进行中。"},
+        {"IPTV background worker is unavailable.", "IPTV 后台任务不可用。"},
+        {"Failed to reload IPTV sources from SD.", "无法从 SD 卡重新加载 IPTV 来源。"},
+        {"No IPTV sources found. Check sources.txt on the Switch SD card.", "没有找到 IPTV 来源。请检查 Switch SD 卡上的 sources.txt。"},
+        {"Queued refresh for all IPTV sources.", "所有 IPTV 来源已加入刷新队列。"},
+        {"Unable to save favorites: not enough memory.", "无法保存收藏：内存不足。"},
+        {"Failed to save favorites.", "无法保存收藏。"},
+        {"Added to favorites.", "已添加到收藏。"}, {"Removed from favorites.", "已取消收藏。"},
+        {"Invalid IPTV URL.", "无效的 IPTV 地址。"},
+        {"Player is busy with another media source.", "播放器正忙于其他媒体来源。"},
+        {"Failed to start IPTV playback.", "无法开始播放 IPTV。"},
+        {"No IPTV channel selected.", "尚未选择 IPTV 频道。"},
+        {"IPTV URL input closed.", "已关闭 IPTV 地址输入。"},
+        {"IPTV URL", "IPTV 地址"},
+        {"Enter a media URL or an M3U playlist URL", "输入媒体地址或 M3U 播放列表地址"},
+        {"M3U lists open in Channels; media URLs play directly", "M3U 列表将在频道中打开；媒体地址将直接播放"},
+        {"Open", "打开"}, {"Import", "导入"}, {"Connect", "连接"},
+        {"Add IPTV playlist", "添加 IPTV 播放列表"},
+        {"Paste the address of the M3U channel list", "粘贴 M3U 频道列表地址"},
+        {"Change programme guide", "更改节目单"}, {"Connect programme guide", "连接节目单"},
+        {"Paste the guide.xml address supplied with this M3U playlist", "粘贴此 M3U 播放列表提供的 guide.xml 地址"},
+        {"Search IPTV", "搜索 IPTV"},
+        {"Match channel name, group, or tvg-id", "按频道名称、分组或 tvg-id 搜索"},
+        {"News", "新闻"}, {"Filter", "筛选"},
+    };
+    for (size_t i = 0; i < sizeof(messages) / sizeof(messages[0]); ++i)
+        if (strcmp(text, messages[i].en) == 0)
+            return home_ui_text(messages[i].en, messages[i].zh);
+    return text;
+}
+
+static void iptv_status_copy(char *out, size_t size, const char *status)
+{
+    int channels, sources;
+    if (sscanf(status, "Loaded %d channels from %d sources.", &channels, &sources) == 2)
+    {
+        snprintf(out, size, home_ui_text("Loaded %d channels from %d sources.", "已加载 %d 个频道，来自 %d 个来源。"), channels, sources);
+        return;
+    }
+    if (sscanf(status, "Imported %d SD source", &sources) == 1)
+    {
+        snprintf(out, size, home_ui_text("Imported %d SD sources; refreshing...", "已导入 %d 个 SD 卡来源，正在刷新…"), sources);
+        return;
+    }
+    static const struct { const char *prefix; const char *suffix; const char *format; } patterns[] = {
+        {"Refreshing ", "...", "正在刷新 %.*s…"},
+        {"Queued refresh for ", ".", "已将 %.*s 加入刷新队列。"},
+        {"Playing IPTV: ", "", "正在播放 IPTV：%.*s"},
+        {"Refresh failed for ", "", "刷新失败：%.*s"},
+        {"", " and programme guide refreshed. Guide link found in M3U.", "%.*s 和节目单已刷新。节目单链接来自 M3U。"},
+        {"", " and programme guide refreshed.", "%.*s 和节目单已刷新。"},
+        {"", " refreshed.", "%.*s 已刷新。"},
+    };
+    const char *translated = iptv_text(status);
+    if (translated != status)
+    {
+        iptv_copy(out, size, translated);
+        return;
+    }
+    size_t length = strlen(status);
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); ++i)
+    {
+        size_t prefix = strlen(patterns[i].prefix), suffix = strlen(patterns[i].suffix);
+        if (length >= prefix + suffix && strncmp(status, patterns[i].prefix, prefix) == 0 &&
+            strcmp(status + length - suffix, patterns[i].suffix) == 0)
+        {
+            if (home_ui_is_chinese())
+                snprintf(out, size, home_ui_text("%.*s", patterns[i].format),
+                         (int)(length - prefix - suffix), status + prefix);
+            else
+                iptv_copy(out, size, status);
+            return;
+        }
+    }
+    iptv_copy(out, size, status);
+}
+
+static char *iptv_trim(char *text)
+{
+    char *end;
+
+    if (!text)
+        return text;
+    while (*text && isspace((unsigned char)*text))
+        ++text;
+    end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1]))
+        *--end = '\0';
+    return text;
+}
+
+static uint32_t iptv_hash_bytes(uint32_t hash, const char *text)
+{
+    while (text && *text)
+    {
+        hash ^= (unsigned char)*text++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static uint32_t iptv_hash_string(const char *text)
+{
+    uint32_t hash = iptv_hash_bytes(2166136261u, text);
+    return hash ? hash : 1u;
+}
+
+static uint32_t iptv_channel_id(uint32_t source_id, const char *tvg_id, const char *url)
+{
+    char source[16];
+    uint32_t hash = 2166136261u;
+
+    snprintf(source, sizeof(source), "%08x", source_id);
+    hash = iptv_hash_bytes(hash, source);
+    hash = iptv_hash_bytes(hash, "|");
+    hash = iptv_hash_bytes(hash, tvg_id && tvg_id[0] ? tvg_id : url);
+    return hash ? hash : 1u;
+}
+
+static bool iptv_path_exists(const char *path)
+{
+    struct stat info;
+    return path && stat(path, &info) == 0 && info.st_size > 0;
+}
+
+static time_t iptv_path_mtime(const char *path)
+{
+    struct stat info;
+    return path && stat(path, &info) == 0 ? info.st_mtime : (time_t)0;
+}
+
+static void iptv_ensure_directories(void)
+{
+    mkdir(IPTV_BASE_DIR, 0777);
+    mkdir(IPTV_ROOT_DIR, 0777);
+    mkdir(IPTV_CACHE_DIR, 0777);
+    mkdir(IPTV_PLAYLIST_CACHE_DIR, 0777);
+    mkdir(IPTV_EPG_CACHE_DIR, 0777);
+    mkdir(IPTV_LOGO_CACHE_DIR, 0777);
+}
+
+static bool iptv_has_m3u_extension(const char *name)
+{
+    const char *dot = name ? strrchr(name, '.') : NULL;
+    return dot && (strcasecmp(dot, ".m3u") == 0 || strcasecmp(dot, ".m3u8") == 0);
+}
+
+static bool iptv_url_is_remote(const char *url)
+{
+    return url && (strncasecmp(url, "http://", 7) == 0 || strncasecmp(url, "https://", 8) == 0);
+}
+
+static bool iptv_url_has_query_token(const char *url, const char *token)
+{
+    size_t token_length;
+
+    if (!url || !token)
+        return false;
+    token_length = strlen(token);
+    for (const char *cursor = url; *cursor; ++cursor)
+    {
+        if (strncasecmp(cursor, token, token_length) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool iptv_url_looks_like_playlist(const char *url)
+{
+    const char *end;
+    const char *path_start;
+    size_t path_length;
+
+    if (!url || !url[0])
+        return false;
+
+    end = strpbrk(url, "?#");
+    if (!end)
+        end = url + strlen(url);
+    path_start = end;
+    while (path_start > url && path_start[-1] != '/')
+        --path_start;
+    path_length = (size_t)(end - path_start);
+    if ((path_length >= 4 && strncasecmp(end - 4, ".m3u", 4) == 0) ||
+        (path_length >= 5 && strncasecmp(end - 5, ".m3u8", 5) == 0))
+        return true;
+
+    return iptv_url_has_query_token(url, "type=m3u") ||
+           iptv_url_has_query_token(url, "format=m3u") ||
+           iptv_url_has_query_token(url, "output=m3u") ||
+           iptv_url_has_query_token(url, "playlist=m3u");
+}
+
+static bool iptv_url_is_playable(const char *url)
+{
+    if (!url || !url[0])
+        return false;
+    return strncasecmp(url, "http://", 7) == 0 ||
+           strncasecmp(url, "https://", 8) == 0 ||
+           strncasecmp(url, "rtsp://", 7) == 0 ||
+           strncasecmp(url, "rtmp://", 7) == 0 ||
+           strncasecmp(url, "udp://", 6) == 0 ||
+           strncasecmp(url, "rtp://", 6) == 0 ||
+           strncasecmp(url, "mms://", 6) == 0 ||
+           strncasecmp(url, "file://", 7) == 0 ||
+           strncasecmp(url, "sdmc:/", 6) == 0 ||
+           url[0] == '/';
+}
+
+static bool iptv_contains_casefold(const char *haystack, const char *needle)
+{
+    size_t needle_length;
+
+    if (!needle || !needle[0])
+        return true;
+    if (!haystack)
+        return false;
+    needle_length = strlen(needle);
+    for (; *haystack; ++haystack)
+    {
+        if (strncasecmp(haystack, needle, needle_length) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void iptv_parse_attr(const char *line, const char *attribute, char *out, size_t out_size)
+{
+    size_t attribute_length;
+
+    if (!out || out_size == 0)
+        return;
+    out[0] = '\0';
+    if (!line || !attribute)
+        return;
+    attribute_length = strlen(attribute);
+    for (const char *p = line; *p; ++p)
+    {
+        if (strncasecmp(p, attribute, attribute_length) != 0)
+            continue;
+        if (p != line && !isspace((unsigned char)p[-1]))
+            continue;
+        p += attribute_length;
+        while (isspace((unsigned char)*p))
+            ++p;
+        if (*p != '=')
+            continue;
+        ++p;
+        while (isspace((unsigned char)*p))
+            ++p;
+        char quote = (*p == '"' || *p == '\'') ? *p++ : '\0';
+        size_t used = 0;
+        while (*p && used + 1 < out_size)
+        {
+            if ((quote && *p == quote) || (!quote && (isspace((unsigned char)*p) || *p == ',')))
+                break;
+            out[used++] = *p++;
+        }
+        out[used] = '\0';
+        return;
+    }
+}
+
+static void iptv_parse_extinf_title(const char *line, char *out, size_t out_size)
+{
+    const char *comma = line ? strrchr(line, ',') : NULL;
+    if (!out || out_size == 0)
+        return;
+    out[0] = '\0';
+    if (comma && comma[1])
+        iptv_copy(out, out_size, comma + 1);
+}
+
+static void iptv_parse_m3u_header_epg(const char *line, char *out, size_t out_size)
+{
+    iptv_parse_attr(line, "url-tvg", out, out_size);
+    if (!out[0])
+        iptv_parse_attr(line, "x-tvg-url", out, out_size);
+}
+
+static void iptv_source_display_name(const char *source_name, char *out, size_t out_size)
+{
+    char *dot;
+    iptv_copy(out, out_size, source_name ? source_name : "IPTV source");
+    dot = strrchr(out, '.');
+    if (dot && (strcasecmp(dot, ".m3u") == 0 || strcasecmp(dot, ".m3u8") == 0))
+        *dot = '\0';
+}
+
+static void iptv_source_name_from_url(const char *url, char *out, size_t out_size)
+{
+    const char *start = strstr(url ? url : "", "://");
+    const char *end;
+    size_t length;
+
+    start = start ? start + 3 : url;
+    end = start ? strchr(start, '/') : NULL;
+    length = start ? (end ? (size_t)(end - start) : strlen(start)) : 0;
+    if (length == 0)
+    {
+        iptv_copy(out, out_size, "Remote IPTV");
+        return;
+    }
+    if (length >= out_size)
+        length = out_size - 1;
+    memcpy(out, start, length);
+    out[length] = '\0';
+}
+
+const char *iptv_playlist_kind_name(IptvPlaylistKind kind)
+{
+    switch (kind)
+    {
+    case IPTV_PLAYLIST_CHANNEL_LIST:
+        return "channel-list";
+    case IPTV_PLAYLIST_HLS_STREAM:
+        return "hls-stream";
+    default:
+        return "unknown";
+    }
+}
+
+IptvPlaylistKind iptv_classify_playlist_file(const char *path)
+{
+    FILE *file;
+    char buffer[IPTV_URL_MAX + 256];
+    bool saw_entry = false;
+    bool saw_extinf = false;
+
+    file = path ? fopen(path, "rb") : NULL;
+    if (!file)
+        return IPTV_PLAYLIST_UNKNOWN;
+    while (fgets(buffer, sizeof(buffer), file))
+    {
+        char *line = iptv_trim(buffer);
+        if (!line[0])
+            continue;
+        if (strncasecmp(line, "#EXT-X-", 7) == 0)
+        {
+            fclose(file);
+            return IPTV_PLAYLIST_HLS_STREAM;
+        }
+        if (strncasecmp(line, "#EXTINF", 7) == 0)
+            saw_extinf = true;
+        else if (line[0] != '#')
+            saw_entry = true;
+    }
+    fclose(file);
+    return (saw_extinf || saw_entry) ? IPTV_PLAYLIST_CHANNEL_LIST : IPTV_PLAYLIST_UNKNOWN;
+}
+
+static int iptv_compare_names(const void *left, const void *right)
+{
+    const IptvSource *a = left;
+    const IptvSource *b = right;
+    return strcasecmp(a->url, b->url);
+}
+
+static bool iptv_id_in_list(const uint32_t *ids, int count, uint32_t id)
+{
+    for (int i = 0; i < count; ++i)
+    {
+        if (ids[i] == id)
+            return true;
+    }
+    return false;
+}
+
+static int iptv_load_id_file(const char *path, uint32_t *ids, int capacity)
+{
+    FILE *file = fopen(path, "rb");
+    char line[40];
+    int count = 0;
+
+    if (!file)
+        return 0;
+    while (count < capacity && fgets(line, sizeof(line), file))
+    {
+        unsigned int value;
+        if (sscanf(line, "%x", &value) == 1 && value != 0 && !iptv_id_in_list(ids, count, value))
+            ids[count++] = value;
+    }
+    fclose(file);
+    return count;
+}
+
+static bool iptv_load_favorites(uint32_t **ids, int *count)
+{
+    FILE *file = fopen(IPTV_FAVORITES_FILE, "rb");
+    size_t capacity = 0;
+    bool failed = false;
+    char line[40];
+    *ids = NULL;
+    *count = 0;
+    if (!file)
+        return errno == ENOENT;
+    while (fgets(line, sizeof(line), file))
+    {
+        unsigned int id;
+        if (sscanf(line, "%x", &id) != 1 || !id)
+            continue;
+        *ids = iptv_data_reserve(*ids, &capacity, (size_t)*count + 1,
+                                 sizeof(**ids), IPTV_METADATA_BYTES, &failed);
+        if (failed)
+            break;
+        (*ids)[(*count)++] = id;
+    }
+    if (ferror(file))
+        failed = true;
+    fclose(file);
+    return !failed;
+}
+
+static bool iptv_replace_saved_file(const char *temporary, const char *path)
+{
+    char backup[IPTV_PATH_MAX + 5];
+    struct stat st;
+    bool existed;
+    int error;
+
+    if (snprintf(backup, sizeof(backup), "%s.bak", path) >= (int)sizeof(backup))
+    {
+        errno = ENAMETOOLONG;
+        goto failed;
+    }
+    existed = stat(path, &st) == 0;
+    if (existed && !S_ISREG(st.st_mode))
+    {
+        errno = EISDIR;
+        goto failed;
+    }
+    if (!existed && errno != ENOENT)
+        goto failed;
+    if (stat(backup, &st) == 0)
+    {
+        /* Never discard the only remaining copy after a failed rollback. */
+        if (!existed || !S_ISREG(st.st_mode))
+        {
+            errno = EEXIST;
+            goto failed;
+        }
+        if (remove(backup) != 0)
+            goto failed;
+    }
+    else if (errno != ENOENT)
+        goto failed;
+
+    /* SD rename may not replace an existing destination. */
+    if (existed && rename(path, backup) != 0)
+        goto failed;
+    if (rename(temporary, path) != 0)
+    {
+        error = errno;
+        if (existed && rename(backup, path) != 0)
+            log_warn("[iptv] save rollback failed; original retained at %s\n", backup);
+        errno = error;
+        goto failed;
+    }
+    if (existed && remove(backup) != 0)
+        log_warn("[iptv] saved %s but could not remove backup %s\n", path, backup);
+    return true;
+
+failed:
+    error = errno;
+    remove(temporary);
+    errno = error;
+    return false;
+}
+
+static bool iptv_write_id_file(const char *path, const uint32_t *ids, int count)
+{
+    char temporary[IPTV_PATH_MAX];
+    FILE *file;
+
+    snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    file = fopen(temporary, "wb");
+    if (!file)
+        return false;
+    for (int i = 0; i < count; ++i)
+        fprintf(file, "%08x\n", ids[i]);
+    bool ok = !ferror(file);
+    if (fclose(file) != 0)
+        ok = false;
+    if (!ok)
+    {
+        remove(temporary);
+        return false;
+    }
+    return iptv_replace_saved_file(temporary, path);
+}
+
+static bool iptv_save_remote_sources(const IptvSource *sources, int source_count)
+{
+    char temporary[IPTV_PATH_MAX];
+    FILE *file;
+
+    snprintf(temporary, sizeof(temporary), "%s.tmp", IPTV_SOURCES_FILE);
+    file = fopen(temporary, "wb");
+    if (!file)
+        return false;
+    fprintf(file, "# id\tenabled\tname\tplaylist-url\txmltv-url\n");
+    for (int i = 0; i < source_count; ++i)
+    {
+        const IptvSource *source = &sources[i];
+        if (source->local)
+            continue;
+        fprintf(file, "%08x\t%d\t%s\t%s\t%s\n",
+                source->id,
+                source->enabled ? 1 : 0,
+                source->name,
+                source->url,
+                source->epg_url);
+    }
+    bool ok = !ferror(file);
+    if (fclose(file) != 0)
+        ok = false;
+    if (!ok)
+    {
+        remove(temporary);
+        return false;
+    }
+    return iptv_replace_saved_file(temporary, IPTV_SOURCES_FILE);
+}
+
+static bool iptv_remove_preinstalled_source(const char *target_url)
+{
+    FILE *input = fopen(IPTV_PREINSTALLED_SOURCES_FILE, "rb");
+    FILE *output;
+    char temporary[IPTV_PATH_MAX];
+    char line[IPTV_URL_MAX * 2 + IPTV_SOURCE_MAX + 32];
+    bool removed = false;
+    bool ok = true;
+
+    if (!input)
+        return errno == ENOENT;
+    snprintf(temporary, sizeof(temporary), "%s.tmp", IPTV_PREINSTALLED_SOURCES_FILE);
+    output = fopen(temporary, "wb");
+    if (!output)
+    {
+        fclose(input);
+        return false;
+    }
+
+    while (fgets(line, sizeof(line), input))
+    {
+        char parsed[sizeof(line)];
+        char *entry;
+        char *url;
+        char *separator;
+        bool matches = false;
+
+        iptv_copy(parsed, sizeof(parsed), line);
+        entry = iptv_trim(parsed);
+        if ((unsigned char)entry[0] == 0xEF &&
+            (unsigned char)entry[1] == 0xBB && (unsigned char)entry[2] == 0xBF)
+            entry = iptv_trim(entry + 3);
+        if (entry[0] && entry[0] != '#')
+        {
+            separator = strchr(entry, '|');
+            if (separator)
+            {
+                url = iptv_trim(separator + 1);
+                separator = strchr(url, '|');
+                if (separator)
+                    *separator = '\0';
+                url = iptv_trim(url);
+            }
+            else
+            {
+                url = entry;
+            }
+            matches = iptv_url_is_remote(url) && strcasecmp(url, target_url) == 0;
+        }
+        if (matches)
+        {
+            removed = true;
+            continue;
+        }
+        if (fputs(line, output) == EOF)
+        {
+            ok = false;
+            break;
+        }
+    }
+    if (ferror(input))
+        ok = false;
+    if (fclose(input) != 0)
+        ok = false;
+    if (fclose(output) != 0)
+        ok = false;
+    if (!ok)
+    {
+        remove(temporary);
+        return false;
+    }
+    if (!removed)
+    {
+        remove(temporary);
+        return true;
+    }
+    return iptv_replace_saved_file(temporary, IPTV_PREINSTALLED_SOURCES_FILE);
+}
+
+static int iptv_merge_preinstalled_sources(IptvCatalog *catalog, int count, bool *changed)
+{
+    FILE *file = fopen(IPTV_PREINSTALLED_SOURCES_FILE, "rb");
+    char line[IPTV_URL_MAX * 2 + IPTV_SOURCE_MAX + 32];
+    int line_number = 0;
+
+    if (!file)
+    {
+        catalog->failed = errno != ENOENT;
+        return count;
+    }
+    while (fgets(line, sizeof(line), file))
+    {
+        IptvSource *sources = catalog->sources;
+        char *entry;
+        char *name = NULL;
+        char *url;
+        char *epg = NULL;
+        char *separator;
+        uint32_t id;
+        int existing = -1;
+        bool source_changed = false;
+        bool source_needs_refresh = false;
+
+        ++line_number;
+        entry = iptv_trim(line);
+        if (line_number == 1 && (unsigned char)entry[0] == 0xEF &&
+            (unsigned char)entry[1] == 0xBB && (unsigned char)entry[2] == 0xBF)
+            entry = iptv_trim(entry + 3);
+        if (!entry[0] || entry[0] == '#')
+            continue;
+
+        separator = strchr(entry, '|');
+        if (separator)
+        {
+            *separator = '\0';
+            name = iptv_trim(entry);
+            url = iptv_trim(separator + 1);
+            separator = strchr(url, '|');
+            if (separator)
+            {
+                *separator = '\0';
+                epg = iptv_trim(separator + 1);
+                url = iptv_trim(url);
+            }
+        }
+        else
+        {
+            url = entry;
+        }
+
+        if (!iptv_url_is_remote(url))
+        {
+            log_warn("[iptv] ignored invalid preinstalled source line=%d\n", line_number);
+            continue;
+        }
+        if (epg && epg[0] && !iptv_url_is_remote(epg))
+        {
+            log_warn("[iptv] ignored invalid preinstalled EPG line=%d\n", line_number);
+            epg = NULL;
+        }
+
+        id = iptv_hash_string(url);
+        for (int i = 0; i < count; ++i)
+        {
+            if (sources[i].id == id || strcasecmp(sources[i].url, url) == 0)
+            {
+                existing = i;
+                break;
+            }
+        }
+
+        if (existing >= 0)
+        {
+            IptvSource *source = &sources[existing];
+            if (name && name[0] && strcmp(source->name, name) != 0)
+            {
+                iptv_copy(source->name, sizeof(source->name), name);
+                source_changed = true;
+            }
+            if (epg && epg[0] && strcmp(source->epg_url, epg) != 0)
+            {
+                iptv_copy(source->epg_url, sizeof(source->epg_url), epg);
+                source_changed = true;
+                source_needs_refresh = true;
+            }
+            if (!iptv_path_exists(source->cache_path))
+                source_needs_refresh = true;
+        }
+        else
+        {
+            catalog->sources = iptv_data_reserve(catalog->sources, &catalog->source_capacity,
+                (size_t)count + 1, sizeof(*catalog->sources), IPTV_METADATA_BYTES, &catalog->failed);
+            if (catalog->failed)
+                break;
+            sources = catalog->sources;
+            IptvSource *source = &sources[count++];
+            memset(source, 0, sizeof(*source));
+            source->id = id;
+            source->enabled = true;
+            if (name && name[0])
+                iptv_copy(source->name, sizeof(source->name), name);
+            else
+                iptv_source_name_from_url(url, source->name, sizeof(source->name));
+            iptv_copy(source->url, sizeof(source->url), url);
+            if (epg)
+                iptv_copy(source->epg_url, sizeof(source->epg_url), epg);
+            snprintf(source->cache_path, sizeof(source->cache_path), "%s/%08x.m3u", IPTV_PLAYLIST_CACHE_DIR, id);
+            source_changed = true;
+            source_needs_refresh = true;
+        }
+
+        if (source_changed)
+        {
+            *changed = true;
+            ++catalog->preinstalled_changed_count;
+        }
+        if (source_needs_refresh)
+            catalog->preinstalled_refresh_needed = true;
+        log_info("[iptv] preinstalled source accepted line=%d changed=%d refresh=%d epg=%d\n",
+                 line_number,
+                 source_changed ? 1 : 0,
+                 source_needs_refresh ? 1 : 0,
+                 epg && epg[0] ? 1 : 0);
+    }
+    if (ferror(file))
+        catalog->failed = true;
+    fclose(file);
+    log_info("[iptv] preinstalled source file loaded sources=%d changed=%d refresh=%d\n",
+             count,
+             catalog->preinstalled_changed_count,
+             catalog->preinstalled_refresh_needed ? 1 : 0);
+    return count;
+}
+
+static int iptv_load_remote_sources(IptvCatalog *catalog)
+{
+    FILE *file = fopen(IPTV_SOURCES_FILE, "rb");
+    char line[IPTV_URL_MAX * 2 + IPTV_SOURCE_MAX + 96];
+    int count = 0;
+    bool changed = false;
+
+    if (!file && errno != ENOENT)
+        catalog->failed = true;
+    while (file && fgets(line, sizeof(line), file))
+    {
+        char *save = NULL;
+        char *id_text = strtok_r(line, "\t\r\n", &save);
+        char *enabled_text = strtok_r(NULL, "\t\r\n", &save);
+        char *name = strtok_r(NULL, "\t\r\n", &save);
+        char *url = strtok_r(NULL, "\t\r\n", &save);
+        char *epg = strtok_r(NULL, "\t\r\n", &save);
+        unsigned int id;
+        IptvSource *source;
+
+        if (!id_text || !enabled_text || !name || !url || sscanf(id_text, "%x", &id) != 1 || !iptv_url_is_remote(url))
+            continue;
+        catalog->sources = iptv_data_reserve(catalog->sources, &catalog->source_capacity,
+            (size_t)count + 1, sizeof(*catalog->sources), IPTV_METADATA_BYTES, &catalog->failed);
+        if (catalog->failed)
+            break;
+        source = &catalog->sources[count++];
+        memset(source, 0, sizeof(*source));
+        source->id = id ? id : iptv_hash_string(url);
+        source->enabled = atoi(enabled_text) != 0;
+        iptv_copy(source->name, sizeof(source->name), name);
+        iptv_copy(source->url, sizeof(source->url), url);
+        if (epg)
+            iptv_copy(source->epg_url, sizeof(source->epg_url), epg);
+        snprintf(source->cache_path, sizeof(source->cache_path), "%s/%08x.m3u", IPTV_PLAYLIST_CACHE_DIR, source->id);
+        source->cache_ready = iptv_path_exists(source->cache_path);
+        source->refreshed_at = iptv_path_mtime(source->cache_path);
+    }
+    if (file)
+    {
+        if (ferror(file))
+            catalog->failed = true;
+        fclose(file);
+    }
+    if (!catalog->failed)
+        count = iptv_merge_preinstalled_sources(catalog, count, &changed);
+    if (!catalog->failed && changed && !iptv_save_remote_sources(catalog->sources, count))
+        catalog->failed = true;
+    return count;
+}
+
+static bool iptv_save_sources_locked(void)
+{
+    return iptv_save_remote_sources(g_sources, g_source_count);
+}
+
+static void iptv_catalog_add_group(IptvCatalog *catalog, const char *group)
+{
+    if (!group || !group[0])
+        return;
+    for (int i = 0; i < catalog->group_count; ++i)
+    {
+        if (strcasecmp(catalog->groups[i], group) == 0)
+            return;
+    }
+    catalog->groups = iptv_data_reserve(catalog->groups, &catalog->group_capacity,
+        (size_t)catalog->group_count + 1, sizeof(*catalog->groups), IPTV_METADATA_BYTES, &catalog->failed);
+    if (!catalog->failed)
+        iptv_copy(catalog->groups[catalog->group_count++], IPTV_GROUP_MAX, group);
+}
+
+static bool iptv_catalog_add_channel(IptvCatalog *catalog,
+                                     IptvSource *source,
+                                     const char *name,
+                                     const char *group,
+                                     const char *tvg_id,
+                                     const char *logo_url,
+                                     const char *url,
+                                     const uint32_t *favorites,
+                                     int favorite_count,
+                                     const uint32_t *recent,
+                                     int recent_count)
+{
+    IptvChannel *channel;
+    char fallback[IPTV_NAME_MAX];
+
+    if (!catalog || !source || !iptv_url_is_playable(url))
+        return false;
+    catalog->channels = iptv_data_reserve(catalog->channels, &catalog->channel_capacity,
+        (size_t)catalog->channel_count + 1, sizeof(*catalog->channels), IPTV_CHANNEL_BYTES, &catalog->failed);
+    if (catalog->failed)
+        return false;
+    channel = &catalog->channels[catalog->channel_count++];
+    memset(channel, 0, sizeof(*channel));
+    channel->source_id = source->id;
+    iptv_copy(channel->name, sizeof(channel->name), name);
+    if (!channel->name[0])
+    {
+        snprintf(fallback, sizeof(fallback), "%s %d", IPTV_FALLBACK_NAME, catalog->channel_count);
+        iptv_copy(channel->name, sizeof(channel->name), fallback);
+    }
+    iptv_copy(channel->group, sizeof(channel->group), group);
+    iptv_copy(channel->source, sizeof(channel->source), source->name);
+    iptv_copy(channel->tvg_id, sizeof(channel->tvg_id), tvg_id);
+    iptv_copy(channel->logo_url, sizeof(channel->logo_url), logo_url);
+    iptv_copy(channel->url, sizeof(channel->url), url);
+    channel->id = iptv_channel_id(source->id, channel->tvg_id, channel->url);
+    channel->favorite = iptv_id_in_list(favorites, favorite_count, channel->id);
+    channel->recent = iptv_id_in_list(recent, recent_count, channel->id);
+    if (channel->logo_url[0])
+    {
+        snprintf(channel->logo_path, sizeof(channel->logo_path), "%s/%08x.img", IPTV_LOGO_CACHE_DIR, channel->id);
+        channel->logo_cached = iptv_path_exists(channel->logo_path);
+        if (channel->logo_cached)
+            ++catalog->logo_cached_count;
+    }
+    iptv_catalog_add_group(catalog, channel->group);
+    if (catalog->failed)
+        return false;
+    ++source->channel_count;
+    return true;
+}
+
+static int iptv_parse_playlist(IptvCatalog *catalog,
+                               IptvSource *source,
+                               const char *path,
+                               const uint32_t *favorites,
+                               int favorite_count,
+                               const uint32_t *recent,
+                               int recent_count)
+{
+    FILE *file = fopen(path, "rb");
+    char buffer[IPTV_URL_MAX + 768];
+    char pending_name[IPTV_NAME_MAX] = "";
+    char pending_group[IPTV_GROUP_MAX] = "";
+    char pending_tvg_id[IPTV_TVG_ID_MAX] = "";
+    char pending_logo[IPTV_LOGO_URL_MAX] = "";
+    int before = catalog->channel_count;
+
+    if (!file)
+    {
+        catalog->failed = true;
+        return 0;
+    }
+    while (fgets(buffer, sizeof(buffer), file))
+    {
+        char *line = iptv_trim(buffer);
+        if (!line[0])
+            continue;
+        if (strncasecmp(line, "#EXTM3U", 7) == 0 && !source->epg_url[0])
+        {
+            char epg[IPTV_URL_MAX];
+            iptv_parse_m3u_header_epg(line, epg, sizeof(epg));
+            if (epg[0])
+                (void)iptv_url_resolve(source->url, epg, source->epg_url,
+                                       sizeof(source->epg_url));
+            continue;
+        }
+        if (strncasecmp(line, "#EXTINF", 7) == 0)
+        {
+            char tvg_name[IPTV_NAME_MAX];
+            pending_name[0] = pending_group[0] = pending_tvg_id[0] = pending_logo[0] = '\0';
+            iptv_parse_extinf_title(line, pending_name, sizeof(pending_name));
+            iptv_parse_attr(line, "tvg-name", tvg_name, sizeof(tvg_name));
+            if (!pending_name[0])
+                iptv_copy(pending_name, sizeof(pending_name), tvg_name);
+            iptv_parse_attr(line, "group-title", pending_group, sizeof(pending_group));
+            iptv_parse_attr(line, "tvg-id", pending_tvg_id, sizeof(pending_tvg_id));
+            iptv_parse_attr(line, "tvg-logo", pending_logo, sizeof(pending_logo));
+            continue;
+        }
+        if (line[0] == '#')
+            continue;
+
+        char playable[IPTV_URL_MAX];
+        char resolved_logo[IPTV_LOGO_URL_MAX];
+        if (!iptv_url_resolve(source->url, line, playable, sizeof(playable)))
+        {
+            log_warn("[iptv] skipped channel with oversized or invalid URL\n");
+            pending_name[0] = pending_group[0] = pending_tvg_id[0] =
+                pending_logo[0] = '\0';
+            continue;
+        }
+        (void)iptv_url_resolve(source->url, pending_logo, resolved_logo,
+                               sizeof(resolved_logo));
+        iptv_catalog_add_channel(catalog,
+                                 source,
+                                 pending_name,
+                                 pending_group,
+                                 pending_tvg_id,
+                                 resolved_logo,
+                                 playable,
+                                 favorites,
+                                 favorite_count,
+                                 recent,
+                                 recent_count);
+        if (catalog->failed)
+            break;
+        pending_name[0] = pending_group[0] = pending_tvg_id[0] = pending_logo[0] = '\0';
+    }
+    if (ferror(file))
+        catalog->failed = true;
+    fclose(file);
+    return catalog->channel_count - before;
+}
+
+static bool iptv_catalog_build(IptvCatalog *catalog)
+{
+    DIR *directory;
+    struct dirent *entry;
+    uint32_t *favorites = NULL;
+    uint32_t recent[IPTV_MAX_RECENT];
+    int favorite_count;
+    int recent_count;
+    int remote_count;
+
+    memset(catalog, 0, sizeof(*catalog));
+    if (!iptv_load_favorites(&favorites, &favorite_count))
+    {
+        free(favorites);
+        return false;
+    }
+    recent_count = iptv_load_id_file(IPTV_RECENT_FILE, recent, IPTV_MAX_RECENT);
+    catalog->source_count = iptv_load_remote_sources(catalog);
+    remote_count = catalog->source_count;
+
+    directory = opendir(IPTV_ROOT_DIR);
+    if (directory)
+    {
+        while (!catalog->failed)
+        {
+            errno = 0;
+            entry = readdir(directory);
+            if (!entry)
+            {
+                if (errno)
+                    catalog->failed = true;
+                break;
+            }
+            if (entry->d_name[0] == '.' || !iptv_has_m3u_extension(entry->d_name))
+                continue;
+            char path[IPTV_PATH_MAX];
+            struct stat info;
+            int length = snprintf(path, sizeof(path), "%s/%s", IPTV_ROOT_DIR, entry->d_name);
+            if (length < 0 || (size_t)length >= sizeof(path) || stat(path, &info) != 0)
+            {
+                catalog->failed = true;
+                break;
+            }
+            if (!S_ISREG(info.st_mode))
+                continue;
+            catalog->sources = iptv_data_reserve(catalog->sources, &catalog->source_capacity,
+                (size_t)catalog->source_count + 1, sizeof(*catalog->sources), IPTV_METADATA_BYTES, &catalog->failed);
+            if (catalog->failed)
+                break;
+            IptvSource *source = &catalog->sources[catalog->source_count++];
+            memset(source, 0, sizeof(*source));
+            source->local = true;
+            source->enabled = true;
+            iptv_source_display_name(entry->d_name, source->name, sizeof(source->name));
+            iptv_copy(source->url, sizeof(source->url), path);
+            iptv_copy(source->cache_path, sizeof(source->cache_path), path);
+            source->id = iptv_hash_string(source->url);
+            source->cache_ready = true;
+            source->refreshed_at = info.st_mtime;
+        }
+        closedir(directory);
+    }
+    else
+        catalog->failed = true;
+    if (catalog->source_count > remote_count)
+        qsort(catalog->sources + remote_count, (size_t)(catalog->source_count - remote_count),
+              sizeof(*catalog->sources), iptv_compare_names);
+
+    for (int i = 0; !catalog->failed && i < catalog->source_count; ++i)
+    {
+        IptvSource *source = &catalog->sources[i];
+        IptvPlaylistKind kind;
+        const char *path;
+        int added = 0;
+
+        if (!source->enabled)
+        {
+            iptv_copy(source->status, sizeof(source->status), "Disabled");
+            continue;
+        }
+        path = source->local ? source->url : source->cache_path;
+        source->cache_ready = iptv_path_exists(path);
+        if (!source->cache_ready)
+        {
+            iptv_copy(source->status, sizeof(source->status), "Not cached - refresh this source");
+            continue;
+        }
+        kind = iptv_classify_playlist_file(path);
+        if (kind == IPTV_PLAYLIST_HLS_STREAM)
+        {
+            added = iptv_catalog_add_channel(catalog,
+                                             source,
+                                             source->name,
+                                             source->local ? "Local HLS" : "Remote HLS",
+                                             "",
+                                             "",
+                                             source->url,
+                                             favorites,
+                                             favorite_count,
+                                             recent,
+                                             recent_count) ? 1 : 0;
+            if (added)
+                ++catalog->hls_stream_count;
+        }
+        else if (kind == IPTV_PLAYLIST_CHANNEL_LIST)
+        {
+            added = iptv_parse_playlist(catalog,
+                                        source,
+                                        path,
+                                        favorites,
+                                        favorite_count,
+                                        recent,
+                                        recent_count);
+        }
+        if (added > 0)
+            snprintf(source->status, sizeof(source->status), "%d channel%s", added, added == 1 ? "" : "s");
+        else
+            iptv_copy(source->status, sizeof(source->status), "No playable channels");
+
+        if (source->epg_url[0])
+        {
+            char epg_path[IPTV_PATH_MAX];
+            char epg_error[96] = "";
+            snprintf(epg_path, sizeof(epg_path), "%s/%08x.xmltv", IPTV_EPG_CACHE_DIR, source->id);
+            if (iptv_path_exists(epg_path))
+            {
+                iptv_xmltv_apply_file(epg_path,
+                                      source->id,
+                                      catalog->channels,
+                                      catalog->channel_count,
+                                      time(NULL),
+                                      epg_error,
+                                      sizeof(epg_error));
+                if (epg_error[0])
+                    catalog->failed = true;
+            }
+        }
+    }
+
+    for (int i = 0; i < catalog->channel_count; ++i)
+    {
+        if (catalog->channels[i].now_title[0] || catalog->channels[i].next_title[0])
+            ++catalog->epg_channel_count;
+    }
+    free(favorites);
+    return !catalog->failed;
+}
+
+static bool iptv_channel_matches_filter_locked(const IptvChannel *channel, int filter)
+{
+    if (!channel)
+        return false;
+    if (g_source_filter_id && channel->source_id != g_source_filter_id)
+        return false;
+    if (filter == 1 && !channel->favorite)
+        return false;
+    if (filter == 2 && !channel->recent)
+        return false;
+    if (filter >= 3)
+    {
+        int group_index = filter - 3;
+        if (group_index >= g_group_count || strcasecmp(channel->group, g_groups[group_index]) != 0)
+            return false;
+    }
+    return iptv_contains_casefold(channel->name, g_search) ||
+           iptv_contains_casefold(channel->group, g_search) ||
+           iptv_contains_casefold(channel->tvg_id, g_search);
+}
+
+static void iptv_rebuild_visible_locked(uint32_t preferred_id)
+{
+    g_visible_count = 0;
+    g_favorite_count = g_recent_channel_count = 0;
+    if (g_filter_counts)
+        memset(g_filter_counts, 0, (size_t)(g_group_count + 3) * sizeof(*g_filter_counts));
+    for (int i = 0; i < g_channel_count; ++i)
+    {
+        const IptvChannel *channel = &g_channels[i];
+        g_favorite_count += channel->favorite;
+        g_recent_channel_count += channel->recent;
+        if (!iptv_channel_matches_filter_locked(channel, 0))
+            continue;
+        ++g_filter_counts[0];
+        g_filter_counts[1] += channel->favorite;
+        for (int j = 0; j < g_group_count; ++j)
+            if (strcasecmp(channel->group, g_groups[j]) == 0)
+            {
+                ++g_filter_counts[j + 3];
+                break;
+            }
+    }
+    /* Recent rows are unique IDs and ordered by history, unlike all/group rows. */
+    for (int recent = 0; recent < g_recent_count; ++recent)
+        for (int i = 0; i < g_channel_count; ++i)
+            if (g_channels[i].id == g_recent_ids[recent] &&
+                iptv_channel_matches_filter_locked(&g_channels[i], 0))
+            {
+                ++g_filter_counts[2];
+                break;
+            }
+    if (g_filter_index > g_group_count + 2)
+        g_filter_index = 0;
+
+    if (g_filter_index == 2)
+    {
+        for (int recent_index = 0; recent_index < g_recent_count; ++recent_index)
+        {
+            for (int channel_index = 0; channel_index < g_channel_count; ++channel_index)
+            {
+                if (g_channels[channel_index].id == g_recent_ids[recent_index] &&
+                    iptv_channel_matches_filter_locked(&g_channels[channel_index], g_filter_index))
+                {
+                    g_visible[g_visible_count++] = channel_index;
+                    break;
+                }
+            }
+        }
+    }
+    else
+    {
+        for (int i = 0; i < g_channel_count; ++i)
+        {
+            if (iptv_channel_matches_filter_locked(&g_channels[i], g_filter_index))
+                g_visible[g_visible_count++] = i;
+        }
+    }
+
+    if (preferred_id)
+    {
+        for (int i = 0; i < g_visible_count; ++i)
+        {
+            if (g_channels[g_visible[i]].id == preferred_id)
+            {
+                g_selected_index = i;
+                return;
+            }
+        }
+    }
+    if (g_visible_count <= 0)
+        g_selected_index = 0;
+    else if (g_selected_index >= g_visible_count)
+        g_selected_index = g_visible_count - 1;
+    else if (g_selected_index < 0)
+        g_selected_index = 0;
+}
+
+static bool iptv_commit_catalog(IptvCatalog *catalog)
+{
+    uint32_t preferred_channel = 0;
+    uint32_t preferred_source = 0;
+    uint32_t *favorites = NULL;
+    char preferred_group[IPTV_GROUP_MAX] = "";
+    int favorite_count;
+    int *visible = catalog->channel_count ? malloc((size_t)catalog->channel_count * sizeof(*visible)) : NULL;
+    int *filter_counts = calloc((size_t)catalog->group_count + 3, sizeof(*filter_counts));
+    if (!filter_counts || (catalog->channel_count && !visible))
+    {
+        free(visible);
+        free(filter_counts);
+        return false;
+    }
+
+    mutexLock(&g_mutex);
+    if (!iptv_load_favorites(&favorites, &favorite_count))
+    {
+        mutexUnlock(&g_mutex);
+        free(visible);
+        free(filter_counts);
+        free(favorites);
+        return false;
+    }
+    if (g_visible_count > 0 && g_selected_index >= 0 && g_selected_index < g_visible_count)
+        preferred_channel = g_channels[g_visible[g_selected_index]].id;
+    if (g_source_selected_index >= 0 && g_source_selected_index < g_source_count)
+        preferred_source = g_sources[g_source_selected_index].id;
+    if (g_filter_index >= 3 && g_filter_index - 3 < g_group_count)
+        iptv_copy(preferred_group, sizeof(preferred_group), g_groups[g_filter_index - 3]);
+    free(g_channels);
+    free(g_sources);
+    free(g_groups);
+    free(g_visible);
+    free(g_filter_counts);
+    g_filter_counts = filter_counts;
+    g_channels = catalog->channels;
+    catalog->channels = NULL;
+    g_visible = visible;
+    g_channel_count = catalog->channel_count;
+    g_sources = catalog->sources;
+    catalog->sources = NULL;
+    g_source_capacity = catalog->source_capacity;
+    g_source_count = catalog->source_count;
+    g_groups = catalog->groups;
+    catalog->groups = NULL;
+    g_group_count = catalog->group_count;
+    if (g_filter_index >= 3)
+    {
+        g_filter_index = 0;
+        for (int i = 0; i < g_group_count; ++i)
+            if (strcasecmp(preferred_group, g_groups[i]) == 0)
+                g_filter_index = i + 3;
+    }
+    if (g_source_filter_id)
+    {
+        bool found = false;
+        for (int i = 0; i < g_source_count; ++i)
+            found |= g_sources[i].id == g_source_filter_id;
+        if (!found)
+            g_source_filter_id = 0;
+    }
+    g_preinstalled_refresh_needed |= catalog->preinstalled_refresh_needed;
+    g_preinstalled_changed_count += catalog->preinstalled_changed_count;
+    g_hls_stream_count = catalog->hls_stream_count;
+    g_logo_cached_count = catalog->logo_cached_count;
+    g_epg_channel_count = catalog->epg_channel_count;
+    g_recent_count = iptv_load_id_file(IPTV_RECENT_FILE, g_recent_ids, IPTV_MAX_RECENT);
+    for (int i = 0; i < g_channel_count; ++i)
+    {
+        g_channels[i].favorite = iptv_id_in_list(favorites, favorite_count, g_channels[i].id);
+        g_channels[i].recent = iptv_id_in_list(g_recent_ids, g_recent_count, g_channels[i].id);
+    }
+    g_loaded = true;
+    iptv_rebuild_visible_locked(preferred_channel);
+    g_source_selected_index = 0;
+    if (preferred_source)
+    {
+        for (int i = 0; i < g_source_count; ++i)
+        {
+            if (g_sources[i].id == preferred_source)
+            {
+                g_source_selected_index = i;
+                break;
+            }
+        }
+    }
+    if (!g_refreshing)
+    {
+        if (g_channel_count > 0)
+            snprintf(g_status, sizeof(g_status), "Loaded %d channels from %d sources.", g_channel_count, g_source_count);
+        else if (g_source_count > 0)
+            iptv_copy(g_status, sizeof(g_status), "Sources loaded. Refresh remote sources or add local M3U files.");
+        else
+            iptv_copy(g_status, sizeof(g_status), "No IPTV sources. Add a remote source or copy M3U files to the IPTV folder.");
+    }
+    iptv_queue_selected_logo_locked();
+    mutexUnlock(&g_mutex);
+    free(favorites);
+    return true;
+}
+
+static bool iptv_rebuild_catalog(void)
+{
+    IptvCatalog catalog;
+    mutexLock(&g_catalog_mutex);
+    bool ok = iptv_catalog_build(&catalog);
+
+    if (ok)
+        ok = iptv_commit_catalog(&catalog);
+    free(catalog.channels);
+    free(catalog.sources);
+    free(catalog.groups);
+    mutexUnlock(&g_catalog_mutex);
+    if (!ok)
+        iptv_set_status("IPTV catalog load failed: memory budget, allocation, or SD read/write error. Previous catalog retained.");
+    return ok;
+}
+
+static bool iptv_find_source_copy(uint32_t id, IptvSource *out)
+{
+    bool found = false;
+    mutexLock(&g_mutex);
+    for (int i = 0; i < g_source_count; ++i)
+    {
+        if (g_sources[i].id == id)
+        {
+            *out = g_sources[i];
+            found = true;
+            break;
+        }
+    }
+    mutexUnlock(&g_mutex);
+    return found;
+}
+
+static bool iptv_find_playlist_guide_url(const IptvSource *source, char *out, size_t out_size)
+{
+    const char *path;
+    FILE *file;
+    char buffer[IPTV_URL_MAX + 768];
+
+    if (!source || !out || out_size == 0)
+        return false;
+    out[0] = '\0';
+    path = source->local ? source->url : source->cache_path;
+    file = fopen(path, "rb");
+    if (!file)
+        return false;
+
+    while (fgets(buffer, sizeof(buffer), file))
+    {
+        char *line = iptv_trim(buffer);
+        char declared[IPTV_URL_MAX];
+
+        if (!line[0])
+            continue;
+        if (strncasecmp(line, "#EXTM3U", 7) != 0)
+            break;
+        iptv_parse_m3u_header_epg(line, declared, sizeof(declared));
+        if (declared[0])
+            (void)iptv_url_resolve(source->url, declared, out, out_size);
+        break;
+    }
+    fclose(file);
+    return out[0] != '\0';
+}
+
+static bool iptv_refresh_source_files(const IptvSource *source, char *message, size_t message_size)
+{
+    char error[IPTV_STATUS_MAX] = "";
+    char automatic_epg_url[IPTV_URL_MAX] = "";
+    const char *epg_url;
+    bool playlist_ok = true;
+    bool epg_ok = true;
+
+    if (!source)
+        return false;
+    if (!source->local)
+        playlist_ok = iptv_fetch_to_file(source->url,
+                                         source->cache_path,
+                                         IPTV_REMOTE_PLAYLIST_LIMIT,
+                                         &g_background_fetch_control,
+                                         error,
+                                         sizeof(error));
+    epg_url = source->epg_url;
+    if (playlist_ok && !epg_url[0] && iptv_find_playlist_guide_url(source, automatic_epg_url, sizeof(automatic_epg_url)))
+        epg_url = automatic_epg_url;
+    if (playlist_ok && epg_url[0])
+    {
+        char epg_path[IPTV_PATH_MAX];
+        snprintf(epg_path, sizeof(epg_path), "%s/%08x.xmltv", IPTV_EPG_CACHE_DIR, source->id);
+        epg_ok = iptv_fetch_to_file(epg_url,
+                                    epg_path,
+                                    IPTV_XMLTV_LIMIT,
+                                    &g_background_fetch_control,
+                                    error,
+                                    sizeof(error));
+    }
+    if (playlist_ok && epg_ok)
+    {
+        snprintf(message,
+                 message_size,
+                 "%.100s %s%s",
+                 source->name,
+                 epg_url[0] ? "and programme guide refreshed." : "refreshed.",
+                 automatic_epg_url[0] ? " Guide link found in M3U." : "");
+        return true;
+    }
+    log_warn("[iptv] refresh failed source=%.64s stage=%s error=%.96s\n",
+             source->name,
+             playlist_ok ? "epg" : "playlist",
+             error[0] ? error : "unknown error");
+    snprintf(message, message_size, "Refresh failed for %.70s: %.80s", source->name, error);
+    return false;
+}
+
+static void iptv_finish_refresh(const char *message)
+{
+    mutexLock(&g_mutex);
+    g_refreshing = false;
+    g_refreshing_source_id = 0;
+    iptv_copy(g_status, sizeof(g_status), message);
+    mutexUnlock(&g_mutex);
+}
+
+static void iptv_cache_logo(uint32_t channel_id, const char *url, const char *path)
+{
+    char error[96] = "";
+
+    if (!url[0] || !path[0] || iptv_path_exists(path))
+        return;
+    if (!iptv_fetch_to_file(url, path, IPTV_LOGO_LIMIT,
+                            &g_background_fetch_control, error,
+                            sizeof(error)))
+    {
+        log_warn("[iptv] logo cache failed channel=%08x error=%s\n", channel_id, error);
+        return;
+    }
+    mutexLock(&g_mutex);
+    for (int i = 0; i < g_channel_count; ++i)
+    {
+        if (g_channels[i].id == channel_id)
+        {
+            if (!g_channels[i].logo_cached)
+                ++g_logo_cached_count;
+            g_channels[i].logo_cached = true;
+            break;
+        }
+    }
+    mutexUnlock(&g_mutex);
+}
+
+static void iptv_worker(void *argument)
+{
+    (void)argument;
+    for (;;)
+    {
+        bool refresh_all;
+        uint32_t refresh_source;
+        bool cache_logo;
+        uint32_t logo_channel;
+        char logo_url[IPTV_LOGO_URL_MAX];
+        char logo_path[IPTV_PATH_MAX];
+
+        mutexLock(&g_mutex);
+        while (!atomic_load(&g_worker_stop) &&
+               (atomic_load(&g_background_suspended) ||
+                (!g_refresh_all_requested && !g_refresh_source_requested &&
+                 !g_logo_requested)))
+            condvarWait(&g_worker_cond, &g_mutex);
+        if (atomic_load(&g_worker_stop))
+        {
+            mutexUnlock(&g_mutex);
+            break;
+        }
+        refresh_all = g_refresh_all_requested;
+        refresh_source = g_refresh_source_requested;
+        cache_logo = g_logo_requested;
+        logo_channel = g_logo_channel_id;
+        iptv_copy(logo_url, sizeof(logo_url), g_logo_url);
+        iptv_copy(logo_path, sizeof(logo_path), g_logo_path);
+        g_refresh_all_requested = false;
+        g_refresh_source_requested = 0;
+        g_logo_requested = false;
+        g_worker_busy = refresh_all || refresh_source || cache_logo;
+        if (refresh_all || refresh_source)
+            g_refreshing = true;
+        mutexUnlock(&g_mutex);
+
+        if (refresh_all)
+        {
+            bool cancelled = false;
+            IptvSource *sources;
+            int count;
+            char message[IPTV_STATUS_MAX] = "IPTV sources refreshed.";
+            char first_failure[IPTV_STATUS_MAX] = "";
+            mutexLock(&g_mutex);
+            count = g_source_count;
+            sources = count ? malloc((size_t)count * sizeof(*sources)) : NULL;
+            if (sources)
+                memcpy(sources, g_sources, (size_t)count * sizeof(*sources));
+            mutexUnlock(&g_mutex);
+            if (count && !sources)
+            {
+                iptv_finish_refresh("IPTV refresh failed: not enough memory for source snapshot.");
+                goto job_finished;
+            }
+            for (int i = 0; i < count; ++i)
+            {
+                mutexLock(&g_mutex);
+                if (atomic_load(&g_worker_stop) ||
+                    atomic_load(&g_background_suspended))
+                {
+                    cancelled = true;
+                    mutexUnlock(&g_mutex);
+                    break;
+                }
+                g_refreshing_source_id = sources[i].id;
+                snprintf(g_status, sizeof(g_status), "Refreshing %s...", sources[i].name);
+                mutexUnlock(&g_mutex);
+                if (!iptv_refresh_source_files(&sources[i], message, sizeof(message)) && !first_failure[0])
+                    iptv_copy(first_failure, sizeof(first_failure), message);
+                if (atomic_load(&g_worker_stop) ||
+                    atomic_load(&g_background_suspended))
+                {
+                    cancelled = true;
+                    break;
+                }
+            }
+            free(sources);
+            if (!cancelled)
+            {
+                if (iptv_rebuild_catalog())
+                    iptv_finish_refresh(first_failure[0] ? first_failure : message);
+                else
+                    iptv_finish_refresh("IPTV catalog load failed: memory budget, allocation, or SD read/write error. Previous catalog retained.");
+            }
+        }
+        else if (refresh_source)
+        {
+            IptvSource source;
+            char message[IPTV_STATUS_MAX];
+            if (iptv_find_source_copy(refresh_source, &source))
+            {
+                mutexLock(&g_mutex);
+                if (atomic_load(&g_worker_stop) ||
+                    atomic_load(&g_background_suspended))
+                {
+                    mutexUnlock(&g_mutex);
+                    goto job_finished;
+                }
+                g_refreshing_source_id = source.id;
+                snprintf(g_status, sizeof(g_status), "Refreshing %s...", source.name);
+                mutexUnlock(&g_mutex);
+                iptv_refresh_source_files(&source, message, sizeof(message));
+                if (!atomic_load(&g_worker_stop) &&
+                    !atomic_load(&g_background_suspended))
+                {
+                    if (iptv_rebuild_catalog())
+                        iptv_finish_refresh(message);
+                    else
+                        iptv_finish_refresh("IPTV catalog load failed: memory budget, allocation, or SD read/write error. Previous catalog retained.");
+                }
+            }
+            else
+            {
+                iptv_finish_refresh("Selected IPTV source no longer exists.");
+            }
+        }
+
+        if (cache_logo)
+        {
+            bool can_cache = !atomic_load(&g_worker_stop) &&
+                             !atomic_load(&g_background_suspended);
+            if (can_cache)
+                iptv_cache_logo(logo_channel, logo_url, logo_path);
+        }
+
+    job_finished:
+        mutexLock(&g_mutex);
+        if (atomic_load(&g_background_suspended) &&
+            !atomic_load(&g_worker_stop))
+        {
+            if (refresh_all)
+                g_refresh_all_requested = true;
+            else if (refresh_source != 0u)
+                g_refresh_source_requested = refresh_source;
+            if (cache_logo)
+            {
+                g_logo_requested = true;
+                g_logo_channel_id = logo_channel;
+                iptv_copy(g_logo_url, sizeof(g_logo_url), logo_url);
+                iptv_copy(g_logo_path, sizeof(g_logo_path), logo_path);
+            }
+            g_refreshing = false;
+            g_refreshing_source_id = 0u;
+            iptv_copy(g_status, sizeof(g_status),
+                      "IPTV background work paused during playback.");
+        }
+        g_worker_busy = false;
+        condvarWakeAll(&g_worker_cond);
+        mutexUnlock(&g_mutex);
+    }
+    mutexLock(&g_mutex);
+    g_worker_busy = false;
+    condvarWakeAll(&g_worker_cond);
+    mutexUnlock(&g_mutex);
+    threadExit();
+}
+
+static void iptv_queue_selected_logo_locked(void)
+{
+    IptvChannel *channel;
+    if (!g_worker_started || atomic_load(&g_background_suspended) ||
+        g_visible_count <= 0 || g_selected_index < 0 ||
+        g_selected_index >= g_visible_count)
+        return;
+    channel = &g_channels[g_visible[g_selected_index]];
+    if (!channel->logo_url[0] || channel->logo_cached)
+        return;
+    g_logo_requested = true;
+    g_logo_channel_id = channel->id;
+    iptv_copy(g_logo_url, sizeof(g_logo_url), channel->logo_url);
+    iptv_copy(g_logo_path, sizeof(g_logo_path), channel->logo_path);
+    condvarWakeOne(&g_worker_cond);
+}
+
+bool iptv_init(void)
+{
+    Result rc;
+
+    if (!g_sync_initialized)
+    {
+        mutexInit(&g_mutex);
+        mutexInit(&g_catalog_mutex);
+        condvarInit(&g_worker_cond);
+        g_sync_initialized = true;
+    }
+    if (g_initialized)
+        return true;
+    iptv_ensure_directories();
+    atomic_store(&g_worker_stop, false);
+    g_worker_busy = false;
+    g_refresh_all_requested = false;
+    g_refresh_source_requested = 0;
+    g_logo_requested = false;
+    g_preinstalled_refresh_needed = false;
+    g_preinstalled_changed_count = 0;
+    avformat_network_init();
+    mutexLock(&g_mutex);
+    g_initialized = true;
+    g_recent_count = iptv_load_id_file(IPTV_RECENT_FILE, g_recent_ids, IPTV_MAX_RECENT);
+    mutexUnlock(&g_mutex);
+    if (!iptv_rebuild_catalog())
+    {
+        free(g_channels);
+        g_channels = NULL;
+        g_initialized = false;
+        avformat_network_deinit();
+        return false;
+    }
+
+    rc = threadCreate(&g_worker_thread, iptv_worker, NULL, NULL, IPTV_WORKER_STACK_SIZE, 0x2D, -2);
+    if (R_SUCCEEDED(rc))
+        rc = threadStart(&g_worker_thread);
+    if (R_FAILED(rc))
+    {
+        if (g_worker_thread.handle)
+            threadClose(&g_worker_thread);
+        mutexLock(&g_mutex);
+        iptv_copy(g_status, sizeof(g_status), "IPTV loaded, but background refresh is unavailable.");
+        mutexUnlock(&g_mutex);
+        log_warn("[iptv] worker start failed rc=0x%08X\n", rc);
+        return true;
+    }
+    mutexLock(&g_mutex);
+    g_worker_started = true;
+    if (g_preinstalled_refresh_needed)
+    {
+        g_refreshing = true;
+        g_refresh_all_requested = true;
+        if (g_preinstalled_changed_count > 0)
+            snprintf(g_status, sizeof(g_status), "Imported %d SD source%s; refreshing...",
+                     g_preinstalled_changed_count,
+                     g_preinstalled_changed_count == 1 ? "" : "s");
+        else
+            iptv_copy(g_status, sizeof(g_status), "Refreshing preinstalled IPTV sources...");
+        g_preinstalled_refresh_needed = false;
+        g_preinstalled_changed_count = 0;
+        condvarWakeOne(&g_worker_cond);
+    }
+    iptv_queue_selected_logo_locked();
+    mutexUnlock(&g_mutex);
+    return true;
+}
+
+void iptv_deinit(void)
+{
+    uint64_t playback_token;
+
+    if (!g_sync_initialized)
+        return;
+    mutexLock(&g_mutex);
+    atomic_store(&g_worker_stop, true);
+    condvarWakeAll(&g_worker_cond);
+    mutexUnlock(&g_mutex);
+    if (g_worker_started)
+    {
+        threadWaitForExit(&g_worker_thread);
+        threadClose(&g_worker_thread);
+    }
+    mutexLock(&g_mutex);
+    g_worker_started = false;
+    g_worker_busy = false;
+    g_initialized = false;
+    g_loaded = false;
+    g_refreshing = false;
+    g_channel_count = g_source_count = g_visible_count = 0;
+    g_group_count = g_recent_count = g_filter_index = 0;
+    g_selected_index = g_source_selected_index = 0;
+    g_source_filter_id = g_playing_channel_id = 0;
+    g_source_capacity = 0;
+    g_search[0] = '\0';
+    g_status[0] = g_last_name[0] = g_last_url[0] = '\0';
+    playback_token = g_playback_token;
+    free(g_channels);
+    g_channels = NULL;
+    free(g_sources);
+    g_sources = NULL;
+    free(g_groups);
+    g_groups = NULL;
+    free(g_visible);
+    g_visible = NULL;
+    free(g_filter_counts);
+    g_filter_counts = NULL;
+    g_favorite_count = g_recent_channel_count = 0;
+    mutexUnlock(&g_mutex);
+    if (playback_token != 0u)
+        (void)protocol_coordinator_media_release_current(
+            PLAYER_MEDIA_OWNER_IPTV, playback_token);
+    avformat_network_deinit();
+}
+
+bool iptv_set_background_network_suspended(bool suspended)
+{
+    bool previous = atomic_exchange(&g_background_suspended, suspended);
+    bool quiesced = true;
+
+    if (g_sync_initialized)
+    {
+        mutexLock(&g_mutex);
+        if (!suspended && previous)
+            iptv_queue_selected_logo_locked();
+        condvarWakeAll(&g_worker_cond);
+        if (suspended)
+        {
+            uint64_t started_ms =
+                armTicksToNs(armGetSystemTick()) / UINT64_C(1000000);
+
+            while (g_worker_started && g_worker_busy)
+            {
+                uint64_t now_ms =
+                    armTicksToNs(armGetSystemTick()) / UINT64_C(1000000);
+
+                if (now_ms - started_ms >=
+                    IPTV_BACKGROUND_QUIESCE_TIMEOUT_MS)
+                {
+                    quiesced = false;
+                    break;
+                }
+                uint64_t remaining_ms =
+                    IPTV_BACKGROUND_QUIESCE_TIMEOUT_MS -
+                    (now_ms - started_ms);
+                (void)condvarWaitTimeout(&g_worker_cond, &g_mutex,
+                                         remaining_ms * UINT64_C(1000000));
+            }
+        }
+        mutexUnlock(&g_mutex);
+    }
+    if (previous != suspended || !quiesced)
+        log_info("[iptv] background-network suspended=%d quiesced=%d\n",
+                 suspended ? 1 : 0, quiesced ? 1 : 0);
+    return quiesced;
+}
+
+bool iptv_reload(void)
+{
+    if (!g_initialized)
+        return false;
+    iptv_ensure_directories();
+    if (!iptv_rebuild_catalog())
+    {
+        return false;
+    }
+    mutexLock(&g_mutex);
+    iptv_queue_selected_logo_locked();
+    mutexUnlock(&g_mutex);
+    return true;
+}
+
+void iptv_set_status(const char *status)
+{
+    if (!g_sync_initialized)
+        return;
+    mutexLock(&g_mutex);
+    iptv_copy(g_status, sizeof(g_status), status);
+    mutexUnlock(&g_mutex);
+}
+
+bool iptv_get_state(IptvState *out)
+{
+    if (!out || !g_sync_initialized)
+        return false;
+    memset(out, 0, sizeof(*out));
+    mutexLock(&g_mutex);
+    out->initialized = g_initialized;
+    out->loaded = g_loaded;
+    out->refreshing = g_refreshing;
+    out->background_suspended = atomic_load(&g_background_suspended);
+    out->background_worker_busy = g_worker_busy;
+    out->source_count = g_source_count;
+    out->hls_stream_count = g_hls_stream_count;
+    out->channel_count = g_channel_count;
+    out->visible_count = g_visible_count;
+    out->group_count = g_group_count;
+    out->logo_cached_count = g_logo_cached_count;
+    out->epg_channel_count = g_epg_channel_count;
+    out->selected_index = g_selected_index;
+    out->source_selected_index = g_source_selected_index;
+    out->filter_index = g_filter_index;
+    out->source_filter_id = g_source_filter_id;
+    out->favorite_count = g_favorite_count;
+    out->recent_count = g_recent_channel_count;
+    if (g_filter_index == 0)
+        iptv_copy(out->active_filter, sizeof(out->active_filter), iptv_text("All channels"));
+    else if (g_filter_index == 1)
+        iptv_copy(out->active_filter, sizeof(out->active_filter), iptv_text("Favorites"));
+    else if (g_filter_index == 2)
+        iptv_copy(out->active_filter, sizeof(out->active_filter), iptv_text("Recent"));
+    else if (g_filter_index - 3 < g_group_count)
+    {
+        const char *group = g_groups[g_filter_index - 3];
+        iptv_copy(out->active_filter, sizeof(out->active_filter),
+                  strcmp(group, "Local HLS") == 0 || strcmp(group, "Remote HLS") == 0 ? iptv_text(group) : group);
+    }
+    iptv_copy(out->search, sizeof(out->search), g_search);
+    iptv_status_copy(out->status, sizeof(out->status), g_status);
+    iptv_copy(out->last_name, sizeof(out->last_name), g_playing_channel_id ? g_last_name : iptv_text(g_last_name));
+    iptv_copy(out->last_url, sizeof(out->last_url), g_last_url);
+    mutexUnlock(&g_mutex);
+    return true;
+}
+
+int iptv_get_channel_count(void)
+{
+    int count;
+    if (!g_sync_initialized)
+        return 0;
+    mutexLock(&g_mutex);
+    count = g_visible_count;
+    mutexUnlock(&g_mutex);
+    return count;
+}
+
+int iptv_get_selected_index(void)
+{
+    int index;
+    if (!g_sync_initialized)
+        return 0;
+    mutexLock(&g_mutex);
+    index = g_selected_index;
+    mutexUnlock(&g_mutex);
+    return index;
+}
+
+void iptv_set_selected_index(int index)
+{
+    if (!g_sync_initialized)
+        return;
+    mutexLock(&g_mutex);
+    if (g_visible_count <= 0)
+        g_selected_index = 0;
+    else
+    {
+        if (index < 0)
+            index = 0;
+        if (index >= g_visible_count)
+            index = g_visible_count - 1;
+        g_selected_index = index;
+        iptv_queue_selected_logo_locked();
+    }
+    mutexUnlock(&g_mutex);
+}
+
+void iptv_select_delta(int delta)
+{
+    int current = iptv_get_selected_index();
+    iptv_set_selected_index(current + delta);
+}
+
+bool iptv_get_channel(int index, IptvChannel *out)
+{
+    bool found = false;
+    if (!out || !g_sync_initialized)
+        return false;
+    mutexLock(&g_mutex);
+    if (index >= 0 && index < g_visible_count)
+    {
+        *out = g_channels[g_visible[index]];
+        if (strcmp(out->group, "Local HLS") == 0 || strcmp(out->group, "Remote HLS") == 0)
+            iptv_copy(out->group, sizeof(out->group), iptv_text(g_channels[g_visible[index]].group));
+        int generated, consumed = 0;
+        if (sscanf(out->name, IPTV_FALLBACK_NAME " %d%n", &generated, &consumed) == 1 &&
+            out->name[consumed] == '\0')
+            snprintf(out->name, sizeof(out->name), home_ui_text("IPTV Channel %d", "IPTV 频道 %d"), generated);
+        found = true;
+    }
+    mutexUnlock(&g_mutex);
+    return found;
+}
+
+int iptv_get_source_count(void)
+{
+    int count;
+    if (!g_sync_initialized)
+        return 0;
+    mutexLock(&g_mutex);
+    count = g_source_count;
+    mutexUnlock(&g_mutex);
+    return count;
+}
+
+int iptv_get_source_selected_index(void)
+{
+    int index;
+    if (!g_sync_initialized)
+        return 0;
+    mutexLock(&g_mutex);
+    index = g_source_selected_index;
+    mutexUnlock(&g_mutex);
+    return index;
+}
+
+void iptv_set_source_selected_index(int index)
+{
+    if (!g_sync_initialized)
+        return;
+    mutexLock(&g_mutex);
+    if (g_source_count <= 0)
+        g_source_selected_index = 0;
+    else
+    {
+        if (index < 0)
+            index = 0;
+        if (index >= g_source_count)
+            index = g_source_count - 1;
+        g_source_selected_index = index;
+    }
+    mutexUnlock(&g_mutex);
+}
+
+void iptv_select_source_delta(int delta)
+{
+    int current = iptv_get_source_selected_index();
+    iptv_set_source_selected_index(current + delta);
+}
+
+bool iptv_get_source(int index, IptvSource *out)
+{
+    bool found = false;
+    if (!out || !g_sync_initialized)
+        return false;
+    mutexLock(&g_mutex);
+    if (index >= 0 && index < g_source_count)
+    {
+        *out = g_sources[index];
+        if (out->channel_count > 0)
+            snprintf(out->status, sizeof(out->status), home_ui_text("%d channels", "%d 个频道"), out->channel_count);
+        else
+            iptv_copy(out->status, sizeof(out->status), iptv_text(g_sources[index].status));
+        out->refreshing = g_refreshing && out->id == g_refreshing_source_id;
+        found = true;
+    }
+    mutexUnlock(&g_mutex);
+    return found;
+}
+
+static bool iptv_prompt_text(const char *header,
+                             const char *subtext,
+                             const char *guide,
+                             const char *button,
+                             const char *initial,
+                             char *out,
+                             size_t out_size)
+{
+    SwkbdConfig keyboard;
+    Result rc;
+    char *trimmed;
+
+    if (!out || out_size == 0)
+        return false;
+    out[0] = '\0';
+    rc = swkbdCreate(&keyboard, 0);
+    if (R_FAILED(rc))
+        return false;
+    swkbdConfigMakePresetDefault(&keyboard);
+    swkbdConfigSetHeaderText(&keyboard, iptv_text(header));
+    swkbdConfigSetSubText(&keyboard, iptv_text(subtext));
+    swkbdConfigSetGuideText(&keyboard, iptv_text(guide));
+    swkbdConfigSetOkButtonText(&keyboard, iptv_text(button));
+    swkbdConfigSetStringLenMax(&keyboard, out_size > 1 ? (u32)(out_size - 1) : 1);
+    if (initial && initial[0])
+        swkbdConfigSetInitialText(&keyboard, initial);
+    rc = swkbdShow(&keyboard, out, out_size);
+    swkbdClose(&keyboard);
+    if (R_FAILED(rc))
+        return false;
+    trimmed = iptv_trim(out);
+    if (trimmed != out)
+        memmove(out, trimmed, strlen(trimmed) + 1);
+    return out[0] != '\0';
+}
+
+bool iptv_add_source_url(const char *url)
+{
+    char name[IPTV_SOURCE_MAX];
+    uint32_t id;
+    int added_index;
+
+    mutexLock(&g_mutex);
+    bool busy = g_refreshing;
+    mutexUnlock(&g_mutex);
+    if (busy)
+    {
+        iptv_set_status("Wait for the current IPTV refresh to finish.");
+        return false;
+    }
+    if (!iptv_url_is_remote(url))
+    {
+        iptv_set_status("Remote source must use HTTP or HTTPS.");
+        return false;
+    }
+    if (strlen(url) >= IPTV_URL_MAX)
+    {
+        iptv_set_status("IPTV source URL is too long.");
+        return false;
+    }
+    id = iptv_hash_string(url);
+    iptv_source_name_from_url(url, name, sizeof(name));
+    mutexLock(&g_mutex);
+    for (int i = 0; i < g_source_count; ++i)
+    {
+        if (g_sources[i].id == id || strcasecmp(g_sources[i].url, url) == 0)
+        {
+            g_source_selected_index = i;
+            mutexUnlock(&g_mutex);
+            iptv_set_status("IPTV source already exists; refreshing it.");
+            return iptv_refresh_selected_source_async();
+        }
+    }
+    bool allocation_failed = false;
+    g_sources = iptv_data_reserve(g_sources, &g_source_capacity, (size_t)g_source_count + 1,
+                                  sizeof(*g_sources), IPTV_METADATA_BYTES, &allocation_failed);
+    if (allocation_failed)
+    {
+        mutexUnlock(&g_mutex);
+        iptv_set_status("IPTV source allocation failed or memory budget exceeded.");
+        return false;
+    }
+    IptvSource *source = &g_sources[g_source_count++];
+    memset(source, 0, sizeof(*source));
+    source->id = id;
+    source->enabled = true;
+    iptv_copy(source->name, sizeof(source->name), name);
+    iptv_copy(source->url, sizeof(source->url), url);
+    snprintf(source->cache_path, sizeof(source->cache_path), "%s/%08x.m3u", IPTV_PLAYLIST_CACHE_DIR, id);
+    added_index = g_source_count - 1;
+    bool saved = iptv_save_sources_locked();
+    if (!saved)
+    {
+        memset(&g_sources[added_index], 0, sizeof(g_sources[added_index]));
+        --g_source_count;
+    }
+    mutexUnlock(&g_mutex);
+    if (!saved)
+    {
+        iptv_set_status("Failed to save IPTV source.");
+        return false;
+    }
+    if (!iptv_reload())
+    {
+        iptv_set_status("IPTV source was saved, but the catalog could not be reloaded.");
+        return false;
+    }
+    mutexLock(&g_mutex);
+    for (int i = 0; i < g_source_count; ++i)
+    {
+        if (g_sources[i].id == id)
+        {
+            g_source_selected_index = i;
+            break;
+        }
+    }
+    mutexUnlock(&g_mutex);
+    return iptv_refresh_selected_source_async();
+}
+
+bool iptv_prompt_add_source(void)
+{
+    char url[IPTV_URL_MAX];
+
+    if (!iptv_prompt_text("Add IPTV playlist",
+                          "Paste the address of the M3U channel list",
+                          "https://example.com/channels.m3u",
+                          "Import",
+                          "",
+                          url,
+                          sizeof(url)))
+        return false;
+    return iptv_add_source_url(url);
+}
+
+bool iptv_prompt_set_source_epg(void)
+{
+    IptvSource source;
+    char url[IPTV_URL_MAX];
+    int selected = iptv_get_source_selected_index();
+
+    mutexLock(&g_mutex);
+    bool busy = g_refreshing;
+    mutexUnlock(&g_mutex);
+    if (busy)
+    {
+        iptv_set_status("Wait for the current IPTV refresh to finish.");
+        return false;
+    }
+    if (!iptv_get_source(selected, &source))
+        return false;
+    if (source.local)
+    {
+        iptv_set_status("Local playlist: add url-tvg=\"guide.xml URL\" to the #EXTM3U header.");
+        return false;
+    }
+    if (!iptv_prompt_text(source.epg_url[0] ? "Change programme guide" : "Connect programme guide",
+                          "Paste the guide.xml address supplied with this M3U playlist",
+                          "https://example.com/guide.xml",
+                          "Connect",
+                          source.epg_url,
+                          url,
+                          sizeof(url)))
+        return false;
+    if (!iptv_url_is_remote(url))
+    {
+        iptv_set_status("Programme guide address must use HTTP or HTTPS.");
+        return false;
+    }
+    mutexLock(&g_mutex);
+    if (selected >= 0 && selected < g_source_count && g_sources[selected].id == source.id)
+        iptv_copy(g_sources[selected].epg_url, sizeof(g_sources[selected].epg_url), url);
+    bool saved = iptv_save_sources_locked();
+    mutexUnlock(&g_mutex);
+    if (!saved)
+    {
+        iptv_set_status("Failed to save the programme guide address.");
+        return false;
+    }
+    return iptv_refresh_selected_source_async();
+}
+
+bool iptv_remove_selected_source(void)
+{
+    IptvSource removed;
+    int selected;
+
+    mutexLock(&g_mutex);
+    if (g_refreshing)
+    {
+        mutexUnlock(&g_mutex);
+        iptv_set_status("Wait for the current IPTV refresh to finish.");
+        return false;
+    }
+    selected = g_source_selected_index;
+    if (selected < 0 || selected >= g_source_count || g_sources[selected].local)
+    {
+        mutexUnlock(&g_mutex);
+        iptv_set_status("Local M3U sources are removed by deleting their SD card file.");
+        return false;
+    }
+    removed = g_sources[selected];
+    if (!iptv_remove_preinstalled_source(removed.url))
+    {
+        mutexUnlock(&g_mutex);
+        iptv_set_status("Failed to remove the source from sources.txt.");
+        return false;
+    }
+    memmove(&g_sources[selected], &g_sources[selected + 1], (size_t)(g_source_count - selected - 1) * sizeof(g_sources[0]));
+    --g_source_count;
+    bool saved = iptv_save_sources_locked();
+    mutexUnlock(&g_mutex);
+    if (!saved)
+    {
+        iptv_set_status("Failed to update IPTV source list.");
+        return false;
+    }
+    remove(removed.cache_path);
+    char epg_path[IPTV_PATH_MAX];
+    snprintf(epg_path, sizeof(epg_path), "%s/%08x.xmltv", IPTV_EPG_CACHE_DIR, removed.id);
+    remove(epg_path);
+    if (!iptv_reload())
+        return false;
+    iptv_set_status("IPTV source, playlist cache, and programme guide removed.");
+    return true;
+}
+
+bool iptv_refresh_selected_source_async(void)
+{
+    uint32_t id = 0;
+    bool busy;
+
+    mutexLock(&g_mutex);
+    bool suspended = atomic_load(&g_background_suspended);
+    busy = g_refreshing;
+    if (!g_worker_started || g_source_count <= 0 || busy || suspended)
+    {
+        mutexUnlock(&g_mutex);
+        iptv_set_status(suspended ? "IPTV background work is paused during playback."
+                                  : (busy ? "An IPTV refresh is already running."
+                                          : "IPTV background worker is unavailable."));
+        return false;
+    }
+    id = g_sources[g_source_selected_index].id;
+    g_refreshing = true;
+    g_refresh_source_requested = id;
+    snprintf(g_status, sizeof(g_status), "Queued refresh for %s.", g_sources[g_source_selected_index].name);
+    condvarWakeOne(&g_worker_cond);
+    mutexUnlock(&g_mutex);
+    return true;
+}
+
+bool iptv_refresh_all_async(void)
+{
+    bool busy;
+
+    mutexLock(&g_mutex);
+    bool suspended = atomic_load(&g_background_suspended);
+    busy = g_refreshing;
+    if (!g_worker_started || busy || suspended)
+    {
+        mutexUnlock(&g_mutex);
+        iptv_set_status(suspended ? "IPTV background work is paused during playback."
+                                  : (busy ? "An IPTV refresh is already running."
+                                          : "IPTV background worker is unavailable."));
+        return false;
+    }
+    mutexUnlock(&g_mutex);
+
+    if (!iptv_reload())
+    {
+        iptv_set_status("Failed to reload IPTV sources from SD.");
+        return false;
+    }
+
+    mutexLock(&g_mutex);
+    suspended = atomic_load(&g_background_suspended);
+    if (!g_worker_started || g_refreshing || g_source_count <= 0 || suspended)
+    {
+        bool busy = g_refreshing;
+        bool worker_available = g_worker_started;
+        mutexUnlock(&g_mutex);
+        if (suspended)
+            iptv_set_status("IPTV background work is paused during playback.");
+        else if (busy)
+            iptv_set_status("An IPTV refresh is already running.");
+        else if (!worker_available)
+            iptv_set_status("IPTV background worker is unavailable.");
+        else
+            iptv_set_status("No IPTV sources found. Check sources.txt on the Switch SD card.");
+        return false;
+    }
+    g_refreshing = true;
+    g_refresh_all_requested = true;
+    g_preinstalled_refresh_needed = false;
+    g_preinstalled_changed_count = 0;
+    iptv_copy(g_status, sizeof(g_status), "Queued refresh for all IPTV sources.");
+    condvarWakeOne(&g_worker_cond);
+    mutexUnlock(&g_mutex);
+    return true;
+}
+
+void iptv_cycle_filter(int delta)
+{
+    uint32_t selected_id = 0;
+    if (!g_sync_initialized)
+        return;
+    mutexLock(&g_mutex);
+    if (g_visible_count > 0 && g_selected_index < g_visible_count)
+        selected_id = g_channels[g_visible[g_selected_index]].id;
+    int count = g_group_count + 3;
+    g_filter_index = (int)(((int64_t)g_filter_index + delta) % count);
+    if (g_filter_index < 0)
+        g_filter_index += count;
+    iptv_rebuild_visible_locked(selected_id);
+    iptv_queue_selected_logo_locked();
+    mutexUnlock(&g_mutex);
+}
+
+void iptv_set_filter(int index)
+{
+    if (!g_sync_initialized)
+        return;
+    mutexLock(&g_mutex);
+    int next = index >= 0 && index < g_group_count + 3 ? index : 0;
+    if (next != g_filter_index)
+    {
+        g_filter_index = next;
+        g_selected_index = 0;
+        iptv_rebuild_visible_locked(0);
+        iptv_queue_selected_logo_locked();
+    }
+    mutexUnlock(&g_mutex);
+}
+
+int iptv_get_filter_index(void)
+{
+    if (!g_sync_initialized)
+        return 0;
+    mutexLock(&g_mutex);
+    int index = g_filter_index;
+    mutexUnlock(&g_mutex);
+    return index;
+}
+
+int iptv_get_filter_count(void)
+{
+    if (!g_sync_initialized)
+        return 3;
+    mutexLock(&g_mutex);
+    int count = g_group_count + 3;
+    mutexUnlock(&g_mutex);
+    return count;
+}
+
+bool iptv_get_filter(int index, char *name, size_t size, int *count)
+{
+    if (name && size)
+        name[0] = '\0';
+    if (count)
+        *count = 0;
+    if (!g_sync_initialized)
+    {
+        if (index < 0 || index >= 3)
+            return false;
+        iptv_copy(name, size, iptv_text(index == 0 ? "All channels" : index == 1 ? "Favorites" : "Recent"));
+        return true;
+    }
+    mutexLock(&g_mutex);
+    bool valid = index >= 0 && index < g_group_count + 3;
+    if (valid)
+    {
+        const char *label = index == 0 ? home_ui_text("All channels", "全部频道") :
+                            index == 1 ? home_ui_text("Favorites", "收藏") :
+                            index == 2 ? home_ui_text("Recent", "最近播放") : g_groups[index - 3];
+        if (index >= 3 && (strcmp(label, "Local HLS") == 0 || strcmp(label, "Remote HLS") == 0))
+            label = iptv_text(label);
+        iptv_copy(name, size, label);
+        if (count && g_filter_counts)
+            *count = g_filter_counts[index];
+    }
+    mutexUnlock(&g_mutex);
+    return valid;
+}
+
+void iptv_set_source_filter(uint32_t source_id)
+{
+    if (!g_sync_initialized)
+        return;
+    mutexLock(&g_mutex);
+    uint32_t next = 0;
+    for (int i = 0; source_id && i < g_source_count; ++i)
+        if (g_sources[i].id == source_id)
+        {
+            next = source_id;
+            break;
+        }
+    if (next != g_source_filter_id)
+    {
+        g_source_filter_id = next;
+        g_selected_index = 0;
+        iptv_rebuild_visible_locked(0);
+        iptv_queue_selected_logo_locked();
+    }
+    mutexUnlock(&g_mutex);
+}
+
+uint32_t iptv_get_source_filter(void)
+{
+    if (!g_sync_initialized)
+        return 0;
+    mutexLock(&g_mutex);
+    uint32_t id = g_source_filter_id;
+    mutexUnlock(&g_mutex);
+    return id;
+}
+
+uint32_t iptv_get_playing_channel_id(void)
+{
+    if (!g_sync_initialized)
+        return 0;
+    mutexLock(&g_mutex);
+    uint32_t id = g_playing_channel_id;
+    uint64_t token = g_playback_token;
+    mutexUnlock(&g_mutex);
+    return id && player_ownership_matches(PLAYER_MEDIA_OWNER_IPTV, token) ? id : 0;
+}
+
+bool iptv_prompt_search(void)
+{
+    char search[IPTV_SEARCH_MAX];
+    char initial[IPTV_SEARCH_MAX];
+    mutexLock(&g_mutex);
+    iptv_copy(initial, sizeof(initial), g_search);
+    mutexUnlock(&g_mutex);
+    if (!iptv_prompt_text("Search IPTV",
+                          "Match channel name, group, or tvg-id",
+                          "News",
+                          "Filter",
+                          initial,
+                          search,
+                          sizeof(search)))
+        return false;
+    mutexLock(&g_mutex);
+    iptv_copy(g_search, sizeof(g_search), search);
+    iptv_rebuild_visible_locked(0);
+    iptv_queue_selected_logo_locked();
+    mutexUnlock(&g_mutex);
+    return true;
+}
+
+void iptv_clear_search(void)
+{
+    mutexLock(&g_mutex);
+    g_search[0] = '\0';
+    iptv_rebuild_visible_locked(0);
+    iptv_queue_selected_logo_locked();
+    mutexUnlock(&g_mutex);
+}
+
+bool iptv_toggle_selected_favorite(void)
+{
+    uint32_t *favorites;
+    int count = 0;
+    uint32_t selected_id;
+
+    mutexLock(&g_mutex);
+    if (g_visible_count <= 0 || g_selected_index >= g_visible_count)
+    {
+        mutexUnlock(&g_mutex);
+        return false;
+    }
+    favorites = malloc((size_t)g_channel_count * sizeof(*favorites));
+    if (!favorites)
+    {
+        mutexUnlock(&g_mutex);
+        iptv_set_status("Unable to save favorites: not enough memory.");
+        return false;
+    }
+    selected_id = g_channels[g_visible[g_selected_index]].id;
+    bool make_favorite = !g_channels[g_visible[g_selected_index]].favorite;
+    for (int i = 0; i < g_channel_count; ++i)
+    {
+        if (g_channels[i].id == selected_id)
+            g_channels[i].favorite = make_favorite;
+        if (g_channels[i].favorite)
+            favorites[count++] = g_channels[i].id;
+    }
+    bool saved = iptv_write_id_file(IPTV_FAVORITES_FILE, favorites, count);
+    free(favorites);
+    if (!saved)
+        for (int i = 0; i < g_channel_count; ++i)
+            if (g_channels[i].id == selected_id)
+                g_channels[i].favorite = !make_favorite;
+    iptv_rebuild_visible_locked(selected_id);
+    iptv_copy(g_status, sizeof(g_status), !saved ? "Failed to save favorites." :
+              (make_favorite ? "Added to favorites." : "Removed from favorites."));
+    mutexUnlock(&g_mutex);
+    return saved;
+}
+
+static bool iptv_play_url_named(const char *url,
+                                const char *name,
+                                const char *display_title,
+                                uint32_t channel_id)
+{
+    ProtocolMediaTransaction transaction;
+    PlayerCommandRequest request;
+    PlayerCommandStatus command_status;
+    uint64_t playback_token;
+    uint32_t seq;
+    uint32_t url_hash;
+    const char *failure_phase = NULL;
+
+    if (!iptv_url_is_playable(url))
+    {
+        iptv_set_status("Invalid IPTV URL.");
+        return false;
+    }
+
+    url_hash = player_trace_uri_hash(url);
+    seq = player_trace_begin_media("IPTVPlay", url, display_title);
+    log_info("[iptv-play] seq=%u phase=begin channel_id=%08x url_hash=%08x\n",
+             seq, channel_id, url_hash);
+
+    log_info("[iptv-play] seq=%u phase=claim begin url_hash=%08x\n",
+             seq, url_hash);
+    mutexLock(&g_mutex);
+    ++g_playback_token;
+    if (g_playback_token == 0u)
+        ++g_playback_token;
+    playback_token = g_playback_token;
+    mutexUnlock(&g_mutex);
+    if (!protocol_coordinator_media_begin(PLAYER_MEDIA_OWNER_IPTV,
+                                          playback_token,
+                                          &transaction))
+    {
+        log_info("[iptv-play] seq=%u phase=claim failed url_hash=%08x\n",
+                 seq, url_hash);
+        iptv_set_status("Player is busy with another media source.");
+        return false;
+    }
+    log_info("[iptv-play] seq=%u phase=claim done generation=%u "
+             "previous_owner=%s url_hash=%08x\n",
+             seq, transaction.lease.generation,
+             player_media_owner_name(transaction.previous.owner), url_hash);
+
+#if defined(NXCAST_EXCLUSIVE_MEDIA_RESOURCES) && \
+    NXCAST_EXCLUSIVE_MEDIA_RESOURCES
+    /* IPTV entry points run on the main thread, so they may drive convergence
+       while waiting for the coordinator worker to isolate the receivers. */
+    if (!protocol_coordinator_media_drive_resources(
+            &transaction.lease, IPTV_RESOURCE_TRANSITION_TIMEOUT_MS))
+    {
+        failure_phase = "resource-transition";
+        goto failure;
+    }
+#endif
+
+    memset(&request, 0, sizeof(request));
+    request.kind = PLAYER_COMMAND_OPEN;
+    request.source = PLAYER_COMMAND_SOURCE_IPTV;
+    request.lease = transaction.lease;
+    request.uri = url;
+    request.metadata = display_title;
+    request.flag = true;
+    log_info("[iptv-play] seq=%u phase=enqueue-open-autoplay begin "
+             "generation=%u token=%llu url_hash=%08x\n",
+             seq, transaction.lease.generation,
+             (unsigned long long)transaction.lease.token, url_hash);
+    command_status = player_submit_command_async(&request);
+    if (!player_command_status_succeeded(command_status))
+    {
+        failure_phase = player_command_status_name(command_status);
+        goto failure;
+    }
+    log_info("[iptv-play] seq=%u phase=enqueue-open-autoplay done "
+             "status=%s url_hash=%08x\n",
+             seq, player_command_status_name(command_status), url_hash);
+    protocol_coordinator_media_end(&transaction);
+    mutexLock(&g_mutex);
+    iptv_copy(g_last_url, sizeof(g_last_url), url);
+    g_playing_channel_id = channel_id;
+    iptv_copy(g_last_name, sizeof(g_last_name), name && name[0] ? name : "Direct IPTV URL");
+    snprintf(g_status, sizeof(g_status), "Playing IPTV: %s", g_last_name);
+    if (channel_id)
+    {
+        int existing = -1;
+        for (int i = 0; i < g_recent_count; ++i)
+        {
+            if (g_recent_ids[i] == channel_id)
+            {
+                existing = i;
+                break;
+            }
+        }
+        if (existing >= 0)
+            memmove(&g_recent_ids[1], &g_recent_ids[0], (size_t)existing * sizeof(g_recent_ids[0]));
+        else
+        {
+            int move = g_recent_count < IPTV_MAX_RECENT ? g_recent_count : IPTV_MAX_RECENT - 1;
+            memmove(&g_recent_ids[1], &g_recent_ids[0], (size_t)move * sizeof(g_recent_ids[0]));
+            if (g_recent_count < IPTV_MAX_RECENT)
+                ++g_recent_count;
+        }
+        g_recent_ids[0] = channel_id;
+        for (int i = 0; i < g_channel_count; ++i)
+            g_channels[i].recent = iptv_id_in_list(g_recent_ids, g_recent_count, g_channels[i].id);
+        iptv_write_id_file(IPTV_RECENT_FILE, g_recent_ids, g_recent_count);
+        iptv_rebuild_visible_locked(channel_id);
+    }
+    mutexUnlock(&g_mutex);
+    log_info("[iptv-play] seq=%u phase=done channel_id=%08x url_hash=%08x\n",
+             seq, channel_id, url_hash);
+    return true;
+
+failure:
+    log_warn("[iptv-play] seq=%u phase=failed stage=%s channel_id=%08x "
+             "url_hash=%08x\n",
+             seq, failure_phase ? failure_phase : "unknown", channel_id,
+             url_hash);
+    protocol_coordinator_media_abort(&transaction);
+    iptv_set_status("Failed to start IPTV playback.");
+    return false;
+}
+
+bool iptv_play_channel(int index)
+{
+    IptvChannel channel;
+    char display_title[IPTV_NAME_MAX + IPTV_EPG_TITLE_MAX + 4];
+
+    if (!iptv_get_channel(index, &channel))
+    {
+        iptv_set_status("No IPTV channel selected.");
+        return false;
+    }
+    iptv_set_selected_index(index);
+    if (channel.now_title[0])
+        snprintf(display_title, sizeof(display_title), "%s - %s", channel.name, channel.now_title);
+    else
+        snprintf(display_title, sizeof(display_title), "%s", channel.name);
+    return iptv_play_url_named(channel.url, channel.name, display_title, channel.id);
+}
+
+bool iptv_play_url(const char *url)
+{
+    return iptv_play_url_named(url, "Direct IPTV URL", iptv_text("Direct IPTV URL"), 0);
+}
+
+bool iptv_prompt_url(char *out_url, size_t out_url_size)
+{
+    char initial[IPTV_URL_MAX];
+    mutexLock(&g_mutex);
+    iptv_copy(initial, sizeof(initial), g_last_url);
+    mutexUnlock(&g_mutex);
+    if (!iptv_prompt_text("IPTV URL",
+                          "Enter a media URL or an M3U playlist URL",
+                          "M3U lists open in Channels; media URLs play directly",
+                          "Open",
+                          initial,
+                          out_url,
+                          out_url_size))
+    {
+        iptv_set_status("IPTV URL input closed.");
+        return false;
+    }
+    return true;
+}
