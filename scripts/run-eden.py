@@ -289,7 +289,7 @@ def stop_child(child):
 
 
 @contextlib.contextmanager
-def iptv_direct_session(state, interface, log):
+def iptv_direct_session(state, interface, log, diagnostics=False):
     """Publish the runtime marker only after this process's relay is ready."""
     child = None
     identity = None
@@ -298,10 +298,15 @@ def iptv_direct_session(state, interface, log):
     )
     read_fd, write_fd = os.pipe()
     try:
+        command = [
+            str(HELPER_PYTHON), str(IPTV_DIRECT_HELPER),
+            "--interface", interface, "--parent-pid", str(os.getpid()),
+            "--ready-fd", str(write_fd),
+        ]
+        if diagnostics:
+            command.append("--diagnostics")
         child = subprocess.Popen(
-            [str(HELPER_PYTHON), str(IPTV_DIRECT_HELPER),
-             "--interface", interface, "--parent-pid", str(os.getpid()),
-             "--ready-fd", str(write_fd)],
+            command,
             cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
             pass_fds=(write_fd,), start_new_session=True,
         )
@@ -326,7 +331,8 @@ def iptv_direct_session(state, interface, log):
                     marker.unlink()
 
 
-def launch(state, nro, interface, address, lock_fd, iptv_direct_http=False):
+def launch(state, nro, interface, address, lock_fd, iptv_direct_http=False,
+           iptv_direct_http_diagnostics=False):
     logs = ROOT / "artifacts/validation"
     logs.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
@@ -357,7 +363,8 @@ def launch(state, nro, interface, address, lock_fd, iptv_direct_http=False):
     try:
         if iptv_direct_http:
             direct_log = direct_resources.enter_context(direct_log_path.open("wb"))
-            direct = direct_resources.enter_context(iptv_direct_session(state, interface, direct_log))
+            direct = direct_resources.enter_context(
+                iptv_direct_session(state, interface, direct_log, iptv_direct_http_diagnostics))
             print(f"IPTV direct HTTP enabled; public IPv4 HTTP only; log: {direct_log_path}",
                   flush=True)
         with eden_log_path.open("wb") as eden_log, helper_log_path.open("wb") as helper_log:
@@ -446,12 +453,16 @@ def main():
     parser.add_argument("--iptv-direct-http", action="store_true",
                         help="optional Eden relay through --interface; public IPv4 HTTP IPTV only "
                              "(no domains or HTTPS, no system proxy changes)")
+    parser.add_argument("--iptv-direct-http-diagnostics", action="store_true",
+                        help="with --iptv-direct-http, log bounded timings/framing without URLs")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--prepare-only", action="store_true",
                       help="install SD resources and configure Eden without starting it")
     mode.add_argument("--check", action="store_true",
                       help="read-only preflight; do not prepare or launch")
     args = parser.parse_args()
+    if args.iptv_direct_http_diagnostics and not args.iptv_direct_http:
+        parser.error("--iptv-direct-http-diagnostics requires --iptv-direct-http")
     state, nro = args.state.expanduser().resolve(), args.nro.expanduser().resolve()
     try:
         address = preflight(args, state, nro)
@@ -472,7 +483,7 @@ def main():
             if args.prepare_only:
                 return 0
             return launch(state, installed, args.interface, address, lock.fileno(),
-                          args.iptv_direct_http)
+                          args.iptv_direct_http, args.iptv_direct_http_diagnostics)
     except (OSError, ValueError, RuntimeError, configparser.Error,
             subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(f"run-eden: {error}", file=sys.stderr)

@@ -137,8 +137,11 @@ class RelayTests(unittest.TestCase):
         ):
             with self.subTest(method=method):
                 accepted, worker = self.fixture_upstream(response)
+                expected = response
+                if b"Connection: close\r\n" not in expected:
+                    expected = expected.replace(b"\r\n\r\n", b"\r\nConnection: close\r\n\r\n", 1)
                 self.assertEqual(self.request(method + b" http://74.91.26.218/a? HTTP/1.1\r\n\r\n"),
-                                 response)
+                                 expected)
                 worker.join(3)
                 self.assertTrue(accepted[0].startswith(method + b" /a? HTTP/1.1\r\n"))
 
@@ -184,6 +187,106 @@ class RelayTests(unittest.TestCase):
         self.assertTrue(reply.startswith(b"HTTP/1.1 502 "))
         self.assertNotIn(b"never-log-me", reply)
         self.assertEqual(output.getvalue(), "")
+
+    def test_completed_responses_close_without_waiting_for_upstream_eof(self):
+        for body, headers in (
+            (b"abc\x00\xff", b"Content-Length: 5"),
+            (b"3;ignored=yes\r\nabc\r\n2\r\n\x00\xff\r\n0\r\nX-Trailer: fine\r\n\r\n",
+             b"Transfer-Encoding: chunked"),
+            (b"", b"Content-Length: 0"),
+        ):
+            with self.subTest(headers=headers):
+                relay_side, origin = socket.socketpair()
+                release = threading.Event()
+                observed_close = threading.Event()
+                self.connector.side_effect = lambda *_: relay_side
+
+                def serve():
+                    with origin:
+                        incoming = b""
+                        while b"\r\n\r\n" not in incoming:
+                            incoming += origin.recv(4096)
+                        response = (b"HTTP/1.1 200 OK\r\n" + headers
+                                    + b"\r\nConnection: keep-alive\r\n\r\n" + body)
+                        # Split framing markers across recv boundaries.
+                        for byte in response:
+                            origin.sendall(bytes([byte]))
+                        origin.settimeout(1)
+                        if origin.recv(1) == b"":
+                            observed_close.set()
+                        release.wait(2)
+
+                worker = threading.Thread(target=serve, daemon=True)
+                worker.start()
+                try:
+                    start = time.monotonic()
+                    reply = self.request(b"GET http://74.91.26.218/a HTTP/1.1\r\n\r\n")
+                    self.assertLess(time.monotonic() - start, 1)
+                    header, payload = reply.split(b"\r\n\r\n", 1)
+                    self.assertIn(b"Connection: close", header)
+                    self.assertNotIn(b"keep-alive", header)
+                    self.assertEqual(payload, body)
+                    self.assertTrue(observed_close.wait(1))
+                finally:
+                    release.set()
+                    worker.join(3)
+
+    def test_diagnostics_report_complete_truncated_and_timeout_without_secrets(self):
+        records = []
+        self.server.diagnostics = True
+        self.server.diagnostic_sink = records.append
+        for body, length, reason, complete in (
+            (b"abc", 3, "framing-complete", True),
+            (b"abc", 99, "upstream-truncated", False),
+        ):
+            with self.subTest(reason=reason):
+                self.fixture_upstream(
+                    f"HTTP/1.1 206 Partial Content\r\nContent-Length: {length}\r\n".encode()
+                    + b"Location: http://secret.example/path?key=do-not-log\r\n\r\n" + body)
+                reply = self.request(b"GET http://74.91.26.218/path?key=do-not-log HTTP/1.1\r\n\r\n")
+                self.assertTrue(reply.endswith(body))
+                closed = [entry for entry in records if entry["event"] == "closed"][-1]
+                self.assertEqual(closed["reason"], reason)
+                self.assertEqual(closed["body_complete"], complete)
+                self.assertEqual(closed["status"], 206)
+                self.assertEqual(closed["body_bytes"], 3)
+                self.assertIsNotNone(closed["connect_ms"])
+                self.assertIsNotNone(closed["ttfb_ms"])
+                self.assertGreaterEqual(closed["total_ms"], 0)
+        self.connector.side_effect = TimeoutError("private-token")
+        self.request(b"GET http://74.91.26.218/path?key=private-token HTTP/1.1\r\n\r\n")
+        closed = [entry for entry in records if entry["event"] == "closed"][-1]
+        self.assertEqual(closed["reason"], "upstream-connect-timeout")
+        self.assertEqual(closed["status"], 502)
+        serialized = str(records)
+        for secret in ("74.91.26.218", "secret.example", "do-not-log", "private-token", "/path"):
+            self.assertNotIn(secret, serialized)
+
+    def test_chunk_framing_all_split_points_and_truncation(self):
+        header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        body = b"1;extension=value\r\na\r\n4\r\nbcde\r\n0\r\nX-Safe: yes\r\n\r\n"
+        original = header + body
+        expected = header.replace(b"\r\n\r\n", b"\r\nConnection: close\r\n\r\n") + body
+        for split in range(len(original) + 1):
+            response = relay.HTTPResponse()
+            self.assertEqual(response.feed(original[:split]) + response.feed(original[split:]),
+                             expected)
+            self.assertTrue(response.complete)
+        response = relay.HTTPResponse()
+        response.feed(original[:-1])
+        self.assertFalse(response.complete)
+        with self.assertRaisesRegex(relay.ResponseError, "upstream-truncated"):
+            response.eof()
+
+    def test_diagnostics_are_bounded_and_defaults_are_silent(self):
+        records = []
+        self.server.diagnostic_sink = records.append
+        self.server.diagnostic(1, "fixture")
+        self.assertEqual(records, [])
+        self.server.diagnostics = True
+        self.server.diagnostic(relay.DIAGNOSTIC_REQUEST_LIMIT, "fixture")
+        self.server.diagnostic(relay.DIAGNOSTIC_REQUEST_LIMIT + 1, "fixture")
+        self.assertEqual(len(records), 1)
 
     def test_eight_clients_and_close_interrupt_idle_receives(self):
         clients = [self.client() for _ in range(relay.MAX_CLIENTS)]
@@ -231,7 +334,8 @@ class LauncherTests(unittest.TestCase):
         self.fake.write_text(
             "import argparse,os,signal,time\n"
             "p=argparse.ArgumentParser();p.add_argument('--interface');p.add_argument('--parent-pid');"
-            "p.add_argument('--ready-fd',type=int);a=p.parse_args()\n"
+            "p.add_argument('--ready-fd',type=int);p.add_argument('--diagnostics',action='store_true');"
+            "a=p.parse_args()\n"
             "os.write(a.ready_fd,b'R');os.close(a.ready_fd)\n"
             "while True:time.sleep(0.1)\n"
         )
@@ -248,6 +352,14 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(self.marker.stat().st_mode & 0o777, 0o600)
             self.assertIsNotNone(child.poll())
             self.assertFalse(self.marker.exists())
+
+    def test_launcher_diagnostics_are_explicitly_forwarded(self):
+        original = subprocess.Popen
+        with tempfile.TemporaryFile() as log, \
+             mock.patch.object(launcher.subprocess, "Popen", wraps=original) as popen:
+            with launcher.iptv_direct_session(self.state, "fixture0", log, diagnostics=True):
+                self.assertIn("--diagnostics", popen.call_args.args[0])
+        self.assertFalse(self.marker.exists())
 
     def test_failed_readiness_leaves_no_marker_or_child(self):
         self.fake.write_text("raise SystemExit(4)\n")
@@ -316,11 +428,12 @@ class LauncherTests(unittest.TestCase):
 
     def test_launcher_modes_never_enable_relay_implicitly(self):
         nro = self.root / "fixture.nro"
-        for arguments, launches, enabled in (
-            (["--check", "--iptv-direct-http"], False, None),
-            (["--prepare-only", "--iptv-direct-http"], False, None),
-            ([], True, False),
-            (["--iptv-direct-http"], True, True),
+        for arguments, launches, enabled, diagnostics in (
+            (["--check", "--iptv-direct-http"], False, None, False),
+            (["--prepare-only", "--iptv-direct-http"], False, None, False),
+            ([], True, False, False),
+            (["--iptv-direct-http"], True, True, False),
+            (["--iptv-direct-http", "--iptv-direct-http-diagnostics"], True, True, True),
         ):
             argv = ["run-eden.py", "--interface", "fixture0",
                     "--state", str(self.state), "--nro", str(nro)] + arguments
@@ -334,7 +447,8 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(launcher.main(), 0)
                 self.assertEqual(launch.call_count, int(launches))
                 if launches:
-                    self.assertIs(launch.call_args.args[-1], enabled)
+                    self.assertIs(launch.call_args.args[-2], enabled)
+                    self.assertIs(launch.call_args.args[-1], diagnostics)
                 if "--check" in arguments:
                     prepare.assert_not_called()
             self.assertFalse(self.marker.exists())
