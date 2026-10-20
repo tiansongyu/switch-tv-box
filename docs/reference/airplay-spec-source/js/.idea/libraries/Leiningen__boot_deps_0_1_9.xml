@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="Leiningen: boot-deps:0.1.9">
+    <CLASSES>
+      <root url="jar://$MAVEN_REPOSITORY$/boot-deps/boot-deps/0.1.9/boot-deps-0.1.9.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

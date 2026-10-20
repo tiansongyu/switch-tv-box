@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="Leiningen: compassus:1.0.0-alpha3">
+    <CLASSES>
+      <root url="jar://$MAVEN_REPOSITORY$/compassus/compassus/1.0.0-alpha3/compassus-1.0.0-alpha3.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

@@ -1,0 +1,10 @@
+[book]
+authors = ["Brian Olsen"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Unofficial AirPlay Specification"
+
+[output.html]
+additional-js = []
+additional-css = ["css/table.css", "css/examples.css"]

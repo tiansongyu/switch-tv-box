@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="Leiningen: kibu/pushy:0.3.8">
+    <CLASSES>
+      <root url="jar://$MAVEN_REPOSITORY$/kibu/pushy/0.3.8/pushy-0.3.8.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

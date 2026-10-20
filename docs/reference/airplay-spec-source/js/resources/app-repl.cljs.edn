@@ -1,0 +1,2 @@
+{:compiler-options {:language-in  :ecmascript5
+                    :asset-path "http://localhost:3002/app-repl.out"}}

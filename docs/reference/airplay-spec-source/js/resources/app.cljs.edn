@@ -1,0 +1,4 @@
+{:require  [airplay.main]
+ :compiler-options {:language-in  :ecmascript5
+                    :static-fns true
+                    :asset-path "http://localhost:3002/app.out"}}

@@ -1,0 +1,3 @@
+{:require  [cards.ui]
+ :init-fns [cards.ui/start]
+ :compiler-options {:static-fns true}}

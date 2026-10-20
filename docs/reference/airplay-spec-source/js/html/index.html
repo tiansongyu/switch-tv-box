@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ThoNix</title>
+    <link rel="stylesheet" type="text/css" href="/css/bootstrap.min.css">
+    <link rel="stylesheet" type="text/css" href="/css/bootstrap-theme.min.css">
+    <link rel="stylesheet" type="text/css" href="/font-awesome-4.7.0/css/font-awesome.min.css">
+    <link rel="stylesheet" href="/xterm.css" />
+    <link rel="stylesheet" href="/xterm/addons/fullscreen/fullscreen.css" />
+    <link rel="stylesheet" type="text/css" href="/css/main.css">
+  </head>
+  <body>
+  <div id="app"></div>
+  <div id="testing">
+  <table>
+    <thead>
+    <tr><th>bit</th><th>name</th><th>description</th></tr>
+    </thead>
+    <tbody>
+    <tr><td>0</td><td>Test</td><td>Testing</td></tr>
+    <tr><td>1</td><td>Muh</td><td>more</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <pre id="info"><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE plist PUBLIC &quot;-//Apple//DTD PLIST 1.0//EN&quot; &quot;http://www.apple.com/DTDs/PropertyList-1.0.dtd&quot;&gt;
+&lt;plist version=&quot;1.0&quot;&gt;
+&lt;dict&gt;
+	&lt;key&gt;PTPInfo&lt;/key&gt;
+	&lt;string&gt;OpenAVNU ArtAndLogic-aPTP-changes 1.0&lt;/string&gt;
+	&lt;key&gt;build&lt;/key&gt;
+	&lt;string&gt;17.0&lt;/string&gt;
+	&lt;key&gt;deviceID&lt;/key&gt;
+	&lt;string&gt;00:05:CD:D4:42:96&lt;/string&gt;
+	&lt;key&gt;features&lt;/key&gt;
+	&lt;integer&gt;496155769145856&lt;/integer&gt;
+	&lt;key&gt;firmwareBuildDate&lt;/key&gt;
+	&lt;string&gt;Jan 30 2019&lt;/string&gt;
+	&lt;key&gt;firmwareRevision&lt;/key&gt;
+	&lt;string&gt;1.505.130&lt;/string&gt;
+	&lt;key&gt;keepAliveLowPower&lt;/key&gt;
+	&lt;true/&gt;
+	&lt;key&gt;keepAliveSendStatsAsBody&lt;/key&gt;
+	&lt;true/&gt;
+	&lt;key&gt;manufacturer&lt;/key&gt;
+	&lt;string&gt;Sound United&lt;/string&gt;
+	&lt;key&gt;model&lt;/key&gt;
+	&lt;string&gt;AVR-X3500H&lt;/string&gt;
+	&lt;key&gt;name&lt;/key&gt;
+	&lt;string&gt;Daemon&lt;/string&gt;
+	&lt;key&gt;nameIsFactoryDefault&lt;/key&gt;
+	&lt;false/&gt;
+	&lt;key&gt;pi&lt;/key&gt;
+	&lt;string&gt;650c20ee-842c-4c01-80ed-22b7fb239881&lt;/string&gt;
+	&lt;key&gt;protocolVersion&lt;/key&gt;
+	&lt;string&gt;1.1&lt;/string&gt;
+	&lt;key&gt;sdk&lt;/key&gt;
+	&lt;string&gt;AirPlay;2.0.2&lt;/string&gt;
+	&lt;key&gt;sourceVersion&lt;/key&gt;
+	&lt;string&gt;366.0&lt;/string&gt;
+	&lt;key&gt;statusFlags&lt;/key&gt;
+	&lt;integer&gt;4&lt;/integer&gt;
+	&lt;key&gt;txtAirPlay&lt;/key&gt;
+	&lt;data&gt;
+	BWFjbD0wGmRldmljZWlkPTAwOjA1OkNEOkQ0OjQyOjk2G2ZlYXR1cmVzPTB4NDQ1RjhB
+	MDAsMHgxQzM0MAdyc2Y9MHgwEGZ2PXAyMC4xLjUwNS4xMzAJZmxhZ3M9MHg0EG1vZGVs
+	PUFWUi1YMzUwMEgZbWFudWZhY3R1cmVyPVNvdW5kIFVuaXRlZBtzZXJpYWxOdW1iZXI9
+	QkJXMzYxODEyMTIzNjQNcHJvdG92ZXJzPTEuMQ1zcmN2ZXJzPTM2Ni4wJ3BpPTY1MGMy
+	MGVlLTg0MmMtNGMwMS04MGVkLTIyYjdmYjIzOTg4MShnaWQ9NjUwYzIwZWUtODQyYy00
+	YzAxLTgwZWQtMjJiN2ZiMjM5ODgxBmdjZ2w9MENwaz0wYWNkN2Q2MWIyODRjMGFmNzFj
+	N2VmNGY3ZWE2NDRkZGRlYzIzOGVmMjdjM2MwYWQzZDVkM2JiOWM4YjMxZThm
+	&lt;/data&gt;
+&lt;/dict&gt;
+&lt;/plist&gt;
+</code></pre>
+
+  <script type="text/javascript">
+    console.log('REPL', location.search);
+    if (location.search === '?repl') {
+      document.write('<script type="text/javascript" src="/app-repl.js"></' + 'script>')
+    } else {
+      document.write('<script type="text/javascript" src="/app.js"></' + 'script>')
+    }
+  </script>
+  </body>
+</html>
