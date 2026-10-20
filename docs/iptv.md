@@ -111,6 +111,11 @@ IPTV; more buffering trades startup time and live delay for tolerance of network
 jitter. The actual buffered duration can be shorter at stream end or when the
 memory limit is reached.
 
+HTTP(S) IPTV URLs whose path ends in `.m3u8` start from the newest complete live
+segment (`live_start_index=-1`) before filling the startup buffer. This leaves
+more download time before segments expire from short live playlists. Finished
+VOD playlists ignore this live-only option; other protocols keep their own settings.
+
 Quality selects a variant supplied by the source; it does not transcode video.
 A single-variant 720p stream remains 720p in Smooth mode. A provider must supply
 a lower-resolution or lower-bitrate variant, or a separate channel URL, to

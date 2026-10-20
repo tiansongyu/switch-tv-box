@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-20",
+  "environment": "Eden 0.2.1, isolated authenticated Xvfb",
+  "channel": "CCTV-3 (720p), existing iptv-org Chinese list",
+  "network": "physical-interface HTTP relay with validated range recovery",
+  "nro_sha256": "3b61d66d49a4addac8dfe074eaafb4c9b420ba754b944815e21410c057a7abee",
+  "passed": true,
+  "failures": [],
+  "sample_interval_seconds": 3,
+  "samples_after_initial_buffering": 104,
+  "continuous_playback_seconds": 309.343,
+  "playback_position_start_seconds": 0.869,
+  "playback_position_end_seconds": 310.469,
+  "initial_playing_load_age_seconds": 72.092,
+  "cache_min_seconds": 52.76,
+  "cache_max_seconds": 78.677,
+  "video_dimensions": [
+    "1280x720"
+  ],
+  "additional_frame_drops": 0,
+  "additional_decoder_drops": 0,
+  "maximum_cumulative_position_drift_seconds": 0.275,
+  "runtime_error_bytes": 0,
+  "relay_completed_requests": 77,
+  "relay_validated_resumptions": 0,
+  "relay_resumed_complete_requests": 0,
+  "playback_log_sha256": "2b1fb7fe419ee02de5584214fee95c0d980fc66f77edd249c0c3f78b6469bdc3",
+  "limits": "No physical Switch or subjective audio-listening acceptance; no guarantee for other sources or later network conditions."
+}

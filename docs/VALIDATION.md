@@ -18,6 +18,7 @@ TVBOX_TOOLCHAIN_IMAGE=switch-tv-box/toolchain:eden-macros ./scripts/build-local.
 | 三入口首页、频道库、语言持久化、触摸区域、长标题 | 通过 |
 | 播放视图：同 URL 重播、手动返回主页、音频/视频切换、停止画面保留 | 通过 |
 | IPTV 数据、收藏重启恢复、取消收藏持久化、保存失败回滚 | 通过；数据集含 10,041 个频道、81 个源 |
+| IPTV 画质、缓冲、配置持久化、保存失败回滚、同 URI 协议交接 | 通过 |
 | 播放所有权、协议协调、DLNA 会话、退出顺序 | 通过 |
 | DLNA 视频 URI、签名网址、播放控制、协议交接、空媒体与 SOAP 错误 | 通过 |
 | RTSP、配对、RSA、SDP、加密音频、时钟、FLUSH、重传 | 通过 |
@@ -28,6 +29,8 @@ TVBOX_TOOLCHAIN_IMAGE=switch-tv-box/toolchain:eden-macros ./scripts/build-local.
 | SSDP 数据报消费、Eden socket ABI、就绪轮询与等待行为 | 通过 |
 | C 安全检查的 ASan/UBSan | 通过 |
 | 开发工作流、FFmpeg 安装、发现辅助程序 | 通过 |
+| Eden 物理网卡 HTTP 辅助 | 27 项离线测试通过；无外网、只读源码容器复测通过 |
+| 完整源码与运行文件归档 | 11 项测试通过；包含 21 个必需资源、CRC、路径、完整性与验收 NRO 哈希校验 |
 | 安装包 | ZIP CRC、唯一 NRO、字体、直播源、许可证和敏感文件排除检查通过 |
 
 音频、镜像运行时、照片、远程视频及播放视图的针对性 ASan/UBSan 回归亦通过。
@@ -38,7 +41,11 @@ TVBOX_TOOLCHAIN_IMAGE=switch-tv-box/toolchain:eden-macros ./scripts/build-local.
 Switch 编译器为 devkitA64 GCC 15.2.0。构建确认启用 libmpv、deko3d、
 Ed25519、libnx 随机源、PlayFair 和 Matroska muxer，并校验 ALAC/AAC/PCM、
 JPEG/PNG 和 H.264 所需 FFmpeg 组件。完整日志见本地
-`artifacts/validation/release.log`；日志、测试截图和二进制不进入源码仓库。
+`artifacts/validation/iptv-large-buffer-release.log`。随后最新完整分片起播策略
+通过针对性 ASan/UBSan 与 SDK 检查，并再次完整交叉编译、打包；
+日志见 `artifacts/validation/iptv-live-edge-build.log`。
+完整调试日志、测试截图和二进制不进入源码仓库；下文单独归档了不含 URL
+或凭据的 CCTV-3 验收指标和数字采样记录。
 
 ## 本次安装包
 
@@ -46,8 +53,8 @@ JPEG/PNG 和 H.264 所需 FFmpeg 组件。完整日志见本地
 
 | 文件 | SHA-256 |
 |---|---|
-| `switch-tv-box.nro` | `e59c01ed5119f1c74d08c561efb719eb3d69c8bf349abcf69290c0d3d292e108` |
-| `dist/switch-tv-box-sdmc.zip` | `284ad81ccb5db45f1431a14f1fdb88b64077a6caca8e9db4d396106377744508` |
+| `switch-tv-box.nro` | `3b61d66d49a4addac8dfe074eaafb4c9b420ba754b944815e21410c057a7abee` |
+| `dist/switch-tv-box-sdmc.zip` | `61749ea3de1d14811cdadaae0ec5e86c08ef502c0a2d9df9881ddd3355980293` |
 
 ZIP 内的 NRO 与根目录构建产物一致。重建可能因时间戳等因素产生不同校验值；
 以上标识本次 release 产物。
@@ -86,7 +93,7 @@ DLNA 已验证以下步骤：
 `artifacts/debug/dlna-controls-20261020-190356/eden-replay-video.png`。
 
 快速停止重播曾暴露两个问题：旧主页请求再次发送 STOP，以及同 URL 新会话
-没有清除主页覆盖状态。修复后，最终 release 的真实 NRO 已通过上述全部控制
+没有清除主页覆盖状态。修复后，本轮前期构建的真实 NRO 已通过上述全部控制
 步骤；`artifacts/debug/dlna-controls-20261020-190356/result.json` 的
 `passed` 为 `true`。旧失败日志保留用于对照，不作为最终验收结果。
 
@@ -112,6 +119,69 @@ HTTP 请求日志明确依次出现 `channel: 1` 和 `channel: 2`。
 外部 IPTV 源仍观察到 TLS 握手失败，记录在
 `artifacts/validation/eden-software-video-errors.log`。
 
+## IPTV 画质、缓冲与在线 CCTV-3
+
+画质逻辑在真实 Eden 中用受控 HLS 主播放列表验证：原画请求 720p 版本，
+保存“流畅”后重新播放同一频道并请求 360p 版本；日志分别记录
+1280×720 与 640×360，播放位置持续增长，收藏数据保持原样。
+该前期构建使用较小的缓冲参数；证据见
+`artifacts/validation/iptv-quality-and-cctv3-stable.log`、
+`iptv-quality-requests.log` 和 `iptv-quality-smooth-playing.png`。
+最终缓冲参数另经宿主测试与真实 NRO 验证。
+
+默认“大缓冲”使用 60 秒起播门槛、180 秒预读目标、96 MiB 前向与
+4 MiB 回看压缩媒体包缓存，不包含解码及渲染内存。直播窗口、网络与字节
+上限可能使缓存达不到目标；时间戳缺口也可能令缓存秒数高于真实可播时长，
+因此验收同时检查播放位置增量、状态与掉帧，不能只看缓存数字。
+
+原移动源的 CCTV-3 在当前网络中连接失败；后续实播使用已有 `iptv-org`
+中文清单中的 **CCTV-3 (720p)**，通过物理网卡 HTTP 辅助访问。该标题来自
+清单；实测来源曾先后提供 1280×720 和 1920×1080，且都是单版本 HLS，
+不能用画质设置强制转成更低分辨率。
+
+保留了三个未通过的播放样本：
+
+- 首次大缓冲测试在 267.4 秒连续播放后再次缓冲，随后跳过约一分钟内容。
+  期间没有新增解码丢帧。证据：
+  `cctv3-largebuffer-first-attempt-iptv-playback.log`。
+- 修复辅助程序的保活响应边界后再测，仍出现跳时。逐请求诊断显示一个
+  5.36 MB 分片耗时 60.07 秒，其中等待上游 59.84 秒、发送给模拟器约
+  7 毫秒；另一分片 4.29 MB 只需 3.93 秒。10 秒 socket 采样确认慢连接
+  仅收到约 468 KB，而模拟器及时收完全部字节。证据：
+  `eden-iptv-direct-20261020-215651-222937.log` 和
+  `cctv3-framing-fix-attempt-iptv-playback.log`。
+- 加入带强 ETag 校验的字节续传后，真实慢分片成功续传完毕，但默认从短
+  播放列表的较旧分片起播，仍在起播后出现跳片。证据：
+  `cctv3-resume-initial-attempt-iptv-playback.log` 和
+  `eden-iptv-direct-20261020-220914-245409.log`。
+
+上述失败样本不作为发布通过依据。它们表明个别上游连接的持续低速会耗尽
+缓存，并使分片离开约 30 秒的源播放窗口；仅继续增大缓冲不能补回已过期内容。
+最终构建对 IPTV 的 HLS URL 从最新完整分片起读，再积累起播缓冲；其他协议、
+普通视频 URL 和结束的点播列表不改变起点。模拟器的可选 HTTP 辅助只对符合
+条件的慢速媒体响应续传，并校验同一强 ETag、精确字节区间和剩余长度，最多
+重连两次，避免把不同版本的内容拼接在一起。
+
+### 本次发布通过样本
+
+最终 NRO 在独立认证的 Xvfb 桌面运行 Eden 0.2.1，通过上述物理网卡辅助
+实际播放 CCTV-3。首次播放约等待 72.1 秒，随后 **连续播放 309.343 秒
+（5 分 9 秒）**，104 个连续采样均处于播放状态：
+
+- 画面为 1280×720；起播后没有再次缓冲，也没有播放位置跳跃。
+- 播放进度与经过时间的最大累计偏差为 0.275 秒。
+- 起播后新增渲染丢帧和解码丢帧均为 0；起播时渲染丢帧计数已有 2。
+- 压缩包缓存读数为 52.760～78.677 秒，运行错误日志为 0 字节。
+- 77 个 HTTP 响应均正常结束；本次通过样本没有触发字节续传。
+- 起播后约一分钟和五分钟截图均确认 CCTV-3 视频画面正常呈现。
+
+机器可读结果见 [验收记录](validation/cctv3-20261020.json)，对应
+[数字采样日志](validation/cctv3-20261020.log) 的 SHA-256 与记录一致。
+门槛检查每约 3 秒采样、序号连续、日志新鲜度、逐次及累计时间偏差、
+状态、掉帧和错误，并核对测试 SD、根目录及发布 ZIP 中 NRO 的哈希一致。
+本结果只覆盖这一次片源和网络条件；未进行主观音频听感或物理 Switch 验收，
+不代表所有在线源和长期网络条件都能流畅播放。
+
 ## AirPlay 发现与音频
 
 真实 NRO 的 `OPTIONS`、`/info` 和 `/server-info` 均返回成功；
@@ -127,8 +197,8 @@ Eden 0.2.1 组播 socket 选项支持不完整，且宿主默认组播路由经�
 该次运行未再出现线程创建或 `ao_hos` 写入错误。初次证据：
 `artifacts/validation/raop-pcm-probe-fixed-sdk.log`。
 
-最终安装的 NRO 校验值与本次交付产物一致。在同一个 Eden 进程完成上述
-DLNA 视频控制后，再次发送约 5 秒 RAOP PCM：627 包、889,524 字节、5 个
+本轮前期构建在同一个 Eden 进程完成上述 DLNA 视频控制后，再次发送约
+5 秒 RAOP PCM：627 包、889,524 字节、5 个
 同步包，UDP 错误为 0，RTSP 全部返回 200。记录见
 `artifacts/validation/raop-pcm-after-video-final.log`。
 `artifacts/validation/eden-final-playback-errors.log` 为 0 字节，未出现线程、
@@ -140,9 +210,11 @@ DLNA 视频控制后，再次发送约 5 秒 RAOP PCM：627 包、889,524 字节
 规范归档包含 48 个 HTML 页面、294 个已记录 SHA-256 的文件；章节、搜索索引、
 CSS 和字体本地链接验证通过。入口见 [离线归档](reference/README.md)。
 
-16 个界面预览直接提取实际 ImGui 绘制代码，覆盖 IPTV/AirPlay/DLNA 三入口首页、
+21 个界面预览直接提取实际 ImGui 绘制代码，覆盖 IPTV/AirPlay/DLNA 三入口首页、
 中英文投屏说明、配对、离线、播放状态、频道库、播放中列表和收藏空状态。
-样本数据仅用于界面预览；图片保存在 `artifacts/ui/`，已目视确认无溢出。
+以及画质、缓冲和设置保存反馈。
+样本数据仅用于界面预览；图片保存在 `artifacts/ui-playback-settings-large-buffer/`，
+已目视确认无溢出。
 真实 NRO 首页截图另见 `artifacts/validation/eden-three-entry-home.png`。
 
 ## 尚需验收
