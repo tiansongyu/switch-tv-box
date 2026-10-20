@@ -9,6 +9,38 @@
 
 模拟器的配置、SD 卡和缓存使用独立目录，不使用网易项目的账号数据。
 
+## Eden 中只显示英文文字界面
+
+`QUICK START`、`PLAYER CONTROLS`、`IPTV`、`DIAGNOSTICS` 是程序保留的文字首页。
+看到它们不表示下载了另一份命令行版本：图形首页需要播放器和图形后端完成初始化。
+Eden 0.2.1 在缺少兼容标记时会调用尚未实现的系统服务，可能一直停在这一步。
+
+本机推荐在仓库根目录运行启动器，让它安装完整资源并创建兼容标记：
+
+```sh
+python3 scripts/run-eden.py --interface enp7s0
+```
+
+在其他电脑手动使用 Eden 时：
+
+1. 停止正在运行的 NRO，在 Eden 的 **File → Open Eden Folder** 中找到当前模拟器
+   数据目录；如设置了自定义 SD 路径，应使用设置中实际的 `sdmc` 目录。
+2. 将 `switch-tv-box-sdmc.zip` 解压到该 `sdmc` 根目录，保留
+   `switch/switch-tv-box/switch-tv-box.nro`、`fonts/` 等完整目录。
+3. 在 `sdmc/switch/switch-tv-box/` 中新建一个空文件 **`eden-compat.flag`**。
+   确认没有被文件管理器自动添加 `.txt` 扩展名；不要只放在下载目录或 NRO 旁边。
+4. 重新启动 NRO。兼容标记只在程序启动时读取，运行中添加不会生效。
+   如果提示缺少解密组件，对本项目自制 NRO 选择 **No**。
+
+该标记只用于 Eden，不应复制到实体 Switch。图形界面启动成功也不代表手机发现
+已自动配置；AirPlay 的局域网发现仍按下文使用启动器和 Avahi 助手。
+
+2026-10-21 在独立虚拟桌面对正式 v0.1.1 NRO 做过对照：SHA-256 为
+`41c0489f9a005000ec9bb2344e845e26f9f6b6ba28eb6a44c7469340b00fba4d`。
+去掉标记后出现上述文字首页，日志记录未实现的
+`60(SetMediaPlaybackStateForApplication)`；恢复标记并重启后显示 IPTV / AirPlay /
+DLNA 图形首页。同一 NRO 无需替换为其他构建。
+
 ## 本机路径
 
 | 内容 | 路径 |

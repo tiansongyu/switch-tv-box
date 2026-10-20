@@ -40,6 +40,11 @@ Release 同时提供 `switch-tv-box-v0.1.1-complete.zip`，包含 `sdmc/` 安装
 
 使用 Atmosphère/homebrew 环境，推荐完整应用模式启动。手机与 Switch 连接同一局域网，在支持 AirPlay 的应用中选择 **Switch TV Box**。镜像需要配对时，输入电视上显示的 PIN。
 
+**在 Eden 中运行需要额外的模拟器配置。** 下载的 NRO 包含图形界面，但只打开 NRO
+不会创建 Eden 兼容标记；缺少标记时，Eden 0.2.1 可能停在 `QUICK START` /
+`PLAYER CONTROLS` 英文文字界面。请按 [Eden 启动与文字界面排查](docs/EMULATOR.md#eden-中只显示英文文字界面)
+配置模拟 SD，或使用本项目的 `scripts/run-eden.py` 自动准备。实体 Switch 无需该标记。
+
 直播源可以放入 `switch/switch-tv-box/iptv/`，也可在频道库的直播源管理中添加。配置目录与 NX-Cast 分开；要迁移直播源，请复制原 `iptv/` 下自己的配置文件。AirPlay 身份与配对记录由本机生成，不随安装包分发。
 
 | 操作 | 按键 |
