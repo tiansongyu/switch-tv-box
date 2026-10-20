@@ -1,3 +1,23 @@
+# Switch TV Box changes
+
+## 0.1.0
+
+- Fork NX-Cast 0.3.2 while preserving DLNA/IPTV and media rendering.
+- Add classic RAOP SDP/RSA handshake, standalone ALAC/AAC/PCM audio, volume,
+  retransmission and FLUSH with ownership-safe player integration.
+- Add JPEG/PNG photo casting and session-isolated bounded caching that survives
+  short HTTP connections without taking playback ownership.
+- Fix standalone audio timestamps, socket close races, handler allocation cleanup
+  and capability advertising. Prevent superseded requests from stopping or
+  releasing newer playback, including reentrant HLS claims.
+- Replace the home screen with a Chinese-first living-room interface, music card,
+  network IP, clock and resumable playback.
+- Archive the complete AirPlay specification and create a reproducible local
+  Docker build using the existing netease-switch devkitPro environment.
+- Record hardware and unsupported-protocol limits in docs/AIRPLAY1.md.
+
+---
+
 # Changelog
 
 All notable user-facing changes to NX-Cast are documented here.

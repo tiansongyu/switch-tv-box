@@ -1,3 +1,5 @@
+> Historical NX-Cast documentation. For this fork, see [Switch TV Box](../README.md), [AirPlay 1](AIRPLAY1.md) and [build instructions](BUILD.md).
+
 # Install NX-Cast
 
 `NX-Cast` is distributed as a Switch homebrew SD card package. The recommended release asset is `NX-Cast-sdmc.zip`.

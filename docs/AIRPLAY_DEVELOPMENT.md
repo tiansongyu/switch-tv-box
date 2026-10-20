@@ -1,3 +1,5 @@
+> Historical NX-Cast documentation. For this fork, see [Switch TV Box](../README.md), [AirPlay 1](AIRPLAY1.md) and [build instructions](BUILD.md).
+
 # AirPlay Video Development
 
 NX-Cast contains an independent, experimental AirPlay media receiver path. It

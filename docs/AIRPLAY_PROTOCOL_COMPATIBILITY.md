@@ -1,3 +1,5 @@
+> Historical NX-Cast documentation. For this fork, see [Switch TV Box](../README.md), [AirPlay 1](AIRPLAY1.md) and [build instructions](BUILD.md).
+
 # AirPlay Protocol Compatibility Contract
 
 NX-Cast implements its AirPlay receiver protocol in C for the Switch runtime. UxPlay and RPiPlay are behavior references, not linked or ported runtime dependencies.

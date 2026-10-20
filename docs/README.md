@@ -1,3 +1,5 @@
+> Historical NX-Cast documentation. For this fork, see [Switch TV Box](../README.md), [AirPlay 1](AIRPLAY1.md) and [build instructions](BUILD.md).
+
 # NX-Cast Documentation
 
 This directory keeps design boundaries, implementation notes, toolchain guidance, and future product plans for `NX-Cast`.
