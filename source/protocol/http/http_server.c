@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "app/network_diagnostics.h"
+#include "app/platform_compat.h"
 #include "log/log.h"
 
 #define HTTP_SERVER_REQUEST_BUFFER_SIZE 16384
@@ -105,7 +106,8 @@ static int http_diagnostic_select(int descriptor_count, fd_set *read_set,
 {
     NetworkOperationToken operation = network_diagnostics_operation_begin(
         NETWORK_DIAGNOSTIC_DLNA_HTTP, NETWORK_OPERATION_SELECT);
-    int result = select(descriptor_count, read_set, NULL, NULL, timeout);
+    int result = tvbox_socket_select(descriptor_count, read_set, NULL, NULL,
+                                     timeout);
     int saved_errno = result < 0 ? errno : 0;
 
     network_diagnostics_operation_end(&operation, saved_errno);

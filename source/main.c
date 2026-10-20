@@ -544,6 +544,8 @@ static void build_home_view_state(PlayerHomeViewState *out,
                                   const PlayerSnapshot *snapshot)
 {
     IptvState iptv_state = {0};
+    static struct in_addr cached_ip;
+    static uint64_t next_ip_query_ms;
 
     if (!out)
         return;
@@ -556,11 +558,20 @@ static void build_home_view_state(PlayerHomeViewState *out,
     out->network_ready = network_ready;
     if (network_ready)
     {
-        struct in_addr local = { .s_addr = gethostid() };
-        if (local.s_addr != 0 && local.s_addr != INADDR_NONE)
-            (void)inet_ntop(AF_INET, &local, out->ip_address,
+        /* gethostid() performs NIFM IPC on Switch. Query at most once per
+         * second instead of competing with audio work on every UI frame. */
+        uint64_t now_ms = armTicksToNs(armGetSystemTick()) / UINT64_C(1000000);
+        if (now_ms >= next_ip_query_ms)
+        {
+            cached_ip.s_addr = gethostid();
+            next_ip_query_ms = now_ms + UINT64_C(1000);
+        }
+        if (cached_ip.s_addr != 0 && cached_ip.s_addr != INADDR_NONE)
+            (void)inet_ntop(AF_INET, &cached_ip, out->ip_address,
                            sizeof(out->ip_address));
     }
+    else
+        next_ip_query_ms = 0;
     out->dlna_running = protocols &&
                         protocols->services[PROTOCOL_SERVICE_DLNA] ==
                             PROTOCOL_SERVICE_RUNNING;

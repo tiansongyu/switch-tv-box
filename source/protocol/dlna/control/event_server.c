@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "app/network_diagnostics.h"
+#include "app/platform_compat.h"
 #include "handler_internal.h"
 #include "log/log.h"
 #include "player/renderer.h"
@@ -165,7 +166,8 @@ static int event_diagnostic_connect(int socket_fd,
 
         FD_ZERO(&write_set);
         FD_SET(socket_fd, &write_set);
-        selected = select(socket_fd + 1, NULL, &write_set, NULL, &timeout);
+        selected = tvbox_socket_select(socket_fd + 1, NULL, &write_set, NULL,
+                                        &timeout);
         if (selected > 0 && FD_ISSET(socket_fd, &write_set))
         {
             int socket_error = 0;

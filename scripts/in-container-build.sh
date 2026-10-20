@@ -14,6 +14,8 @@ if [[ "${TVBOX_ACTION:-release}" == test || "${TVBOX_ACTION:-release}" == releas
     sh scripts/test_airplay_photo.sh
     python3 scripts/test_dev_workflow.py
     python3 scripts/test_ffmpeg_install.py
+    python3 scripts/test_ssdp_receive.py
+    python3 scripts/test_platform_compat.py
 fi
 if [[ "${TVBOX_ACTION:-release}" == build || "${TVBOX_ACTION:-release}" == release ]]; then
     make RELEASE_JOBS="${BUILD_JOBS:-8}" release-build

@@ -21,6 +21,7 @@
 #include <switch.h>
 
 #include "log/log.h"
+#include "app/platform_compat.h"
 
 typedef Thread AirPlayNativeThread;
 typedef void (*AirPlayNativeThreadEntry)(void *argument);
@@ -29,6 +30,7 @@ typedef Mutex AirPlayNativeMutex;
 #define AIRPLAY_THREAD_FINISH() return
 #define AIRPLAY_SERVER_LOG_ERROR(...) log_error(__VA_ARGS__)
 #define AIRPLAY_SERVER_LOG_INFO(...) log_info(__VA_ARGS__)
+#define AIRPLAY_SOCKET_SELECT tvbox_socket_select
 #else
 #include <pthread.h>
 
@@ -39,6 +41,7 @@ typedef pthread_mutex_t AirPlayNativeMutex;
 #define AIRPLAY_THREAD_FINISH() return NULL
 #define AIRPLAY_SERVER_LOG_ERROR(...) ((void)fprintf(stderr, __VA_ARGS__))
 #define AIRPLAY_SERVER_LOG_INFO(...) ((void)0)
+#define AIRPLAY_SOCKET_SELECT select
 #endif
 
 #define AIRPLAY_SERVER_BACKLOG 8
@@ -95,7 +98,7 @@ static uint64_t airplay_server_now_ms(void)
 
 static bool airplay_native_thread_start(AirPlayNativeThread *thread,
                                         AirPlayNativeThreadEntry entry,
-                                        void *argument)
+                                        void *argument, const char *role)
 {
     if (!thread || !entry)
         return false;
@@ -108,16 +111,29 @@ static bool airplay_native_thread_start(AirPlayNativeThread *thread,
                                  0x2B,
                                  -2);
     if (R_FAILED(result))
+    {
+        AIRPLAY_SERVER_LOG_ERROR(
+            "[airplay-server] %s threadCreate failed rc=0x%08X stack=%u\n",
+            role, (unsigned)result, AIRPLAY_SERVER_THREAD_STACK_SIZE);
         return false;
+    }
     result = threadStart(thread);
     if (R_FAILED(result))
     {
-        threadClose(thread);
+        Result close_result = threadClose(thread);
+        AIRPLAY_SERVER_LOG_ERROR(
+            "[airplay-server] %s threadStart failed rc=0x%08X cleanup=0x%08X\n",
+            role, (unsigned)result, (unsigned)close_result);
         return false;
     }
     return true;
 #else
-    return pthread_create(thread, NULL, entry, argument) == 0;
+    int result = pthread_create(thread, NULL, entry, argument);
+    if (result != 0)
+        AIRPLAY_SERVER_LOG_ERROR(
+            "[airplay-server] %s pthread_create failed rc=%d (%s)\n",
+            role, result, strerror(result));
+    return result == 0;
 #endif
 }
 
@@ -126,10 +142,18 @@ static void airplay_native_thread_join(AirPlayNativeThread *thread)
     if (!thread)
         return;
 #ifdef __SWITCH__
-    threadWaitForExit(thread);
-    threadClose(thread);
+    Result wait_result = threadWaitForExit(thread);
+    Result close_result = threadClose(thread);
+    if (R_FAILED(wait_result) || R_FAILED(close_result))
+        AIRPLAY_SERVER_LOG_ERROR(
+            "[airplay-server] thread reap failed wait=0x%08X close=0x%08X\n",
+            (unsigned)wait_result, (unsigned)close_result);
 #else
-    pthread_join(*thread, NULL);
+    int result = pthread_join(*thread, NULL);
+    if (result != 0)
+        AIRPLAY_SERVER_LOG_ERROR(
+            "[airplay-server] pthread_join failed rc=%d (%s)\n",
+            result, strerror(result));
 #endif
 }
 
@@ -243,6 +267,30 @@ static ssize_t airplay_server_diagnostic_send(int socket_fd,
 static ssize_t airplay_server_diagnostic_recv(int socket_fd, void *buffer,
                                               size_t length, int flags)
 {
+#ifdef __SWITCH__
+    if (tvbox_eden_compat_enabled())
+    {
+        /* Eden shares three BSD service workers across all sockets. Wait in
+         * the guest so an idle RTSP/reverse connection cannot occupy a worker
+         * for SO_RCVTIMEO while RTP packets are waiting to be received. */
+        fd_set read_set;
+        struct timeval timeout = {
+            .tv_sec = 0,
+            .tv_usec = AIRPLAY_SERVER_SOCKET_POLL_MS * 1000U,
+        };
+        FD_ZERO(&read_set);
+        FD_SET(socket_fd, &read_set);
+        int ready = tvbox_socket_select(socket_fd + 1, &read_set, NULL, NULL,
+                                         &timeout);
+        if (ready <= 0)
+        {
+            if (ready == 0)
+                errno = EAGAIN;
+            return -1;
+        }
+        flags |= MSG_DONTWAIT;
+    }
+#endif
     NetworkOperationToken operation = network_diagnostics_operation_begin(
         NETWORK_DIAGNOSTIC_AIRPLAY_CONTROL, NETWORK_OPERATION_RECV);
     ssize_t result = recv(socket_fd, buffer, length, flags);
@@ -260,7 +308,7 @@ static int airplay_server_diagnostic_select(int descriptor_count,
 {
     NetworkOperationToken operation = network_diagnostics_operation_begin(
         NETWORK_DIAGNOSTIC_AIRPLAY_CONTROL, NETWORK_OPERATION_SELECT);
-    int result = select(descriptor_count, read_set, NULL, NULL, timeout);
+    int result = AIRPLAY_SOCKET_SELECT(descriptor_count, read_set, NULL, NULL, timeout);
     int saved_errno = result < 0 ? errno : 0;
 
     network_diagnostics_operation_end(&operation, saved_errno);
@@ -868,13 +916,13 @@ static AIRPLAY_THREAD_RETURN airplay_server_listener_thread(void *argument)
         atomic_store(&client->reverse_session_id, 0u);
         atomic_store(&client->active, true);
         atomic_store(&client->finished, false);
-        if (!airplay_native_thread_start(&client->thread, airplay_server_client_thread, client))
+        if (!airplay_native_thread_start(&client->thread, airplay_server_client_thread,
+                                         client, "client"))
         {
             airplay_diagnostics_thread_create_failed(
                 RUNTIME_DIAGNOSTIC_THREAD_AIRPLAY_CLIENT);
             airplay_server_close_client_socket(client);
             atomic_store(&client->active, false);
-            AIRPLAY_SERVER_LOG_ERROR("[airplay-server] client thread creation failed\n");
             continue;
         }
         client->thread_started = true;
@@ -942,7 +990,7 @@ bool airplay_server_start(const AirPlayServerConfig *config)
     atomic_store(&g_airplay_server.running, true);
     if (!airplay_native_thread_start(&g_airplay_server.listener_thread,
                                      airplay_server_listener_thread,
-                                     &g_airplay_server))
+                                     &g_airplay_server, "listener"))
     {
         airplay_diagnostics_thread_create_failed(
             RUNTIME_DIAGNOSTIC_THREAD_AIRPLAY_LISTENER);

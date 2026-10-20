@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "app/network_diagnostics.h"
+#include "app/platform_compat.h"
 #include "log/log.h"
 #include "protocol/dlna/server_info.h"
 
@@ -26,6 +27,9 @@
 #define SSDP_MULTICAST "239.255.255.250"
 #define SSDP_NOTIFY_INTERVAL_MS 30000ULL
 #define SSDP_CACHE_MAX_AGE 66
+/* The socket is IPv4 UDP. This includes every legal datagram without relying
+ * on MSG_TRUNC support in the underlying BSD service. */
+#define SSDP_MAX_DATAGRAM_SIZE 65507
 // Keep a conservative stack budget here too. SSDP itself is simple, but
 // repeated logging and response formatting make 0x10000 a safer floor.
 #define SSDP_THREAD_STACK_SIZE 0x10000
@@ -44,6 +48,7 @@ typedef struct
     Thread thread;                       // background responder thread
     atomic_bool running;
     bool thread_started;
+    bool eden_compat;
     char *local_ip;                      // cached local IPv4
     char *location;                      // http://<ip>:<port>/device.xml
 } SsdpState;
@@ -244,7 +249,8 @@ static int ssdp_select(int descriptor_count, fd_set *read_set,
 {
     NetworkOperationToken operation = network_diagnostics_operation_begin(
         NETWORK_DIAGNOSTIC_SSDP, NETWORK_OPERATION_SELECT);
-    int result = select(descriptor_count, read_set, NULL, NULL, timeout);
+    int result = tvbox_socket_select(descriptor_count, read_set, NULL, NULL,
+                                     timeout);
     int saved_errno = result < 0 ? errno : 0;
 
     network_diagnostics_operation_end(&operation, saved_errno);
@@ -607,10 +613,24 @@ static char *ssdp_recv_packet_alloc(int socket_fd, struct sockaddr_in *from, ssi
         return NULL;
 
     *out_len = -1;
-    if (ioctl(socket_fd, FIONREAD, &pending) < 0)
-        return NULL;
-    if (pending <= 0)
-        return NULL;
+    if (g_ssdp.eden_compat)
+    {
+        /* Eden 0.2.1 does not implement FIONREAD. Leaving a readable packet in
+         * the queue makes select return immediately forever, starving other
+         * network services. Consume it directly with a bounded heap buffer. */
+        pending = SSDP_MAX_DATAGRAM_SIZE;
+    }
+    else
+    {
+        if (ioctl(socket_fd, FIONREAD, &pending) < 0)
+            return NULL;
+        if (pending < 0)
+            return NULL;
+        /* select already reported readability. A zero-length UDP datagram
+         * must still be consumed so it cannot keep the socket readable. */
+        if (pending == 0)
+            pending = 1;
+    }
 
     buffer = malloc((size_t)pending + 1);
     if (!buffer)
@@ -801,6 +821,7 @@ bool ssdp_start(const SsdpConfig *config)
     atomic_store(&g_ssdp.socket_fd, -1);
     g_ssdp.config = *config;
     g_ssdp.thread_started = false;
+    g_ssdp.eden_compat = tvbox_eden_compat_enabled();
 
     if (!determine_local_ip(&g_ssdp.local_ip))
         return false;

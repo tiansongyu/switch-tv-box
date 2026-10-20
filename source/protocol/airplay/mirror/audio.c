@@ -17,12 +17,14 @@
 
 #ifdef __SWITCH__
 #include <switch.h>
+#include "app/platform_compat.h"
 typedef Thread AirPlayAudioThread;
 typedef Mutex AirPlayAudioMutex;
 typedef void (*AirPlayAudioThreadEntry)(void *argument);
 #define AIRPLAY_AUDIO_THREAD_RETURN void
 #define AIRPLAY_AUDIO_THREAD_FINISH() return
 #define AIRPLAY_AUDIO_THREAD_STACK_SIZE 0x18000u
+#define AIRPLAY_SOCKET_SELECT tvbox_socket_select
 #else
 #include <pthread.h>
 typedef pthread_t AirPlayAudioThread;
@@ -30,6 +32,7 @@ typedef pthread_mutex_t AirPlayAudioMutex;
 typedef void *(*AirPlayAudioThreadEntry)(void *argument);
 #define AIRPLAY_AUDIO_THREAD_RETURN void *
 #define AIRPLAY_AUDIO_THREAD_FINISH() return NULL
+#define AIRPLAY_SOCKET_SELECT select
 #endif
 
 #include "protocol/airplay/security/crypto.h"
@@ -609,7 +612,7 @@ static AIRPLAY_AUDIO_THREAD_RETURN audio_thread(void *argument)
             FD_SET(data_fd, &read_set);
         if (control_fd >= 0)
             FD_SET(control_fd, &read_set);
-        result = select(maximum + 1, &read_set, NULL, NULL, &timeout);
+        result = AIRPLAY_SOCKET_SELECT(maximum + 1, &read_set, NULL, NULL, &timeout);
         if (result < 0 && errno != EINTR)
         {
             if (atomic_load(&audio->running))

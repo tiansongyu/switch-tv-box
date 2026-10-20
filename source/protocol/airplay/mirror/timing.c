@@ -13,10 +13,12 @@
 
 #ifdef __SWITCH__
 #include <switch.h>
+#include "app/platform_compat.h"
 typedef Thread AirPlayTimingThread;
 typedef void (*AirPlayTimingThreadEntry)(void *argument);
 #define AIRPLAY_TIMING_THREAD_RETURN void
 #define AIRPLAY_TIMING_THREAD_FINISH() return
+#define AIRPLAY_SOCKET_SELECT tvbox_socket_select
 #define AIRPLAY_TIMING_THREAD_STACK_SIZE 0x10000u
 #else
 #include <pthread.h>
@@ -24,6 +26,7 @@ typedef pthread_t AirPlayTimingThread;
 typedef void *(*AirPlayTimingThreadEntry)(void *argument);
 #define AIRPLAY_TIMING_THREAD_RETURN void *
 #define AIRPLAY_TIMING_THREAD_FINISH() return NULL
+#define AIRPLAY_SOCKET_SELECT select
 #endif
 
 #include "protocol/airplay/trace.h"
@@ -133,7 +136,7 @@ static void timing_wait_response(AirPlayMirrorTiming *timing, int socket_fd)
 
     FD_ZERO(&read_fds);
     FD_SET(socket_fd, &read_fds);
-    selected = select(socket_fd + 1, &read_fds, NULL, NULL, &timeout);
+    selected = AIRPLAY_SOCKET_SELECT(socket_fd + 1, &read_fds, NULL, NULL, &timeout);
     if (selected <= 0 || !FD_ISSET(socket_fd, &read_fds))
         return;
     struct sockaddr_in peer = {0};

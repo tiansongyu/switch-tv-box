@@ -1,11 +1,13 @@
 #include "mirror_runtime.h"
 
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef __SWITCH__
 #include <switch.h>
+#include "log/log.h"
 typedef Mutex AirPlayRuntimeMutex;
 typedef CondVar AirPlayRuntimeCond;
 typedef Thread AirPlayRuntimeThread;
@@ -13,6 +15,7 @@ typedef void (*AirPlayRuntimeThreadEntry)(void *argument);
 #define AIRPLAY_RUNTIME_THREAD_RETURN void
 #define AIRPLAY_RUNTIME_THREAD_FINISH() return
 #define AIRPLAY_RUNTIME_THREAD_STACK_SIZE 0x10000u
+#define AIRPLAY_RUNTIME_LOG_ERROR(...) log_error(__VA_ARGS__)
 #else
 #include <pthread.h>
 typedef pthread_mutex_t AirPlayRuntimeMutex;
@@ -21,6 +24,7 @@ typedef pthread_t AirPlayRuntimeThread;
 typedef void *(*AirPlayRuntimeThreadEntry)(void *argument);
 #define AIRPLAY_RUNTIME_THREAD_RETURN void *
 #define AIRPLAY_RUNTIME_THREAD_FINISH() return NULL
+#define AIRPLAY_RUNTIME_LOG_ERROR(...) ((void)fprintf(stderr, __VA_ARGS__))
 #endif
 
 #include "protocol/airplay/mirror/mirror_session.h"
@@ -174,16 +178,29 @@ static bool runtime_thread_start(AirPlayRuntimeThread *thread,
     Result result = threadCreate(thread, entry, argument, NULL,
                                  AIRPLAY_RUNTIME_THREAD_STACK_SIZE, 0x2b, -2);
     if (R_FAILED(result))
+    {
+        AIRPLAY_RUNTIME_LOG_ERROR(
+            "[airplay-runtime] threadCreate failed rc=0x%08X stack=%u\n",
+            (unsigned)result, AIRPLAY_RUNTIME_THREAD_STACK_SIZE);
         return false;
+    }
     result = threadStart(thread);
     if (R_FAILED(result))
     {
-        threadClose(thread);
+        Result close_result = threadClose(thread);
+        AIRPLAY_RUNTIME_LOG_ERROR(
+            "[airplay-runtime] threadStart failed rc=0x%08X cleanup=0x%08X\n",
+            (unsigned)result, (unsigned)close_result);
         return false;
     }
     return true;
 #else
-    return pthread_create(thread, NULL, entry, argument) == 0;
+    int result = pthread_create(thread, NULL, entry, argument);
+    if (result != 0)
+        AIRPLAY_RUNTIME_LOG_ERROR(
+            "[airplay-runtime] pthread_create failed rc=%d (%s)\n",
+            result, strerror(result));
+    return result == 0;
 #endif
 }
 
@@ -638,11 +655,19 @@ bool airplay_mirror_runtime_create(const AirPlayMirrorRuntimeConfig *config,
         return false;
     runtime = calloc(1, sizeof(*runtime));
     if (!runtime)
+    {
+        AIRPLAY_RUNTIME_LOG_ERROR(
+            "[airplay-runtime] allocation failed bytes=%zu\n", sizeof(*runtime));
         return false;
+    }
     runtime->config = *config;
     runtime->status = AIRPLAY_MIRROR_RUNTIME_IDLE;
     mutex_ready = runtime_mutex_init(&runtime->mutex);
     condition_ready = mutex_ready && runtime_cond_init(&runtime->command_ready);
+    if (!condition_ready)
+        AIRPLAY_RUNTIME_LOG_ERROR(
+            "[airplay-runtime] synchronization init failed mutex=%u condition=%u\n",
+            mutex_ready ? 1u : 0u, condition_ready ? 1u : 0u);
     atomic_init(&runtime->running, condition_ready);
     if (!condition_ready ||
         !runtime_thread_start(&runtime->thread, runtime_worker, runtime))
