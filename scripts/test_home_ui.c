@@ -127,21 +127,31 @@ int main(void)
     assert(home_ui_is_chinese());
     test_translation();
 
-    assert(home_ui_hit(HOME_FOCUS_TV, 336, 320));
-    assert(home_ui_hit(HOME_FOCUS_LANGUAGE, 1100, 60));
-    assert(!home_ui_hit(HOME_FOCUS_TV, 940, 320));
-    assert(!home_ui_hit(HOME_FOCUS_LANGUAGE, 336, 320));
-    assert(!home_ui_hit(HOME_FOCUS_TV, 940, 660));
-    assert(!home_ui_hit(HOME_FOCUS_LANGUAGE, 1100, 100));
-    assert(!home_ui_hit(HOME_FOCUS_TV, HOME_TV_RIGHT, 320));
-    assert(home_ui_hit(HOME_FOCUS_PLAYER, 336, 560));
-    assert(home_ui_hit(HOME_FOCUS_PLAYER, HOME_PLAYER_LEFT, HOME_PLAYER_TOP));
-    assert(!home_ui_hit(HOME_FOCUS_PLAYER, HOME_PLAYER_RIGHT, 560));
-    assert(!home_ui_hit(HOME_FOCUS_PLAYER, 336, HOME_PLAYER_BOTTOM));
-    assert(!home_ui_hit(HOME_FOCUS_TV, 336, 560));
-    assert(!home_ui_hit(HOME_FOCUS_PLAYER, 336, 320));
-    assert(!home_ui_hit(HOME_FOCUS_PLAYER, 940, 560));
+    const HomeFocus cards[] = {HOME_FOCUS_TV, HOME_FOCUS_AIRPLAY, HOME_FOCUS_DLNA};
+    const int centers[] = {236, 640, 1044};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            assert(home_ui_hit(cards[i], centers[j], 388) == (i == j));
+    assert(home_ui_hit(HOME_FOCUS_TV, HOME_TV_LEFT, HOME_TV_TOP));
+    assert(!home_ui_hit(HOME_FOCUS_TV, HOME_TV_RIGHT, HOME_TV_TOP));
+    assert(!home_ui_hit(HOME_FOCUS_AIRPLAY, HOME_AIRPLAY_LEFT, HOME_AIRPLAY_BOTTOM));
+    assert(!home_ui_hit(HOME_FOCUS_DLNA, HOME_DLNA_RIGHT, HOME_DLNA_TOP));
+    assert(home_ui_hit(HOME_FOCUS_LANGUAGE, 1168, 60));
+    assert(!home_ui_hit(HOME_FOCUS_LANGUAGE, 1168, 100));
+    assert(home_ui_hit(HOME_FOCUS_PLAYER, 264, 551));
+    assert(!home_ui_hit(HOME_FOCUS_PLAYER, HOME_PLAYER_RIGHT, 551));
+    assert(home_ui_hit(HOME_FOCUS_BACK, 122, 147));
     assert(!home_ui_hit((HomeFocus)99, 940, 320));
+    assert(home_ui_navigate(HOME_FOCUS_TV, 1, 0) == HOME_FOCUS_AIRPLAY);
+    assert(home_ui_navigate(HOME_FOCUS_AIRPLAY, 1, 0) == HOME_FOCUS_DLNA);
+    assert(home_ui_navigate(HOME_FOCUS_DLNA, 1, 0) == HOME_FOCUS_DLNA);
+    assert(home_ui_navigate(HOME_FOCUS_DLNA, -1, 0) == HOME_FOCUS_AIRPLAY);
+    assert(home_ui_navigate(HOME_FOCUS_TV, -1, 0) == HOME_FOCUS_TV);
+    for (int i = 0; i < 3; ++i)
+        assert(home_ui_navigate(cards[i], 0, -1) == HOME_FOCUS_LANGUAGE);
+    assert(home_ui_navigate(HOME_FOCUS_LANGUAGE, 0, 1) == HOME_FOCUS_DLNA);
+    assert(home_ui_navigate(HOME_FOCUS_LANGUAGE, -1, 0) == HOME_FOCUS_DLNA);
+    assert(home_ui_navigate((HomeFocus)99, 0, 0) == HOME_FOCUS_TV);
     remove(path);
     rmdir(directory);
     puts("Home language persistence, built-in translations and touch geometry passed");

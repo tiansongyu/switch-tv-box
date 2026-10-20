@@ -195,8 +195,30 @@ bool home_ui_hit(HomeFocus target, int x, int y)
     if (target == HOME_FOCUS_TV)
         return x >= HOME_TV_LEFT && x < HOME_TV_RIGHT &&
                y >= HOME_TV_TOP && y < HOME_TV_BOTTOM;
+    if (target == HOME_FOCUS_AIRPLAY)
+        return x >= HOME_AIRPLAY_LEFT && x < HOME_AIRPLAY_RIGHT &&
+               y >= HOME_AIRPLAY_TOP && y < HOME_AIRPLAY_BOTTOM;
+    if (target == HOME_FOCUS_DLNA)
+        return x >= HOME_DLNA_LEFT && x < HOME_DLNA_RIGHT &&
+               y >= HOME_DLNA_TOP && y < HOME_DLNA_BOTTOM;
     if (target == HOME_FOCUS_PLAYER)
         return x >= HOME_PLAYER_LEFT && x < HOME_PLAYER_RIGHT &&
                y >= HOME_PLAYER_TOP && y < HOME_PLAYER_BOTTOM;
+    if (target == HOME_FOCUS_BACK)
+        return x >= HOME_BACK_LEFT && x < HOME_BACK_RIGHT &&
+               y >= HOME_BACK_TOP && y < HOME_BACK_BOTTOM;
     return false;
+}
+
+HomeFocus home_ui_navigate(HomeFocus focus, int horizontal, int vertical)
+{
+    if (focus < HOME_FOCUS_TV || focus > HOME_FOCUS_LANGUAGE)
+        focus = HOME_FOCUS_TV;
+    if (vertical < 0)
+        return HOME_FOCUS_LANGUAGE;
+    if (focus == HOME_FOCUS_LANGUAGE)
+        return vertical > 0 || horizontal < 0 ? HOME_FOCUS_DLNA : focus;
+    int card = (int)focus + (horizontal < 0 ? -1 : horizontal > 0 ? 1 : 0);
+    return (HomeFocus)(card < HOME_FOCUS_TV ? HOME_FOCUS_TV :
+                       card > HOME_FOCUS_DLNA ? HOME_FOCUS_DLNA : card);
 }

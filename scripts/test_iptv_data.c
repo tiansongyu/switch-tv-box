@@ -173,6 +173,45 @@ static void test_configuration_save_failures(void)
     puts("IPTV save tests passed: first save, SD rename, close/backup/install/rollback failures.");
 }
 
+static void test_favorites_restart(void)
+{
+    const char *playlist = IPTV_ROOT_DIR "/favorites-restart.m3u";
+    write_playlist(playlist, 2);
+    assert(iptv_init());
+    iptv_set_selected_index(1);
+    IptvChannel channel;
+    assert(iptv_get_channel(1, &channel) && !channel.favorite);
+    const uint32_t saved_id = channel.id;
+    assert(iptv_toggle_selected_favorite());
+    iptv_deinit();
+
+    assert(iptv_init());
+    iptv_set_filter(1);
+    assert(iptv_get_channel_count() == 1);
+    assert(iptv_get_channel(0, &channel) && channel.id == saved_id && channel.favorite);
+    fail_install = true;
+    assert(!iptv_toggle_selected_favorite());
+    fail_install = false;
+    assert(iptv_get_channel(0, &channel) && channel.favorite);
+    iptv_deinit();
+
+    assert(iptv_init());
+    iptv_set_filter(1);
+    assert(iptv_get_channel_count() == 1);
+    assert(iptv_toggle_selected_favorite());
+    assert(iptv_get_channel_count() == 0);
+    iptv_deinit();
+    assert(iptv_init());
+    iptv_set_filter(1);
+    assert(iptv_get_channel_count() == 0);
+    iptv_set_filter(0);
+    assert(iptv_get_channel_count() == 2);
+    iptv_deinit();
+    assert(remove(playlist) == 0);
+    assert(remove(IPTV_FAVORITES_FILE) == 0);
+    puts("IPTV favorites survived restart; failed saves rolled back; removal survived restart.");
+}
+
 int main(void)
 {
     char early_name[64];
@@ -201,6 +240,7 @@ int main(void)
     assert(iptv_reload()); /* Empty catalogs have no allocated channel buffer. */
     iptv_deinit();
     test_configuration_save_failures();
+    test_favorites_restart();
 
     const char *large = IPTV_ROOT_DIR "/large.m3u8";
     write_playlist(large, 10001);

@@ -19,7 +19,7 @@ FUNCTIONS = ["draw_home_text", "text_width", "draw_sized_centered_text", "switch
 def function(source: str, name: str) -> str:
     # Declarations end in ';', definitions reach '{'. The included functions have
     # no braces in string literals; balance nested C++ scopes after the signature.
-    match = re.search(r"^(?:void|float) " + re.escape(name) + r"\([^;{]*\)\s*\{", source, re.M)
+    match = re.search(r"^(?:void|float|ImU32|ImVec2|BrowserPalette) " + re.escape(name) + r"\([^;{]*\)\s*\{", source, re.M)
     if not match:
         raise RuntimeError(f"Production draw function missing: {name}")
     depth = 1
@@ -48,23 +48,32 @@ def main() -> None:
 extern "C" {
 #include "player/view.h"
 #include "player/ui/home.h"
+#include "iptv/iptv.h"
 }
 #define NXCAST_APP_VERSION "preview"
 struct SwitchActionHint { const char *button; const char *label; };
 '''
+    header += (ROOT / "assets/ui/preview_iptv_data.cpp").read_text()
     body = header + "\n\n".join(function(source, name) for name in FUNCTIONS)
+    body += "\nstruct BrowserPalette { ImU32 background, surface, text, muted, line, selected, accent, on_accent; };\n"
+    for name in ["channel_badge_color", "format_program_window", "programme_progress", "draw_channel_badge",
+                 "browser_palette", "browser_min", "browser_max", "browser_text", "browser_toolbar_icon",
+                 "browser_button", "draw_browser_modal", "draw_iptv_panel"]:
+        body += "\n" + function(source, name)
     body += (ROOT / "assets/ui/preview_renderer.cpp").read_text()
     with tempfile.TemporaryDirectory(prefix="switch-tv-box-ui-") as temporary:
         build = Path(temporary)
         (build / "preview.cpp").write_text(body)
         subprocess.run(["cc", "-std=c11", "-I", str(ROOT / "source"), "-c",
                         str(ROOT / "source/player/ui/home.c"), "-o", str(build / "home.o")], check=True)
+        subprocess.run(["cc", "-std=c11", "-I", str(ROOT / "source"), "-c",
+                        str(ROOT / "source/player/ui/browser.c"), "-o", str(build / "browser.o")], check=True)
         imgui = ROOT / "third_party/imgui"
         subprocess.run(["c++", "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(imgui),
-                        "-I", str(ROOT / "source"), str(build / "preview.cpp"), str(build / "home.o"),
+                        "-I", str(ROOT / "source"), str(build / "preview.cpp"), str(build / "home.o"), str(build / "browser.o"),
                         *(str(imgui / name) for name in ["imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp"]),
                         "-o", str(build / "preview")], check=True)
-        for scenario in ["home", "playing", "music", "music-paused", "pairing", "offline", "english", "long-title"]:
+        for scenario in ["home", "airplay", "dlna", "playing", "music", "music-paused", "pairing", "offline", "english", "english-airplay", "english-dlna", "long-title", "iptv", "iptv-drawer", "iptv-favorites", "iptv-empty-favorites"]:
             ppm = build / f"{scenario}.ppm"
             subprocess.run([str(build / "preview"), str(ROOT / "assets/fonts/switch_font.ttf"),
                             str(ppm), scenario], check=True)

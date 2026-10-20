@@ -528,6 +528,7 @@ static bool main_snapshot_playback_active(const PlayerSnapshot *snapshot)
 }
 
 static HomeFocus g_home_focus = HOME_FOCUS_TV;
+static HomePage g_home_page = HOME_PAGE_MAIN;
 static bool g_home_language_save_failed;
 static u64 g_home_navigation_previous;
 
@@ -552,6 +553,8 @@ static void build_home_view_state(PlayerHomeViewState *out,
 
     memset(out, 0, sizeof(*out));
     out->storage_ready = storage_ready;
+    out->home_focus = g_home_focus;
+    out->home_page = g_home_page;
     out->home_language_focused = g_home_focus == HOME_FOCUS_LANGUAGE;
     out->player_focused = g_home_focus == HOME_FOCUS_PLAYER;
     out->home_language_save_failed = g_home_language_save_failed;
@@ -1841,43 +1844,75 @@ int main(int argc, char* argv[])
             bool return_home_player = false;
             if (!iptv_panel_open && !browser_captured)
             {
-                if (!home_state.playback_active && g_home_focus == HOME_FOCUS_PLAYER)
-                    g_home_focus = HOME_FOCUS_TV;
-                if (home_navigation_down & HidNpadButton_Up)
-                    g_home_focus = g_home_focus == HOME_FOCUS_PLAYER ?
-                        HOME_FOCUS_TV : HOME_FOCUS_LANGUAGE;
-                if (home_navigation_down & HidNpadButton_Down)
-                    g_home_focus = g_home_focus == HOME_FOCUS_TV &&
-                        home_state.playback_active ? HOME_FOCUS_PLAYER : HOME_FOCUS_TV;
-                if (home_navigation_down & HidNpadButton_Right)
-                    g_home_focus = HOME_FOCUS_LANGUAGE;
-                if (home_navigation_down & HidNpadButton_Left)
-                    g_home_focus = HOME_FOCUS_TV;
-                bool language_tapped = touch_tap &&
-                    home_ui_hit(HOME_FOCUS_LANGUAGE, touch_tap_x, touch_tap_y);
-                bool tv_tapped = touch_tap &&
-                    home_ui_hit(HOME_FOCUS_TV, touch_tap_x, touch_tap_y);
-                if (language_tapped || ((kDown & HidNpadButton_A) && g_home_focus == HOME_FOCUS_LANGUAGE))
+                int horizontal = (home_navigation_down & HidNpadButton_L) ? -1 :
+                                 (home_navigation_down & HidNpadButton_R) ? 1 : 0;
+                int vertical = (home_navigation_down & HidNpadButton_Up) ? -1 :
+                               (home_navigation_down & HidNpadButton_Down) ? 1 : 0;
+                bool can_control = home_state.playback_active &&
+                    (g_home_page == HOME_PAGE_AIRPLAY || !home_state.audio_playback_active);
+                if (g_home_page == HOME_PAGE_MAIN)
+                    g_home_focus = home_ui_navigate(g_home_focus, horizontal, vertical);
+                else
+                {
+                    if (g_home_focus == HOME_FOCUS_PLAYER && !can_control)
+                        g_home_focus = HOME_FOCUS_BACK;
+                    if (horizontal > 0)
+                        g_home_focus = HOME_FOCUS_LANGUAGE;
+                    else if (horizontal < 0)
+                        g_home_focus = HOME_FOCUS_BACK;
+                    else if (vertical < 0)
+                        g_home_focus = g_home_focus == HOME_FOCUS_PLAYER ? HOME_FOCUS_BACK : HOME_FOCUS_LANGUAGE;
+                    else if (vertical > 0)
+                        g_home_focus = can_control ? HOME_FOCUS_PLAYER : HOME_FOCUS_BACK;
+                }
+                bool accept = (kDown & HidNpadButton_A) != 0;
+                bool language_tapped = touch_tap && home_ui_hit(HOME_FOCUS_LANGUAGE, touch_tap_x, touch_tap_y);
+                if (language_tapped || (accept && g_home_focus == HOME_FOCUS_LANGUAGE))
                 {
                     g_home_focus = HOME_FOCUS_LANGUAGE;
                     g_home_language_save_failed = !home_ui_toggle_language();
                     if (g_home_language_save_failed)
                         log_warn("[ui] language applied but SD preference could not be saved: %s (errno=%d)\n", strerror(errno), errno);
+                    touch_tap = accept = false;
+                }
+                if (g_home_page != HOME_PAGE_MAIN)
+                {
+                    bool go_back = (kDown & HidNpadButton_B) ||
+                        (touch_tap && home_ui_hit(HOME_FOCUS_BACK, touch_tap_x, touch_tap_y)) ||
+                        (accept && g_home_focus == HOME_FOCUS_BACK);
+                    return_home_player = !go_back && can_control &&
+                        ((touch_tap && home_ui_hit(HOME_FOCUS_PLAYER, touch_tap_x, touch_tap_y)) ||
+                         (accept && g_home_focus == HOME_FOCUS_PLAYER));
+                    if (go_back)
+                    {
+                        g_home_focus = g_home_page == HOME_PAGE_AIRPLAY ? HOME_FOCUS_AIRPLAY : HOME_FOCUS_DLNA;
+                        g_home_page = HOME_PAGE_MAIN;
+                        kDown &= ~HidNpadButton_B;
+                    }
                     touch_tap = false;
                 }
-                open_home_channels = tv_tapped ||
-                    ((kDown & HidNpadButton_A) && g_home_focus == HOME_FOCUS_TV);
-                if (tv_tapped)
-                    touch_tap = false;
-                return_home_player = home_state.playback_active &&
-                    ((touch_tap && home_ui_hit(HOME_FOCUS_PLAYER, touch_tap_x, touch_tap_y)) ||
-                     ((kDown & HidNpadButton_A) && g_home_focus == HOME_FOCUS_PLAYER));
-                if (return_home_player)
-                    touch_tap = false;
+                else
+                {
+                    for (int card = HOME_FOCUS_TV; card <= HOME_FOCUS_DLNA; ++card)
+                    {
+                        bool tapped = touch_tap && home_ui_hit((HomeFocus)card, touch_tap_x, touch_tap_y);
+                        if (!tapped && !(accept && g_home_focus == (HomeFocus)card))
+                            continue;
+                        if (card == HOME_FOCUS_TV)
+                            open_home_channels = true;
+                        else
+                        {
+                            g_home_page = card == HOME_FOCUS_AIRPLAY ? HOME_PAGE_AIRPLAY : HOME_PAGE_DLNA;
+                            g_home_focus = HOME_FOCUS_BACK;
+                        }
+                        touch_tap = false;
+                        break;
+                    }
+                }
             }
 
             if (!iptv_panel_open && !browser_captured && home_state.playback_active &&
-                (((kDown & HidNpadButton_B) && !home_state.audio_playback_active) ||
+                (((kDown & HidNpadButton_B) && g_home_page == HOME_PAGE_MAIN && !home_state.audio_playback_active) ||
                  return_home_player))
             {
                 bool ok = home_state.audio_playback_active ?
@@ -1895,6 +1930,7 @@ int main(int argc, char* argv[])
                 if (!iptv_panel_open)
                 {
                     g_home_focus = HOME_FOCUS_TV;
+                    g_home_page = HOME_PAGE_MAIN;
                     iptv_panel_open = true;
                     iptv_sources_open = false;
                     player_browser_open(&g_iptv_browser, false);

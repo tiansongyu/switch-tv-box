@@ -46,6 +46,8 @@ typedef struct
 typedef struct
 {
     bool storage_ready;
+    int home_focus;
+    int home_page;
     bool home_language_focused;
     bool player_focused;
     bool home_language_save_failed;

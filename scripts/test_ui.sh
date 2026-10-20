@@ -12,6 +12,10 @@ cd "$ROOT"
 "${HOST_CC:-cc}" -std=c11 -Wall -Wextra -Werror -pedantic -Isource \
     -Drename=home_test_rename source/player/ui/home.c scripts/test_home_ui.c -o "$TMP/home"
 "$TMP/home"
+"${HOST_CC:-cc}" -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pedantic \
+    -Iscripts/view_test_stubs -Iscripts/iptv_test_stubs -Isource \
+    source/player/render/view.c source/player/types.c scripts/test_player_view.c -o "$TMP/view"
+"$TMP/view"
 "${HOST_CC:-cc}" -std=c11 -Wall -Wextra -Werror -pedantic -Isource \
     source/player/ui/layout.c scripts/test_player_layout.c -o "$TMP/layout"
 "$TMP/layout"

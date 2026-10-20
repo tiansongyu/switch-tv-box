@@ -34,8 +34,9 @@ extern "C"
     } PlayerBrowserFocus;
     typedef enum
     {
-        PLAYER_BROWSER_CATEGORIES,
+        PLAYER_BROWSER_ALL,
         PLAYER_BROWSER_FAVORITES,
+        PLAYER_BROWSER_CATEGORIES,
         PLAYER_BROWSER_RECENT,
         PLAYER_BROWSER_SEARCH,
         PLAYER_BROWSER_SOURCE_FILTER,

@@ -1235,15 +1235,14 @@ void draw_channel_badge(ImDrawList *draw,
 
 
 
-// This screen uses the same 1280 x 720 geometry as home_ui_hit().
-// Keep actionable cards aligned with those rectangles; the receiver is passive.
+// Shared logical geometry keeps controller focus and touch targets consistent.
 void draw_home_screen(ImDrawList *draw, const PlayerHomeViewState &home, float width, float height)
 {
-    const ImU32 ink = IM_COL32(242, 248, 255, 255);
-    const ImU32 muted = IM_COL32(148, 170, 194, 255);
-    const ImU32 cyan = IM_COL32(96, 228, 239, 255);
-    const ImU32 border = IM_COL32(70, 96, 124, 145);
-    const ImU32 surface = IM_COL32(18, 31, 48, 255);
+    const ImU32 ink = IM_COL32(243, 248, 253, 255);
+    const ImU32 muted = IM_COL32(153, 174, 196, 255);
+    const ImU32 cyan = IM_COL32(102, 226, 218, 255);
+    const ImU32 border = IM_COL32(94, 127, 155, 65);
+    const ImU32 surface = IM_COL32(18, 32, 48, 255);
     auto tr = [](const char *en, const char *zh) { return home_ui_text(en, zh); };
     auto centered = [&](const char *text, float x, float y, float size, ImU32 color) {
         draw_sized_centered_text(draw, text, ImVec2(x, y), size, color);
@@ -1252,199 +1251,175 @@ void draw_home_screen(ImDrawList *draw, const PlayerHomeViewState &home, float w
         char label[PLAYER_HOME_ERROR_MAX + 8];
         snprintf(label, sizeof(label), "%s", text ? text : "");
         for (char *p = label; *p; ++p)
-            if (*p == '\n' || *p == '\r' || *p == '\t')
-                *p = ' ';
+            if (*p == '\n' || *p == '\r' || *p == '\t') *p = ' ';
         if (text_width(size, label) > w)
         {
             const char *remaining = label;
             ImGui::GetFont()->CalcTextSizeA(size, std::max(0.0f, w - text_width(size, "…")),
                                           0.0f, label, nullptr, &remaining);
-            // CalcTextSizeA returns a complete UTF-8 code point boundary.
             snprintf(label + (remaining - label), sizeof(label) - (remaining - label), "…");
         }
         draw->PushClipRect(ImVec2(x, y), ImVec2(x + w, y + size + 8), true);
         draw_home_text(draw, x, y, size, color, label);
         draw->PopClipRect();
     };
-    const bool receiver_ready = home.network_ready && home.airplay_running;
-    const bool tv_focused = !home.home_language_focused && !home.player_focused;
-    const bool resume_focused = home.playback_active && home.player_focused;
-    const bool music_paused = home.audio_playback_active &&
-                              home.playback_state == PLAYER_STATE_PAUSED;
+    auto screen_icon = [&](float x, float y, ImU32 color, int kind) {
+        draw->AddRect(ImVec2(x, y), ImVec2(x + 62, y + 42), color, 7, 0, 2.5f);
+        if (kind == HOME_FOCUS_TV)
+        {
+            draw->AddLine(ImVec2(x + 31, y + 43), ImVec2(x + 31, y + 52), color, 2.5f);
+            draw->AddLine(ImVec2(x + 18, y + 53), ImVec2(x + 44, y + 53), color, 2.5f);
+            draw->AddTriangleFilled(ImVec2(x + 25, y + 11), ImVec2(x + 25, y + 31), ImVec2(x + 42, y + 21), color);
+        }
+        else if (kind == HOME_FOCUS_AIRPLAY)
+        {
+            draw->AddRectFilled(ImVec2(x + 15, y + 37), ImVec2(x + 47, y + 46), surface);
+            draw->AddTriangleFilled(ImVec2(x + 31, y + 32), ImVec2(x + 16, y + 51), ImVec2(x + 46, y + 51), color);
+        }
+        else
+        {
+            draw->AddRectFilled(ImVec2(x - 3, y + 20), ImVec2(x + 25, y + 46), surface);
+            draw->AddCircleFilled(ImVec2(x + 1, y + 42), 3, color);
+            for (int radius = 12; radius <= 22; radius += 10)
+            {
+                draw->PathArcTo(ImVec2(x + 1, y + 42), (float)radius, -1.57f, 0.0f, 16);
+                draw->PathStroke(color, false, 2.5f);
+            }
+        }
+    };
+    const bool detail = home.home_page != HOME_PAGE_MAIN;
+    const bool airplay = home.home_page == HOME_PAGE_AIRPLAY;
+    const bool music_paused = home.playback_state == PLAYER_STATE_PAUSED;
+    const bool receiver_ready = home.network_ready && (airplay ? home.airplay_running : home.dlna_running);
     const time_t now = time(nullptr);
     struct tm local = {};
     char clock_text[16] = "--:--";
-    char date_text[48] = {};
     if (localtime_r(&now, &local))
-    {
         snprintf(clock_text, sizeof(clock_text), "%02d:%02d", local.tm_hour, local.tm_min);
-        snprintf(date_text, sizeof(date_text), tr("%02d / %02d", "%d 月 %d 日"),
-                 local.tm_mon + 1, local.tm_mday);
-    }
 
-    draw->AddRectFilled(ImVec2(0, 0), ImVec2(width, height), IM_COL32(8, 15, 27, 255));
+    draw->AddRectFilled(ImVec2(0, 0), ImVec2(width, height), IM_COL32(8, 16, 27, 255));
     draw->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(width, height),
-                                 IM_COL32(18, 44, 67, 145), IM_COL32(8, 15, 27, 0),
-                                 IM_COL32(27, 27, 61, 90), IM_COL32(8, 15, 27, 0));
-    // A small television mark stays legible at a distance and in handheld mode.
-    draw->AddRectFilled(ImVec2(48, 34), ImVec2(102, 88), IM_COL32(31, 69, 88, 255), 16);
-    draw->AddRect(ImVec2(60, 47), ImVec2(90, 68), cyan, 4, 0, 2.2f);
-    draw->AddLine(ImVec2(75, 69), ImVec2(75, 75), cyan, 2.0f);
-    draw->AddLine(ImVec2(68, 76), ImVec2(82, 76), cyan, 2.0f);
-    draw_home_text(draw, 118, 37, 28, ink, "Switch TV Box");
-    draw_home_text(draw, 118, 72, 16, muted, tr("YOUR LIVING ROOM, CONNECTED", "让好内容，回到大屏幕"));
-    draw->AddCircleFilled(ImVec2(774, 52), 4,
-                         home.network_ready ? cyan : IM_COL32(248, 184, 91, 255));
-    draw_home_text(draw, 788, 40, 19, ink,
-                   home.network_ready ? tr("Connected", "网络已连接") : tr("Offline", "网络未连接"));
-    clipped(home.network_ready && home.ip_address[0] ? home.ip_address : tr("Check Wi-Fi settings", "请检查 Wi-Fi 设置"),
-            774, 72, 164, 16, muted);
-    draw_home_text(draw, 950, 34, 30, ink, clock_text);
-    draw_home_text(draw, 950, 72, 15, muted, date_text);
+                                 IM_COL32(26, 57, 75, 100), IM_COL32(8, 16, 27, 0),
+                                 IM_COL32(31, 35, 62, 70), IM_COL32(8, 16, 27, 0));
+    draw_home_text(draw, 48, 38, 30, ink, "Switch TV Box");
+    const char *network = home.network_ready ? home.ip_address : tr("Network offline", "网络未连接");
+    draw->AddCircleFilled(ImVec2(775, 61), 4, home.network_ready ? cyan : IM_COL32(239, 183, 105, 255));
+    clipped(network, 789, 50, 190, 19, muted);
+    draw_home_text(draw, 996, 47, 26, ink, clock_text);
     draw->AddRectFilled(ImVec2(HOME_LANGUAGE_LEFT, HOME_LANGUAGE_TOP),
-                        ImVec2(HOME_LANGUAGE_RIGHT, HOME_LANGUAGE_BOTTOM), surface, 15);
+                        ImVec2(HOME_LANGUAGE_RIGHT, HOME_LANGUAGE_BOTTOM), surface, 13);
     draw->AddRect(ImVec2(HOME_LANGUAGE_LEFT, HOME_LANGUAGE_TOP),
                   ImVec2(HOME_LANGUAGE_RIGHT, HOME_LANGUAGE_BOTTOM),
-                  home.home_language_focused ? cyan : border, 15, 0,
-                  home.home_language_focused ? 3.0f : 1.0f);
-    centered("中文 / EN", (HOME_LANGUAGE_LEFT + HOME_LANGUAGE_RIGHT) * 0.5f, 60, 23, ink);
-    draw->AddLine(ImVec2(48, 110), ImVec2(1232, 110), IM_COL32(86, 114, 144, 55));
-    draw_home_text(draw, 48, 138, 36, ink, tr("Make yourself at home.", "把客厅，交给喜欢的内容。"));
-    draw_home_text(draw, 48, 186, 19, muted,
-                   tr("Live television. Your music. A bigger screen.", "看电视 · 听音乐 · 分享你的大屏时光"));
+                  home.home_focus == HOME_FOCUS_LANGUAGE ? cyan : border, 13, 0,
+                  home.home_focus == HOME_FOCUS_LANGUAGE ? 2.5f : 1.0f);
+    centered("中文 / EN", 1168, 60, 21, ink);
+    draw->AddLine(ImVec2(48, 106), ImVec2(1232, 106), border);
 
-    const ImVec2 tv_min(HOME_TV_LEFT, HOME_TV_TOP), tv_max(HOME_TV_RIGHT, HOME_TV_BOTTOM);
-    draw->AddRectFilled(ImVec2(tv_min.x, tv_min.y + 6), ImVec2(tv_max.x, tv_max.y + 6),
-                        IM_COL32(0, 0, 0, 55), 24);
-    draw->AddRectFilled(tv_min, tv_max, IM_COL32(22, 64, 88, 255), 24);
-    draw->PushClipRect(ImVec2(tv_min.x + 3, tv_min.y + 3), ImVec2(tv_max.x - 3, tv_max.y - 3), true);
-    draw->AddRectFilledMultiColor(ImVec2(380, tv_min.y + 24), ImVec2(tv_max.x - 3, tv_max.y - 24),
-                                 IM_COL32(45, 121, 149, 0), IM_COL32(53, 127, 160, 100),
-                                 IM_COL32(50, 102, 149, 75), IM_COL32(24, 61, 86, 0));
-    draw->AddCircle(ImVec2(666, 355), 142, IM_COL32(158, 228, 244, 20), 72, 1.5f);
-    draw->AddCircle(ImVec2(666, 355), 113, IM_COL32(158, 228, 244, 24), 72, 1.5f);
-    // Stylized television artwork is drawn directly, with no external assets.
-    draw->AddRectFilled(ImVec2(535, 280), ImVec2(703, 392), IM_COL32(9, 28, 45, 255), 13);
-    draw->AddRect(ImVec2(535, 280), ImVec2(703, 392), IM_COL32(120, 210, 231, 190), 13, 0, 2.5f);
-    draw->AddCircleFilled(ImVec2(661, 310), 13, IM_COL32(149, 233, 238, 230), 32);
-    draw->AddTriangleFilled(ImVec2(544, 380), ImVec2(603, 319), ImVec2(665, 380), IM_COL32(37, 120, 145, 255));
-    draw->AddTriangleFilled(ImVec2(598, 380), ImVec2(651, 337), ImVec2(694, 380), IM_COL32(45, 164, 176, 255));
-    draw->AddLine(ImVec2(619, 393), ImVec2(619, 405), IM_COL32(120, 210, 231, 190), 3);
-    draw->AddLine(ImVec2(592, 408), ImVec2(646, 408), IM_COL32(120, 210, 231, 190), 3);
-    draw->PopClipRect();
-    draw->AddRect(tv_min, tv_max, tv_focused ? cyan : border, 24, 0, tv_focused ? 3.0f : 1.0f);
-    draw_home_text(draw, 82, 252, 17, cyan, "LIVE TV");
-    draw_home_text(draw, 80, 291, 48, ink, tr("Live television", "电视直播"));
-    char summary[128];
-    snprintf(summary, sizeof(summary), tr("%d channels  /  %d sources", "%d 个频道  /  %d 个直播源"),
-             home.iptv_channel_count, home.iptv_source_count);
-    draw_home_text(draw, 82, 356, 22, IM_COL32(181, 211, 227, 255), summary);
-    draw->AddRectFilled(ImVec2(82, 409), ImVec2(354, 459), cyan, 13);
-    draw->AddCircle(ImVec2(108, 434), 13, IM_COL32(13, 48, 64, 255), 24, 1.5f);
-    centered("A", 108, 434, 17, IM_COL32(13, 48, 64, 255));
-    centered(tr("Open channels", "打开频道库"), 231, 434, 23, IM_COL32(13, 48, 64, 255));
-
-    // Music is controlled here; video returns to its existing full-screen session.
-    draw->AddRectFilled(ImVec2(HOME_PLAYER_LEFT, HOME_PLAYER_TOP),
-                        ImVec2(HOME_PLAYER_RIGHT, HOME_PLAYER_BOTTOM), surface, 20);
-    draw->AddRect(ImVec2(HOME_PLAYER_LEFT, HOME_PLAYER_TOP),
-                  ImVec2(HOME_PLAYER_RIGHT, HOME_PLAYER_BOTTOM),
-                  resume_focused ? cyan : border, 20, 0, resume_focused ? 3.0f : 1.0f);
-    draw->AddRectFilled(ImVec2(72, 532), ImVec2(134, 594), IM_COL32(32, 52, 74, 255), 16);
-    if (home.playback_active)
+    if (!detail)
     {
-        if (home.audio_playback_active)
-        {
-            draw->AddLine(ImVec2(99, 570), ImVec2(99, 548), cyan, 3);
-            draw->AddLine(ImVec2(115, 566), ImVec2(115, 544), cyan, 3);
-            draw->AddLine(ImVec2(99, 548), ImVec2(115, 544), cyan, 4);
-            draw->AddCircleFilled(ImVec2(94, 572), 6, cyan, 24);
-            draw->AddCircleFilled(ImVec2(110, 568), 6, cyan, 24);
-        }
-        else
-            draw->AddTriangleFilled(ImVec2(95, 550), ImVec2(95, 576), ImVec2(115, 563), cyan);
-        draw_home_text(draw, 154, 530, 24, ink, home.audio_playback_active
-                       ? tr("AirPlay music", "AirPlay 音乐") : tr("Continue watching", "继续播放"));
-        const char *title = home.audio_playback_active ?
-                            (music_paused ? tr("Paused · Select and press A", "已暂停 · 选中后按 A 继续")
-                                          : tr("Playing · Select and press A", "正在播放 · 选中后按 A 暂停")) :
-                            home.iptv_playback_active && home.iptv_last_name[0] ? home.iptv_last_name :
-                            tr("Return to the current session", "返回当前播放画面");
-        clipped(title, 154, 568, 450, 20, muted);
-        draw->AddCircle(ImVec2(706, 563), 18, cyan, 24, 1.5f);
-        centered(home.audio_playback_active ? "A" : "B", 706, 563, 22, cyan);
-    }
-    else
-    {
-        draw->AddCircle(ImVec2(103, 563), 15, muted, 28, 1.8f);
-        draw->AddLine(ImVec2(103, 563), ImVec2(103, 553), muted, 1.8f);
-        draw->AddLine(ImVec2(103, 563), ImVec2(110, 567), muted, 1.8f);
-        draw_home_text(draw, 154, 530, 23, ink, tr("Recently watched", "最近观看"));
-        clipped(home.iptv_last_name[0] ? home.iptv_last_name :
-                    tr("Your next favourite is a channel away", "打开频道库，发现喜欢的节目"),
-                154, 568, 565, 20, muted);
-    }
-
-    draw->AddRectFilled(ImVec2(784, 224), ImVec2(1232, 620), surface, 24);
-    draw->AddRect(ImVec2(784, 224), ImVec2(1232, 620), border, 24);
-    draw_home_text(draw, 816, 252, 30, ink, "AirPlay 1");
-    draw->AddRect(ImVec2(1174, 259), ImVec2(1200, 277), cyan, 3, 0, 1.8f);
-    draw->AddTriangleFilled(ImVec2(1187, 273), ImVec2(1179, 282), ImVec2(1195, 282), cyan);
-    draw->AddCircleFilled(ImVec2(822, 310), 4, receiver_ready ? cyan : IM_COL32(248, 184, 91, 255));
-    draw_home_text(draw, 836, 298, 20, receiver_ready ? cyan : muted,
-                   !home.network_ready ? tr("Connect to Wi-Fi", "请先连接网络") :
-                   home.audio_playback_active ? (music_paused ? tr("Music paused", "音乐已暂停") :
-                                                               tr("Playing your music", "音乐正在播放")) :
-                   receiver_ready ? tr("Ready to connect", "已就绪，等待连接") : tr("Starting receiver", "接收服务正在启动"));
-    draw->AddLine(ImVec2(816, 336), ImVec2(1200, 336), border);
-    if (home.airplay_pin_visible && home.airplay_pin[0])
-    {
-        centered(tr("AirPlay pairing code", "AirPlay 配对验证码"), 1008, 373, 22, muted);
-        centered(home.airplay_pin, 1008, 444, 72, ink);
-        centered(tr("Enter this code on your device", "请在你的设备上输入此验证码"), 1008, 516, 22, muted);
-    }
-    else
-    {
-        draw_home_text(draw, 816, 359, 18, muted, tr("Choose this receiver", "在你的设备上选择"));
-        draw_home_text(draw, 816, 392, 29, ink, "Switch TV Box");
-        const char *steps_en[] = {"Connect to the same Wi-Fi", "Tap AirPlay in music or video", "Choose Switch TV Box"};
-        const char *steps_zh[] = {"将设备与 Switch 连接同一网络", "在音乐或视频 App 中点击 AirPlay", "选择 Switch TV Box，开始播放"};
+        draw_home_text(draw, 48, 150, 30, ink, tr("What would you like to watch?", "选择一种播放方式"));
+        const int left[] = {HOME_TV_LEFT, HOME_AIRPLAY_LEFT, HOME_DLNA_LEFT};
+        const char *titles[] = {"IPTV", "AirPlay", "DLNA"};
+        const char *subtitles[] = {tr("Live television", "电视直播"), tr("Connect your Apple device", "连接 Apple 设备"), tr("Cast a video", "视频投屏")};
+        const ImU32 accents[] = {cyan, IM_COL32(144, 180, 255, 255), IM_COL32(211, 175, 255, 255)};
         for (int i = 0; i < 3; ++i)
         {
-            const float y = 452.0f + i * 37.0f;
+            const float x = (float)left[i];
+            const bool focused = home.home_focus == i;
+            draw->AddRectFilled(ImVec2(x, HOME_TV_TOP), ImVec2(x + 376, HOME_TV_BOTTOM), surface, 24);
+            draw->AddRectFilledMultiColor(ImVec2(x + 24, 238), ImVec2(x + 352, 340),
+                                         IM_COL32(39, 71, 91, 90), 0, 0, IM_COL32(39, 71, 91, 0));
+            draw->AddRect(ImVec2(x, HOME_TV_TOP), ImVec2(x + 376, HOME_TV_BOTTOM),
+                          focused ? accents[i] : border, 24, 0, focused ? 3.0f : 1.0f);
+            screen_icon(x + 32, 254, accents[i], i);
+            draw_home_text(draw, x + 32, 341, 42, ink, titles[i]);
+            draw_home_text(draw, x + 32, 401, 23, muted, subtitles[i]);
+            draw->AddLine(ImVec2(x + 32, 455), ImVec2(x + 344, 455), border);
+            char status[96];
+            if (i == HOME_FOCUS_TV)
+                snprintf(status, sizeof(status), tr("%d channels · %d favourites", "%d 个频道 · %d 个收藏"),
+                         home.iptv_channel_count, home.iptv_favorite_count);
+            else if (i == HOME_FOCUS_AIRPLAY && home.airplay_pin_visible && home.airplay_pin[0])
+                snprintf(status, sizeof(status), tr("Pairing code: %s", "配对验证码：%s"), home.airplay_pin);
+            else
+                snprintf(status, sizeof(status), "%s", !home.network_ready ? tr("Connect to your network", "请先连接网络") :
+                         (i == HOME_FOCUS_AIRPLAY ? home.airplay_running : home.dlna_running) ?
+                            tr("Ready to connect", "已就绪，等待投送") : tr("Receiver unavailable", "接收服务未启动"));
+            clipped(status, x + 32, 479, 270, 19, muted);
+            draw_home_text(draw, x + 331, 478, 25, accents[i], "›");
+        }
+        draw_home_text(draw, 48, 591, 19, muted,
+                       tr("For casting, connect your phone and Switch to the same network.", "投屏时，请将手机与 Switch 连接到同一个局域网。"));
+    }
+    else
+    {
+        draw->AddRectFilled(ImVec2(HOME_BACK_LEFT, HOME_BACK_TOP), ImVec2(HOME_BACK_RIGHT, HOME_BACK_BOTTOM), surface, 13);
+        draw->AddRect(ImVec2(HOME_BACK_LEFT, HOME_BACK_TOP), ImVec2(HOME_BACK_RIGHT, HOME_BACK_BOTTOM),
+                      home.home_focus == HOME_FOCUS_BACK ? cyan : border, 13, 0, 2);
+        centered(tr("B  Home", "B  返回"), 122, 147, 21, ink);
+        draw_home_text(draw, 48, 207, 42, ink, airplay ? "AirPlay" : tr("DLNA video casting", "DLNA 视频投屏"));
+        draw->AddCircleFilled(ImVec2(54, 280), 4, receiver_ready ? cyan : IM_COL32(239, 183, 105, 255));
+        draw_home_text(draw, 68, 269, 21, muted,
+                       !home.network_ready ? tr("Connect to your network first", "请先连接网络") :
+                       receiver_ready ? tr("Ready to receive", "接收服务已就绪") : tr("Receiver unavailable", "接收服务未启动"));
+        const char *steps_en[] = {"Connect your phone to the same network.",
+            airplay ? "Open the AirPlay output in your media app." : "Open a video app that supports DLNA casting.",
+            "Choose Switch TV Box to start playback."};
+        const char *steps_zh[] = {"手机与 Switch 连接同一个局域网。",
+            airplay ? "打开音乐或视频 App，点击 AirPlay。" : "在支持 DLNA 的视频 App 中点击投屏。",
+            "选择 Switch TV Box，开始播放。"};
+        for (int i = 0; i < 3; ++i)
+        {
+            const float y = 337.0f + i * 56.0f;
             char number[] = {(char)('1' + i), '\0'};
-            draw->AddCircleFilled(ImVec2(827, y + 10), 11, IM_COL32(34, 59, 79, 255), 24);
-            centered(number, 827, y + 10, 15, cyan);
-            draw_home_text(draw, 849, y, 19, muted, tr(steps_en[i], steps_zh[i]));
+            draw->AddCircleFilled(ImVec2(64, y + 13), 15, surface, 24);
+            centered(number, 64, y + 13, 18, cyan);
+            clipped(tr(steps_en[i], steps_zh[i]), 96, y, 620, 22, ink);
+        }
+        draw->AddRectFilled(ImVec2(784, 210), ImVec2(1232, 600), surface, 24);
+        screen_icon(977, 253, cyan, airplay ? HOME_FOCUS_AIRPLAY : HOME_FOCUS_DLNA);
+        if (airplay && home.airplay_pin_visible && home.airplay_pin[0])
+        {
+            centered(tr("Pairing code", "配对验证码"), 1008, 352, 21, muted);
+            centered(home.airplay_pin, 1008, 423, 72, ink);
+            centered(tr("Enter this on your device", "请在你的设备上输入"), 1008, 514, 21, muted);
+        }
+        else
+        {
+            centered(tr("Receiver name", "投屏设备名称"), 1008, 352, 21, muted);
+            centered("Switch TV Box", 1008, 409, 33, ink);
+            centered(airplay ? tr("AirPlay 1", "AirPlay 1") : tr("DLNA video receiver", "DLNA 视频接收端"),
+                     1008, 466, 21, muted);
+            centered(airplay ? tr("Audio output is supported", "支持音乐音频输出") : tr("Playback is controlled on your phone", "在手机上控制播放与进度"),
+                     1008, 536, 19, muted);
+        }
+        const bool can_control = home.playback_active && (airplay || !home.audio_playback_active);
+        if (can_control)
+        {
+            draw->AddRectFilled(ImVec2(HOME_PLAYER_LEFT, HOME_PLAYER_TOP), ImVec2(HOME_PLAYER_RIGHT, HOME_PLAYER_BOTTOM), surface, 14);
+            draw->AddRect(ImVec2(HOME_PLAYER_LEFT, HOME_PLAYER_TOP), ImVec2(HOME_PLAYER_RIGHT, HOME_PLAYER_BOTTOM),
+                          home.home_focus == HOME_FOCUS_PLAYER ? cyan : border, 14, 0, 2);
+            centered(home.audio_playback_active ? (music_paused ? tr("A  Resume audio", "A  继续播放") : tr("A  Pause audio", "A  暂停播放")) :
+                     tr("A  Return to playback", "A  返回播放画面"), 264, 551, 23, ink);
         }
     }
-    draw->AddLine(ImVec2(816, 566), ImVec2(1200, 566), border);
-    draw->AddCircleFilled(ImVec2(822, 592), 3, home.dlna_running ? cyan : muted);
-    draw_home_text(draw, 836, 581, 18, muted,
-                   home.dlna_running ? tr("DLNA is also available", "同时支持 DLNA 投屏") : tr("DLNA is unavailable", "DLNA 服务未启动"));
-
     if (home.home_language_save_failed || home.has_error)
     {
-        draw->AddRectFilled(ImVec2(48, 632), ImVec2(1232, 664), IM_COL32(70, 40, 40, 255), 9);
-        clipped(home.home_language_save_failed
-                    ? tr("Language changed; could not save to SD card", "语言已切换，但无法保存到 SD 卡")
-                    : home.error_line, 62, 638, 1156, 18, IM_COL32(255, 190, 172, 255));
+        draw->AddRectFilled(ImVec2(48, 630), ImVec2(1232, 662), IM_COL32(63, 35, 36, 255), 9);
+        clipped(home.home_language_save_failed ? tr("Language changed; could not save to SD card", "语言已切换，但无法保存到 SD 卡") :
+                    home.error_line, 62, 636, 1156, 18, IM_COL32(255, 190, 172, 255));
     }
-    draw_home_text(draw, 48, 685, 16, muted, "Switch TV Box  " NXCAST_APP_VERSION);
+    draw_home_text(draw, 48, 686, 15, muted, "Switch TV Box  " NXCAST_APP_VERSION);
     const SwitchActionHint hints[] = {
-        {"A", home.home_language_focused ? tr("Language", "切换语言") :
-              resume_focused && home.audio_playback_active ? (music_paused ? tr("Play", "继续播放") : tr("Pause", "暂停")) :
-              resume_focused ? tr("Continue", "继续播放") : tr("Open", "打开")},
-        {"X", tr("Live TV", "电视直播")},
-        {"B", tr("Player", "返回播放")},
+        {"A", home.home_focus == HOME_FOCUS_LANGUAGE ? tr("Language", "切换语言") : tr("Select", "选择")},
+        {"B", detail ? tr("Home", "返回主页") : tr("Player", "返回播放")},
         {"+", tr("Exit", "退出")},
     };
-    SwitchActionHint visible_hints[4];
+    SwitchActionHint visible[3];
     int count = 0;
-    for (int i = 0; i < 4; ++i)
-        if (i != 2 || (home.playback_active && !home.audio_playback_active))
-            visible_hints[count++] = hints[i];
-    draw_switch_action_hints(draw, width - 48, 692, visible_hints, count, true);
+    for (int i = 0; i < 3; ++i)
+        if (i != 1 || detail || (home.playback_active && !home.audio_playback_active)) visible[count++] = hints[i];
+    draw_switch_action_hints(draw, width - 48, 693, visible, count, true);
 }
 
 struct BrowserPalette
@@ -1515,7 +1490,7 @@ void browser_button(ImDrawList *draw, PlayerBrowserRect r, const char *label,
     if (focused && primary)
         draw->AddRect(ImVec2(r.x + 4, r.y + 4), ImVec2(r.x + r.w - 4, r.y + r.h - 4), color, 8, 0, 1);
     const bool dropdown = icon == PLAYER_BROWSER_CATEGORIES || icon == PLAYER_BROWSER_SOURCE_FILTER;
-    const bool leading = icon >= 0 && icon != PLAYER_BROWSER_CATEGORIES;
+    const bool leading = icon >= 0 && icon != PLAYER_BROWSER_CATEGORIES && icon != PLAYER_BROWSER_ALL;
     float size = key ? 21.0f : 20.0f;
     const float key_width = key ? std::max(28.0f, text_width(14, key) + 14) : 0;
     const float prefix = key ? key_width + (label[0] ? 10 : 0) : leading ? 22 : 0;
@@ -1642,18 +1617,20 @@ void draw_iptv_panel(ImDrawList *draw, const PlayerHomeViewState &home, float wi
         browser_button(draw, player_browser_expand_rect(&v), home_ui_text("X  Full list", "X  全屏列表"), p, false);
 
     const char *toolbar[] = {
-        home_ui_text("Categories", "全部分类"), home_ui_text("Favorites", "收藏"),
-        home_ui_text("Recent", "最近观看"), home_ui_text("Search", "搜索"), home_ui_text("Sources", "直播源")};
+        home_ui_text("All", "全部频道"), home_ui_text("Favorites", "收藏"),
+        home_ui_text("Categories", "分类"), home_ui_text("Recent", "最近"),
+        home_ui_text("Search", "搜索"), home_ui_text("Sources", "直播源")};
     const int filter = iptv_get_filter_index();
     for (int i = 0; i < PLAYER_BROWSER_TOOLBAR_COUNT; ++i)
     {
-        const bool active = (i == PLAYER_BROWSER_CATEGORIES && filter >= 3) ||
+        const bool active = (i == PLAYER_BROWSER_ALL && filter == 0) ||
+                            (i == PLAYER_BROWSER_CATEGORIES && filter >= 3) ||
                             (i == PLAYER_BROWSER_FAVORITES && filter == 1) ||
                             (i == PLAYER_BROWSER_RECENT && filter == 2) ||
                             (i == PLAYER_BROWSER_SEARCH && home.iptv_search[0]) ||
                             (i == PLAYER_BROWSER_SOURCE_FILTER && iptv_get_source_filter());
         browser_button(draw, player_browser_toolbar_rect(&v, i), toolbar[i], p,
-                       v.focus == PLAYER_BROWSER_FOCUS_TOOLBAR && v.toolbar_focus == i, active, i);
+                       v.focus == PLAYER_BROWSER_FOCUS_TOOLBAR && v.toolbar_focus == i, active, drawer ? -1 : i);
     }
 
     const PlayerBrowserRect list = player_browser_list_rect(&v);
@@ -1740,10 +1717,13 @@ void draw_iptv_panel(ImDrawList *draw, const PlayerHomeViewState &home, float wi
     if (v.item_count == 0)
     {
         browser_text(draw, {list.x + 20, list.y + 130, list.w - 40, 40},
-                     home_ui_text("No matching channels", "没有符合条件的频道"), 26, p.text);
+                     filter == 1 ? home_ui_text("No favourite channels yet", "还没有收藏频道") :
+                         home_ui_text("No matching channels", "没有符合条件的频道"), 26, p.text);
         browser_text(draw, {list.x + 20, list.y + 178, list.w - 40, 36},
-                     home_ui_text("Change filters, or open Sources to add a playlist.",
-                                  "更换筛选条件，或打开直播源添加列表。"), drawer ? 16 : 20, p.muted);
+                     filter == 1 ? home_ui_text("Choose All, select a channel and press Y to save it.",
+                                               "在全部频道中选中频道，按 Y 收藏。") :
+                         home_ui_text("Change filters, or open Sources to add a playlist.",
+                                      "更换筛选条件，或打开直播源添加列表。"), drawer ? 16 : 20, p.muted);
     }
     draw->PopClipRect();
     PlayerBrowserRect track = player_browser_scrollbar_rect(&v, false);
@@ -1756,8 +1736,10 @@ void draw_iptv_panel(ImDrawList *draw, const PlayerHomeViewState &home, float wi
         home_ui_text("Add URL", "添加网址"), home_ui_text("Scan SD", "扫描 SD 卡"),
         home_ui_text("Refresh", "刷新"), home_ui_text("Programme guide", "设置节目单"),
         home_ui_text("Delete", "删除")};
+    IptvChannel selected_channel = {};
+    const bool selected_favorite = !sources && iptv_get_channel(v.selected_index, &selected_channel) && selected_channel.favorite;
     const char *channel_actions[] = {
-        home_ui_text("Play", "播放"), home_ui_text("Favorite", "收藏")};
+        home_ui_text("Play", "播放"), selected_favorite ? home_ui_text("Unfavorite", "取消收藏") : home_ui_text("Favorite", "收藏")};
     for (int i = 0; i < player_browser_action_count(&v); ++i)
         browser_button(draw, player_browser_action_rect(&v, i), sources ? source_actions[i] : channel_actions[i], p,
                        v.focus == PLAYER_BROWSER_FOCUS_ACTIONS && v.action_focus == i, !sources && i == 0,

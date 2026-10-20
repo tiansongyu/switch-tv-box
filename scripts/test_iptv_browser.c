@@ -47,6 +47,30 @@ static void test_navigation(void)
     assert(b.view.page == PLAYER_BROWSER_CLOSED);
     assert(press(&b, PLAYER_BROWSER_ACCEPT).kind == PLAYER_BROWSER_ACTION_NONE);
 }
+static void test_favorites_and_all(void)
+{
+    for (int playback = 0; playback <= 1; ++playback)
+    {
+        PlayerBrowser b = fresh(playback);
+        PlayerBrowserAction a = tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_FAVORITES));
+        assert(a.kind == PLAYER_BROWSER_ACTION_FILTER && a.index == 1);
+        a = tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_ALL));
+        assert(a.kind == PLAYER_BROWSER_ACTION_FILTER && a.index == 0);
+        b.view.focus = PLAYER_BROWSER_FOCUS_ROWS;
+        press(&b, PLAYER_BROWSER_DOWN);
+        a = press(&b, PLAYER_BROWSER_FAVORITE_KEY);
+        assert(a.kind == PLAYER_BROWSER_ACTION_FAVORITE && a.index == 1);
+        a = tap(&b, player_browser_action_rect(&b.view, 1));
+        assert(a.kind == PLAYER_BROWSER_ACTION_FAVORITE && a.index == 1);
+        a = press(&b, PLAYER_BROWSER_ACCEPT);
+        assert(a.kind == PLAYER_BROWSER_ACTION_FAVORITE && a.index == 1);
+        b.view.focus = PLAYER_BROWSER_FOCUS_ROWS;
+        a = press(&b, PLAYER_BROWSER_ACCEPT);
+        assert(a.kind == PLAYER_BROWSER_ACTION_PLAY && a.index == 1);
+        press(&b, PLAYER_BROWSER_BACK);
+        assert(b.view.page == PLAYER_BROWSER_CLOSED);
+    }
+}
 static void test_acceleration(void)
 {
     PlayerBrowser b = fresh(false);
@@ -143,7 +167,7 @@ static void test_flick(void)
 static void test_modals_and_sources(void)
 {
     PlayerBrowser b = fresh(true);
-    tap(&b, player_browser_toolbar_rect(&b.view, 0));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_CATEGORIES));
     assert(b.view.modal == PLAYER_BROWSER_MODAL_CATEGORIES && b.view.modal_count == 67);
     for (int i = 0; i < 8; i++)
         press(&b, PLAYER_BROWSER_DOWN);
@@ -151,21 +175,21 @@ static void test_modals_and_sources(void)
     PlayerBrowserAction a = press(&b, PLAYER_BROWSER_ACCEPT);
     assert(a.kind == PLAYER_BROWSER_ACTION_FILTER && a.index == 24);
     assert(b.view.modal == PLAYER_BROWSER_MODAL_NONE && b.view.page == PLAYER_BROWSER_DRAWER);
-    tap(&b, player_browser_toolbar_rect(&b.view, 4));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_SOURCE_FILTER));
     a = tap(&b, player_browser_modal_item_rect(&b.view, 0));
     assert(a.kind == PLAYER_BROWSER_ACTION_SOURCE_FILTER && a.index == -1);
-    tap(&b, player_browser_toolbar_rect(&b.view, 4));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_SOURCE_FILTER));
     press(&b, PLAYER_BROWSER_DOWN);
     press(&b, PLAYER_BROWSER_DOWN);
     a = press(&b, PLAYER_BROWSER_ACCEPT);
     assert(a.kind == PLAYER_BROWSER_ACTION_SOURCE_FILTER && a.index == 0);
-    tap(&b, player_browser_toolbar_rect(&b.view, 4));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_SOURCE_FILTER));
     for (int i = 0; i < 33; i++)
         press(&b, PLAYER_BROWSER_DOWN);
     assert(b.view.modal_cursor == 33 && b.view.modal_first_index == 30);
     a = press(&b, PLAYER_BROWSER_ACCEPT);
     assert(a.kind == PLAYER_BROWSER_ACTION_SOURCE_FILTER && a.index == 31);
-    tap(&b, player_browser_toolbar_rect(&b.view, 4));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_SOURCE_FILTER));
     press(&b, PLAYER_BROWSER_DOWN);
     press(&b, PLAYER_BROWSER_ACCEPT);
     assert(b.view.page == PLAYER_BROWSER_SOURCES && b.view.playback_active);
@@ -189,7 +213,7 @@ static void test_modals_and_sources(void)
     assert(press(&b, PLAYER_BROWSER_ACCEPT).kind == PLAYER_BROWSER_ACTION_DELETE);
     press(&b, PLAYER_BROWSER_BACK);
     assert(b.view.page == PLAYER_BROWSER_DRAWER);
-    tap(&b, player_browser_toolbar_rect(&b.view, 0));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_CATEGORIES));
     press(&b, PLAYER_BROWSER_BACK);
     assert(b.view.page == PLAYER_BROWSER_DRAWER && b.view.modal == PLAYER_BROWSER_MODAL_NONE);
     press(&b, PLAYER_BROWSER_BACK);
@@ -198,17 +222,17 @@ static void test_modals_and_sources(void)
 static void test_modal_touch_and_empty_sources(void)
 {
     PlayerBrowser b = fresh(false);
-    assert(tap(&b, player_browser_toolbar_rect(&b.view, 1)).index == 1);
-    assert(tap(&b, player_browser_toolbar_rect(&b.view, 2)).index == 2);
-    assert(tap(&b, player_browser_toolbar_rect(&b.view, 3)).kind == PLAYER_BROWSER_ACTION_SEARCH);
-    tap(&b, player_browser_toolbar_rect(&b.view, 0));
+    assert(tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_FAVORITES)).index == 1);
+    assert(tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_RECENT)).index == 2);
+    assert(tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_SEARCH)).kind == PLAYER_BROWSER_ACTION_SEARCH);
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_CATEGORIES));
     player_browser_touch(&b, true, 220, 400, 5000);
     player_browser_touch(&b, true, 220, 200, 5040);
     assert(player_browser_touch(&b, false, 0, 0, 5050).kind == PLAYER_BROWSER_ACTION_NONE);
     assert(b.view.modal == PLAYER_BROWSER_MODAL_CATEGORIES && b.view.modal_first_index > 0);
     press(&b, PLAYER_BROWSER_BACK);
     player_browser_sync(&b, 0, 0, 3, 0);
-    tap(&b, player_browser_toolbar_rect(&b.view, 4));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_SOURCE_FILTER));
     assert(b.view.modal_count == 2);
     press(&b, PLAYER_BROWSER_DOWN);
     press(&b, PLAYER_BROWSER_ACCEPT);
@@ -220,7 +244,7 @@ static void test_modal_touch_and_empty_sources(void)
     assert(tap(&b, player_browser_action_rect(&b.view, 0)).kind == PLAYER_BROWSER_ACTION_ADD_URL);
     assert(tap(&b, player_browser_action_rect(&b.view, 1)).kind == PLAYER_BROWSER_ACTION_SCAN_SD);
     /* Reopening Manage while already there must not overwrite its parent. */
-    tap(&b, player_browser_toolbar_rect(&b.view, 4));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_SOURCE_FILTER));
     press(&b, PLAYER_BROWSER_DOWN);
     press(&b, PLAYER_BROWSER_ACCEPT);
     press(&b, PLAYER_BROWSER_BACK);
@@ -233,7 +257,7 @@ static void test_transition_capture(void)
     PlayerBrowser b = fresh(false);
     player_browser_sync(&b, 200, 125, 67, 32);
     float saved = b.view.scroll_offset;
-    tap(&b, player_browser_toolbar_rect(&b.view, 4));
+    tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_SOURCE_FILTER));
     /* Holding Down while a modal opens cannot move its new cursor. */
     for (uint64_t t = 6000; t < 8000; t += 20)
         player_browser_input(&b, 0, PLAYER_BROWSER_DOWN, t);
@@ -276,6 +300,7 @@ int main(void)
     assert(player_iptv_video_menu_available(true, 10000));
     assert(!player_iptv_video_menu_available(false, 10000));
     test_navigation();
+    test_favorites_and_all();
     test_acceleration();
     test_touch();
     test_flick();

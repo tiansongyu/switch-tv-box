@@ -218,14 +218,23 @@ void player_view_sync(const PlayerSnapshot *snapshot)
     now_ms = monotonic_time_ms();
     PlayerViewMode previous_desired = g_view.status.desired_view;
     const char *next_uri = snapshot->has_media ? snapshot->media.uri : NULL;
+    const bool session_active = should_show_video_view(snapshot);
+    const bool audio_only = player_media_is_airplay_audio(&snapshot->media);
 
     media_changed = (g_view.status.media_uri == NULL) != (next_uri == NULL) ||
                     (g_view.status.media_uri && next_uri && strcmp(g_view.status.media_uri, next_uri) != 0);
-    if (media_changed && next_uri)
+    /* A controller can replay the same URL after Stop. The previous session's
+     * home navigation must not hide the new video. Pause/resume within a live
+     * session still respects a deliberate visit to home. AirPlay audio and
+     * mirroring also share a URI, so compare their presentation kind. */
+    const bool session_started = session_active && !g_view.status.session_active;
+    if (next_uri && (media_changed || session_started ||
+                     audio_only != g_view.media_audio_only))
         g_view.home_override = false;
 
+    g_view.media_audio_only = audio_only;
     g_view.status.has_media = snapshot->has_media;
-    g_view.status.session_active = should_show_video_view(snapshot);
+    g_view.status.session_active = session_active;
     g_view.status.player_state = snapshot->state;
 
     if (g_view.status.session_active)
@@ -233,7 +242,7 @@ void player_view_sync(const PlayerSnapshot *snapshot)
         g_view.last_video_state_ms = now_ms;
         g_view.stop_hold_until_ms = 0;
         g_view.status.desired_view =
-            g_view.home_override || player_media_is_airplay_audio(&snapshot->media) ?
+            g_view.home_override || audio_only ?
                 PLAYER_VIEW_HOME : PLAYER_VIEW_VIDEO;
     }
     else

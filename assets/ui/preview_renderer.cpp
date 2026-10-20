@@ -79,22 +79,43 @@ int main(int argc, char **argv)
     int tw, th;
     io.Fonts->GetTexDataAsAlpha8(&atlas, &tw, &th);
     io.Fonts->SetTexID((ImTextureID)1);
-    home_ui_init(nullptr, strcmp(scenario, "english") != 0);
+    home_ui_init(nullptr, strncmp(scenario, "english", 7) != 0);
     PlayerHomeViewState home = {};
     home.storage_ready = home.video_ready = home.network_ready = true;
     home.dlna_running = home.airplay_running = true;
     home.iptv_channel_count = 128;
     home.iptv_source_count = 3;
+    home.iptv_favorite_count = 12;
+    home.home_focus = HOME_FOCUS_TV;
     snprintf(home.ip_address, sizeof(home.ip_address), "192.168.1.108");
     snprintf(home.iptv_last_name, sizeof(home.iptv_last_name), "%s", home_ui_text("CCTV 9 · Documentary", "CCTV 9 · 纪录频道"));
-    if (!strcmp(scenario, "playing")) home.playback_active = home.iptv_playback_active = home.player_focused = true;
+    if (!strcmp(scenario, "playing"))
+    {
+        home.playback_active = true;
+        home.home_page = HOME_PAGE_DLNA;
+        home.home_focus = HOME_FOCUS_PLAYER;
+    }
+    if (!strcmp(scenario, "airplay") || !strcmp(scenario, "english-airplay"))
+    {
+        home.home_page = HOME_PAGE_AIRPLAY;
+        home.home_focus = HOME_FOCUS_BACK;
+    }
+    if (!strcmp(scenario, "dlna") || !strcmp(scenario, "english-dlna"))
+    {
+        home.home_page = HOME_PAGE_DLNA;
+        home.home_focus = HOME_FOCUS_BACK;
+    }
     if (!strcmp(scenario, "music") || !strcmp(scenario, "music-paused"))
     {
         home.playback_active = home.audio_playback_active = home.player_focused = true;
+        home.home_page = HOME_PAGE_AIRPLAY;
+        home.home_focus = HOME_FOCUS_PLAYER;
         home.playback_state = !strcmp(scenario, "music-paused") ? PLAYER_STATE_PAUSED : PLAYER_STATE_PLAYING;
     }
     if (!strcmp(scenario, "pairing"))
     {
+        home.home_page = HOME_PAGE_AIRPLAY;
+        home.home_focus = HOME_FOCUS_BACK;
         home.airplay_pin_visible = true;
         snprintf(home.airplay_pin, sizeof(home.airplay_pin), "4831");
     }
@@ -112,7 +133,24 @@ int main(int argc, char **argv)
         snprintf(home.iptv_last_name, sizeof(home.iptv_last_name), "超长频道名称测试：纪录片 / 旅行 / 城市风景 / 音乐现场 / 无损画质 / 周末精选节目");
     }
     ImGui::NewFrame();
-    draw_home_screen(ImGui::GetBackgroundDrawList(), home, 1280, 720);
+    if (!strncmp(scenario, "iptv", 4))
+    {
+        preview_filter = strstr(scenario, "favorites") ? 1 : 0;
+        preview_channels = strstr(scenario, "empty") ? 0 : 20;
+        PlayerBrowser browser;
+        player_browser_init(&browser);
+        player_browser_open(&browser, !strcmp(scenario, "iptv-drawer"));
+        player_browser_sync(&browser, preview_channels, 3, 4, 1);
+        home.iptv_browser = browser.view;
+        home.iptv_playback_active = !strcmp(scenario, "iptv-drawer");
+        home.iptv_channel_count = 20;
+        home.iptv_visible_count = preview_channels;
+        snprintf(home.iptv_active_filter, sizeof(home.iptv_active_filter), "%s", preview_filter ? "收藏" : "全部频道");
+        snprintf(home.iptv_status, sizeof(home.iptv_status), "上 / 下选择 · A 切台 · Y 收藏 / 取消收藏 · B 返回");
+        draw_iptv_panel(ImGui::GetBackgroundDrawList(), home, 1280, 720);
+    }
+    else
+        draw_home_screen(ImGui::GetBackgroundDrawList(), home, 1280, 720);
     ImGui::Render();
     write_preview(argv[2], ImGui::GetDrawData(), atlas, tw, th);
     ImGui::DestroyContext();

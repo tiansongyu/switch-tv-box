@@ -53,7 +53,7 @@ PlayerBrowserRect player_browser_row_rect(const PlayerBrowserView *v, int i)
 
 PlayerBrowserRect player_browser_toolbar_rect(const PlayerBrowserView *v, int i)
 {
-    float w = (player_browser_panel_rect(v).w - 48) / 5;
+    float w = (player_browser_panel_rect(v).w - 48) / PLAYER_BROWSER_TOOLBAR_COUNT;
     return (PlayerBrowserRect){24 + i * w, 110, w - 4, 40};
 }
 
@@ -206,6 +206,8 @@ static PlayerBrowserAction toolbar(PlayerBrowser *b)
 {
     switch (b->view.toolbar_focus)
     {
+    case PLAYER_BROWSER_ALL:
+        return action(PLAYER_BROWSER_ACTION_FILTER, 0);
     case PLAYER_BROWSER_CATEGORIES:
         modal(b, PLAYER_BROWSER_MODAL_CATEGORIES, b->filter_count);
         break;
@@ -319,7 +321,7 @@ static void navigate(PlayerBrowser *b, unsigned d)
     if (v->focus == PLAYER_BROWSER_FOCUS_TOOLBAR)
     {
         if (d == PLAYER_BROWSER_LEFT || d == PLAYER_BROWSER_RIGHT)
-            v->toolbar_focus = (v->toolbar_focus + (d == PLAYER_BROWSER_LEFT ? 4 : 1)) % 5;
+            v->toolbar_focus = (v->toolbar_focus + (d == PLAYER_BROWSER_LEFT ? PLAYER_BROWSER_TOOLBAR_COUNT - 1 : 1)) % PLAYER_BROWSER_TOOLBAR_COUNT;
         else if (d == PLAYER_BROWSER_DOWN)
             v->focus = PLAYER_BROWSER_FOCUS_ROWS;
     }
@@ -533,7 +535,7 @@ PlayerBrowserAction player_browser_touch(PlayerBrowser *b, bool down, float x, f
             v->page = PLAYER_BROWSER_LIBRARY;
         return none();
     }
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < PLAYER_BROWSER_TOOLBAR_COUNT; i++)
         if (hit(player_browser_toolbar_rect(v, i), x, y))
         {
             v->toolbar_focus = i;
