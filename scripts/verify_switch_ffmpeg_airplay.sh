@@ -35,7 +35,7 @@ trap cleanup EXIT
 "${NM}" -g --defined-only "${LIBAVFORMAT}" > "${WORK_DIR}/libavformat.symbols"
 "${NM}" -A -g --undefined-only "${LIBAVUTIL}" > "${WORK_DIR}/libavutil.undefined"
 
-for symbol in ff_alac_decoder ff_h264_parser; do
+for symbol in ff_alac_decoder ff_aac_decoder ff_pcm_s16be_decoder ff_png_decoder ff_mjpeg_decoder ff_h264_parser; do
     if ! grep -Eq "[[:space:]]${symbol}$" "${WORK_DIR}/libavcodec.symbols"; then
         echo "Switch FFmpeg is missing required libavcodec symbol: ${symbol}" >&2
         exit 1
@@ -52,4 +52,11 @@ if ! grep -Eq 'random_seed\.o:.*[[:space:]]U[[:space:]]randomGet$' "${WORK_DIR}/
     exit 1
 fi
 
-echo "Switch FFmpeg verified at ${PREFIX}: ALAC decoder, H.264 parser, Matroska muxer, libnx random"
+for symbol in ff_image_jpeg_pipe_demuxer ff_image_png_pipe_demuxer; do
+    if ! grep -Eq "[[:space:]]${symbol}$" "${WORK_DIR}/libavformat.symbols"; then
+        echo "Switch FFmpeg is missing required image demuxer: ${symbol}" >&2
+        exit 1
+    fi
+done
+
+echo "Switch FFmpeg verified at ${PREFIX}: ALAC/AAC/PCM, JPEG/PNG, H.264, Matroska, libnx random"

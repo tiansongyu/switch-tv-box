@@ -14,3 +14,12 @@ NX-Cast.elf
 NX-Cast.nro
 NX-Cast.nacp
 NX-Cast.lst
+
+# Switch TV Box local outputs
+switch-tv-box.elf
+switch-tv-box.nacp
+switch-tv-box.nro
+switch-tv-box.lst
+switch-tv-box.map
+.deps/
+.runtime/

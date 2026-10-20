@@ -20,12 +20,12 @@ typedef struct
     bool use_template_values;
 } ScpdRoute;
 
-static const char g_defaultFriendlyName[] = "NX-Cast";
+static const char g_defaultFriendlyName[] = "Switch TV Box";
 static const char g_defaultUrlBase[] = "";
 static const char g_defaultManufacturer[] = "Ode1l";
 static const char g_defaultManufacturerUrl[] = "";
 static const char g_defaultModelDescription[] = "Nintendo Switch DLNA Media Renderer";
-static const char g_defaultModelName[] = "NX-Cast Virtual Renderer";
+static const char g_defaultModelName[] = "Switch TV Box Virtual Renderer";
 static const char g_defaultModelNumber[] = "0.1.0";
 static const char g_defaultModelUrl[] = "";
 static const char g_defaultSerialNumber[] = "00000001";

@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 #ifndef NXCAST_APP_VERSION
-#define NXCAST_APP_VERSION "0.3.2"
+#define NXCAST_APP_VERSION "0.1.0"
 #endif
 
 const char *dlna_server_info_get(void)
@@ -22,14 +22,14 @@ const char *dlna_server_info_get(void)
         {
             snprintf(server_info,
                      sizeof(server_info),
-                     "NintendoSwitch/unknown UPnP/1.0 NX-Cast/%s",
+                     "NintendoSwitch/unknown UPnP/1.0 Switch TV Box/%s",
                      NXCAST_APP_VERSION);
         }
         else
         {
             snprintf(server_info,
                      sizeof(server_info),
-                     "NintendoSwitch/%u.%u.%u UPnP/1.0 NX-Cast/%s",
+                     "NintendoSwitch/%u.%u.%u UPnP/1.0 Switch TV Box/%s",
                      (unsigned)HOSVER_MAJOR(hos),
                      (unsigned)HOSVER_MINOR(hos),
                      (unsigned)HOSVER_MICRO(hos),

@@ -66,7 +66,7 @@ bool iptv_fetch_to_file(const char *url,
         return false;
     }
     remove(temporary);
-    av_dict_set(&options, "user_agent", "NX-Cast/0.1 IPTV", 0);
+    av_dict_set(&options, "user_agent", "Switch TV Box/0.1 IPTV", 0);
     av_dict_set(&options, "rw_timeout", "3000000", 0);
     av_dict_set(&options, "reconnect", "1", 0);
     av_dict_set(&options, "reconnect_streamed", "1", 0);

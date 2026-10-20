@@ -2,7 +2,53 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "NX-Cast: Clean",
+      "label": "TV Box: Build and package (Docker)",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/build-local.sh",
+        "build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "TV Box: Tests (Docker)",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/build-local.sh",
+        "test"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "TV Box: Preview home UI",
+      "type": "shell",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/scripts/preview_home.py"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "switch-tv-box: Clean",
       "type": "process",
       "command": "bash",
       "args": [
@@ -31,7 +77,7 @@
       }
     },
     {
-      "label": "NX-Cast: Compile",
+      "label": "switch-tv-box: Compile",
       "type": "process",
       "command": "bash",
       "args": [
@@ -62,7 +108,7 @@
       }
     },
     {
-      "label": "NX-Cast: Compile Full Trace",
+      "label": "switch-tv-box: Compile Full Trace",
       "type": "process",
       "command": "bash",
       "args": [
@@ -93,7 +139,7 @@
       }
     },
     {
-      "label": "NX-Cast: Upload",
+      "label": "switch-tv-box: Upload",
       "type": "process",
       "command": "bash",
       "args": [
@@ -122,7 +168,7 @@
       }
     },
     {
-      "label": "NX-Cast: Upload + Logs",
+      "label": "switch-tv-box: Upload + Logs",
       "type": "process",
       "command": "bash",
       "args": [
@@ -151,7 +197,7 @@
       }
     },
     {
-      "label": "NX-Cast: Build Release",
+      "label": "switch-tv-box: Build Release",
       "type": "process",
       "command": "bash",
       "args": [
@@ -182,7 +228,7 @@
       }
     },
     {
-      "label": "NX-Cast: Package SD ZIP",
+      "label": "switch-tv-box: Package SD ZIP",
       "type": "process",
       "command": "bash",
       "args": [
@@ -211,7 +257,7 @@
       }
     },
     {
-      "label": "NX-Cast: Publish GitHub Release",
+      "label": "switch-tv-box: Publish GitHub Release",
       "type": "process",
       "command": "bash",
       "args": [
@@ -240,22 +286,22 @@
       }
     },
     {
-      "label": "NX-Cast: Rebuild + Upload",
+      "label": "switch-tv-box: Rebuild + Upload",
       "dependsOrder": "sequence",
       "dependsOn": [
-        "NX-Cast: Clean",
-        "NX-Cast: Compile",
-        "NX-Cast: Upload"
+        "switch-tv-box: Clean",
+        "switch-tv-box: Compile",
+        "switch-tv-box: Upload"
       ],
       "problemMatcher": []
     },
     {
-      "label": "NX-Cast: Full Trace + Upload + Logs",
+      "label": "switch-tv-box: Full Trace + Upload + Logs",
       "dependsOrder": "sequence",
       "dependsOn": [
-        "NX-Cast: Clean",
-        "NX-Cast: Compile Full Trace",
-        "NX-Cast: Upload + Logs"
+        "switch-tv-box: Clean",
+        "switch-tv-box: Compile Full Trace",
+        "switch-tv-box: Upload + Logs"
       ],
       "problemMatcher": []
     }

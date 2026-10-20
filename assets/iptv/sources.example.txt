@@ -1,4 +1,4 @@
-# NX-Cast preinstalled IPTV sources
+# Switch TV Box preinstalled IPTV sources
 #
 # Copy this file to sources.txt in the same directory, then add one source per
 # line. HTTPS is recommended. Blank lines and lines beginning with # are ignored.

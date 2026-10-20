@@ -34,7 +34,7 @@ class WorkflowTests(unittest.TestCase):
         self.executable("make", '#!/bin/sh\n[ "$NXCAST_FIXTURE_SDK" = 1 ] || exit 90\nprintf "%s\\n" "$*" >> "$FIXTURE_CALLS"\n')
         self.executable("nxlink", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$FIXTURE_CALLS"\nexit "${FIXTURE_UPLOAD_EXIT:-0}"\n')
         self.env["NXLINK_BIN"] = str(self.bin / "nxlink")
-        (self.root / "NX-Cast.nro").write_bytes(b"fixture")
+        (self.root / "switch-tv-box.nro").write_bytes(b"fixture")
 
     def executable(self, name, content):
         path = self.bin / name
@@ -83,7 +83,7 @@ class WorkflowTests(unittest.TestCase):
     def release_fixture(self):
         (self.root / "makefile").write_text("APP_VERSION := 0.0.1\n")
         (self.root / ".github").mkdir()
-        (self.root / ".github/release-notes.md").write_text("# NX-Cast v0.0.1 Release Notes\n")
+        (self.root / ".github/release-notes.md").write_text("# switch-tv-box v0.0.1 Release Notes\n")
         self.remote = self.base / "remote.git"
         self.run_command("git", "init", "--bare", "--initial-branch=main", str(self.remote))
         self.run_command("git", "init", "--initial-branch=main")
@@ -108,7 +108,7 @@ class WorkflowTests(unittest.TestCase):
     def test_publish_accepts_crlf_metadata(self):
         self.release_fixture()
         (self.root / "makefile").write_bytes(b"APP_VERSION := 0.0.1\r\n")
-        (self.root / ".github/release-notes.md").write_bytes(b"# NX-Cast v0.0.1 Release Notes\r\n")
+        (self.root / ".github/release-notes.md").write_bytes(b"# switch-tv-box v0.0.1 Release Notes\r\n")
         self.run_command("git", "add", ".")
         self.run_command("git", "commit", "-m", "CRLF metadata")
         self.run_command("bash", "scripts/dev.sh", "publish")

@@ -23,7 +23,7 @@
 #include "player/trace.h"
 #include "player/ui/home.h"
 
-#define IPTV_BASE_DIR "sdmc:/switch/NX-Cast"
+#define IPTV_BASE_DIR "sdmc:/switch/switch-tv-box"
 #define IPTV_CACHE_DIR IPTV_ROOT_DIR "/cache"
 #define IPTV_PLAYLIST_CACHE_DIR IPTV_CACHE_DIR "/playlists"
 #define IPTV_EPG_CACHE_DIR IPTV_CACHE_DIR "/epg"

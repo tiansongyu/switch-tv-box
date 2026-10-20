@@ -7,7 +7,7 @@ LOG_DIR="${PROJECT_ROOT}/logs"
 mkdir -p "$LOG_DIR"
 
 NXLINK_BIN=${NXLINK_BIN:-nxlink}
-NRO_PATH=${1:-${PROJECT_ROOT}/NX-Cast.nro}
+NRO_PATH=${1:-${PROJECT_ROOT}/switch-tv-box.nro}
 SWITCH_IP=${SWITCH_IP:-}
 NO_BUILD=${NO_BUILD:-0}
 BUILD_JOBS=${BUILD_JOBS:-4}

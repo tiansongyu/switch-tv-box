@@ -4,13 +4,13 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 DIST_DIR="${ROOT_DIR}/dist"
 SDMC_DIR="${DIST_DIR}/sdmc"
-PACKAGE="${DIST_DIR}/NX-Cast-sdmc.zip"
+PACKAGE="${DIST_DIR}/switch-tv-box-sdmc.zip"
 IPTV_SOURCES="${ROOT_DIR}/assets/iptv/sources.txt"
-PACKAGED_IPTV_SOURCES="${SDMC_DIR}/switch/NX-Cast/iptv/sources.txt"
+PACKAGED_IPTV_SOURCES="${SDMC_DIR}/switch/switch-tv-box/iptv/sources.txt"
 AIRPLAY_README="${ROOT_DIR}/assets/airplay/README.txt"
-PACKAGED_AIRPLAY_README="${SDMC_DIR}/switch/NX-Cast/airplay/README.txt"
+PACKAGED_AIRPLAY_README="${SDMC_DIR}/switch/switch-tv-box/airplay/README.txt"
 PLAYFAIR_LICENSE="${ROOT_DIR}/assets/licenses/LICENSE.PlayFair.GPLv3.txt"
-PACKAGED_PLAYFAIR_LICENSE="${SDMC_DIR}/switch/NX-Cast/licenses/LICENSE.PlayFair.GPLv3.txt"
+PACKAGED_PLAYFAIR_LICENSE="${SDMC_DIR}/switch/switch-tv-box/licenses/LICENSE.PlayFair.GPLv3.txt"
 RELEASE_ATTESTATION="${ROOT_DIR}/build/release-features.txt"
 
 if [ "${NXCAST_ALLOW_UNVERIFIED_PACKAGE:-0}" != "1" ]; then
@@ -27,15 +27,15 @@ if [ "${NXCAST_ALLOW_UNVERIFIED_PACKAGE:-0}" != "1" ]; then
     fi
 fi
 
-if [ ! -f "${ROOT_DIR}/NX-Cast.nro" ]; then
-    echo "NX-Cast.nro not found. Run make before packaging." >&2
+if [ ! -f "${ROOT_DIR}/switch-tv-box.nro" ]; then
+    echo "switch-tv-box.nro not found. Run make before packaging." >&2
     exit 1
 fi
 
 if [ "${NXCAST_MIN_NRO_SIZE:-0}" -gt 0 ]; then
-    actual_size=$(wc -c < "${ROOT_DIR}/NX-Cast.nro" | tr -d ' ')
+    actual_size=$(wc -c < "${ROOT_DIR}/switch-tv-box.nro" | tr -d ' ')
     if [ "${actual_size}" -lt "${NXCAST_MIN_NRO_SIZE}" ]; then
-        echo "NX-Cast.nro is too small (${actual_size} bytes). Expected at least ${NXCAST_MIN_NRO_SIZE} bytes." >&2
+        echo "switch-tv-box.nro is too small (${actual_size} bytes). Expected at least ${NXCAST_MIN_NRO_SIZE} bytes." >&2
         exit 1
     fi
 fi
@@ -61,32 +61,32 @@ if [ ! -s "${PLAYFAIR_LICENSE}" ]; then
 fi
 
 rm -rf "${SDMC_DIR}" "${PACKAGE}"
-mkdir -p "${SDMC_DIR}/switch/NX-Cast/dlna" \
-    "${SDMC_DIR}/switch/NX-Cast/fonts" \
-    "${SDMC_DIR}/switch/NX-Cast/iptv" \
-    "${SDMC_DIR}/switch/NX-Cast/airplay" \
-    "${SDMC_DIR}/switch/NX-Cast/licenses"
+mkdir -p "${SDMC_DIR}/switch/switch-tv-box/dlna" \
+    "${SDMC_DIR}/switch/switch-tv-box/fonts" \
+    "${SDMC_DIR}/switch/switch-tv-box/iptv" \
+    "${SDMC_DIR}/switch/switch-tv-box/airplay" \
+    "${SDMC_DIR}/switch/switch-tv-box/licenses"
 
-cp "${ROOT_DIR}/NX-Cast.nro" "${SDMC_DIR}/switch/NX-Cast/NX-Cast.nro"
-cp "${ROOT_DIR}/assets/dlna/"* "${SDMC_DIR}/switch/NX-Cast/dlna/"
+cp "${ROOT_DIR}/switch-tv-box.nro" "${SDMC_DIR}/switch/switch-tv-box/switch-tv-box.nro"
+cp "${ROOT_DIR}/assets/dlna/"* "${SDMC_DIR}/switch/switch-tv-box/dlna/"
 if [ -d "${ROOT_DIR}/assets/fonts" ]; then
-    cp "${ROOT_DIR}/assets/fonts/"* "${SDMC_DIR}/switch/NX-Cast/fonts/"
+    cp "${ROOT_DIR}/assets/fonts/"* "${SDMC_DIR}/switch/switch-tv-box/fonts/"
 fi
 if [ -d "${ROOT_DIR}/assets/iptv" ]; then
-    cp "${ROOT_DIR}/assets/iptv/"* "${SDMC_DIR}/switch/NX-Cast/iptv/"
+    cp "${ROOT_DIR}/assets/iptv/"* "${SDMC_DIR}/switch/switch-tv-box/iptv/"
 fi
 cp "${AIRPLAY_README}" "${PACKAGED_AIRPLAY_README}"
 if [ -d "${ROOT_DIR}/assets/licenses" ]; then
-    cp "${ROOT_DIR}/assets/licenses/"* "${SDMC_DIR}/switch/NX-Cast/licenses/"
+    cp "${ROOT_DIR}/assets/licenses/"* "${SDMC_DIR}/switch/switch-tv-box/licenses/"
 fi
-cp "${ROOT_DIR}/LICENSE" "${SDMC_DIR}/switch/NX-Cast/licenses/LICENSE.NX-Cast.txt"
-cp "${ROOT_DIR}/third_party/NOTICE.md" "${SDMC_DIR}/switch/NX-Cast/licenses/THIRD-PARTY-NOTICE.txt"
-cp "${ROOT_DIR}/third_party/imgui/LICENSE.txt" "${SDMC_DIR}/switch/NX-Cast/licenses/LICENSE.Dear-ImGui.txt"
+cp "${ROOT_DIR}/LICENSE" "${SDMC_DIR}/switch/switch-tv-box/licenses/LICENSE.NX-Cast.txt"
+cp "${ROOT_DIR}/third_party/NOTICE.md" "${SDMC_DIR}/switch/switch-tv-box/licenses/THIRD-PARTY-NOTICE.txt"
+cp "${ROOT_DIR}/third_party/imgui/LICENSE.txt" "${SDMC_DIR}/switch/switch-tv-box/licenses/LICENSE.Dear-ImGui.txt"
 
 staged_nro_count=$(find "${SDMC_DIR}/switch" -type f -name '*.nro' -print | wc -l | tr -d ' ')
 if [ "${staged_nro_count}" -ne 1 ] || \
-   [ ! -s "${SDMC_DIR}/switch/NX-Cast/NX-Cast.nro" ]; then
-    echo "The staged SD package must contain exactly switch/NX-Cast/NX-Cast.nro." >&2
+   [ ! -s "${SDMC_DIR}/switch/switch-tv-box/switch-tv-box.nro" ]; then
+    echo "The staged SD package must contain exactly switch/switch-tv-box/switch-tv-box.nro." >&2
     exit 1
 fi
 
@@ -118,29 +118,29 @@ if [ -n "${sensitive_files}" ]; then
     exit 1
 fi
 
-cat > "${SDMC_DIR}/README-NX-Cast.txt" <<'EOF'
-NX-Cast install
+cat > "${SDMC_DIR}/README-switch-tv-box.txt" <<'EOF'
+switch-tv-box install
 ===============
 
 Recommended install:
 1. Extract this zip to the root of your Switch SD card.
 2. Confirm the final path is:
-   sdmc:/switch/NX-Cast/NX-Cast.nro
-3. Launch NX-Cast from hbmenu.
+   sdmc:/switch/switch-tv-box/switch-tv-box.nro
+3. Launch switch-tv-box from hbmenu.
 
 Do not extract this zip into an extra nested folder such as:
-sdmc:/NX-Cast-sdmc/switch/NX-Cast/
+sdmc:/switch-tv-box-sdmc/switch/switch-tv-box/
 
 Included files:
-- switch/NX-Cast/NX-Cast.nro
-- switch/NX-Cast/dlna/ runtime DLNA description assets
-- switch/NX-Cast/fonts/ packaged UI font and license notices
-- switch/NX-Cast/iptv/sources.txt preinstalled IPTV sources
-- switch/NX-Cast/iptv/ local playlists, remote source/cache location, and usage notes
-- switch/NX-Cast/airplay/ AirPlay storage notice; identity and pairings are generated on first launch
-- switch/NX-Cast/licenses/ third-party license notices
+- switch/switch-tv-box/switch-tv-box.nro
+- switch/switch-tv-box/dlna/ runtime DLNA description assets
+- switch/switch-tv-box/fonts/ packaged UI font and license notices
+- switch/switch-tv-box/iptv/sources.txt preinstalled IPTV sources
+- switch/switch-tv-box/iptv/ local playlists, remote source/cache location, and usage notes
+- switch/switch-tv-box/airplay/ AirPlay storage notice; identity and pairings are generated on first launch
+- switch/switch-tv-box/licenses/ third-party license notices
 
-If NX-Cast does not appear in hbmenu, check the SD card path above.
+If switch-tv-box does not appear in hbmenu, check the SD card path above.
 If the UI font looks wrong, reinstall this full SD package instead of copying
 only the NRO.
 EOF
@@ -149,33 +149,33 @@ mkdir -p "${DIST_DIR}"
 
 (
     cd "${SDMC_DIR}"
-    zip -qr "${PACKAGE}" README-NX-Cast.txt switch
+    zip -qr "${PACKAGE}" README-switch-tv-box.txt switch
 )
 
 zip_listing=$(zip -sf "${PACKAGE}")
 zip_nro_count=$(printf '%s\n' "${zip_listing}" | awk '$1 ~ /^switch\/.*\.nro$/ { count++ } END { print count + 0 }')
 if [ "${zip_nro_count}" -ne 1 ] || \
-   ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/NX-Cast/NX-Cast.nro"; then
-    echo "The release ZIP must contain exactly switch/NX-Cast/NX-Cast.nro." >&2
+   ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/switch-tv-box/switch-tv-box.nro"; then
+    echo "The release ZIP must contain exactly switch/switch-tv-box/switch-tv-box.nro." >&2
     exit 1
 fi
 
-if ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/NX-Cast/iptv/sources.txt"; then
+if ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/switch-tv-box/iptv/sources.txt"; then
     echo "IPTV sources.txt is missing from the release ZIP." >&2
     exit 1
 fi
 
-if ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/NX-Cast/airplay/README.txt"; then
+if ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/switch-tv-box/airplay/README.txt"; then
     echo "AirPlay README is missing from the release ZIP." >&2
     exit 1
 fi
 
-if ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/NX-Cast/licenses/LICENSE.NX-Cast.txt"; then
-    echo "NX-Cast license is missing from the release ZIP." >&2
+if ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/switch-tv-box/licenses/LICENSE.NX-Cast.txt"; then
+    echo "switch-tv-box license is missing from the release ZIP." >&2
     exit 1
 fi
 
-if ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/NX-Cast/licenses/LICENSE.PlayFair.GPLv3.txt"; then
+if ! printf '%s\n' "${zip_listing}" | grep -Fq "  switch/switch-tv-box/licenses/LICENSE.PlayFair.GPLv3.txt"; then
     echo "PlayFair GPL license is missing from the release ZIP." >&2
     exit 1
 fi

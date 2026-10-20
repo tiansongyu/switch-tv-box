@@ -24,13 +24,13 @@
 static bool g_dlnaRunning = false;
 static const uint16_t g_dlnaHttpPort = 49152;
 static const char g_dlnaDeviceType[] = "urn:schemas-upnp-org:device:MediaRenderer:1";
-static const char g_dlnaFriendlyName[] = "NX-Cast";
+static const char g_dlnaFriendlyName[] = "Switch TV Box";
 static const char g_dlnaManufacturer[] = "Ode1l";
 static const char g_dlnaManufacturerUrl[] = "https://github.com/Ode1l";
 static const char g_dlnaModelDescription[] = "DLNA Media Renderer for Nintendo Switch";
-static const char g_dlnaModelName[] = "NX-Cast";
+static const char g_dlnaModelName[] = "Switch TV Box";
 static const char g_dlnaModelNumber[] = "0.1.0";
-static const char g_dlnaModelUrl[] = "https://github.com/Ode1l/NX-Cast";
+static const char g_dlnaModelUrl[] = "https://github.com/tiansongyu/switch-tv-box";
 static const char g_dlnaFallbackSerialNumber[] = "000000000001";
 static const char g_dlnaFallbackUuid[] = "uuid:6b0d3c60-3d96-41f4-986c-0a4bb12b0001";
 static const char g_dlnaLocationPath[] = "/description.xml";

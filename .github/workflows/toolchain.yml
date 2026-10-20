@@ -57,5 +57,5 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.resolve.outputs.image }}
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
-          cache-from: type=gha,scope=nx-cast-toolchain
-          cache-to: type=gha,mode=max,scope=nx-cast-toolchain
+          cache-from: type=gha,scope=switch-tv-box-toolchain
+          cache-to: type=gha,mode=max,scope=switch-tv-box-toolchain

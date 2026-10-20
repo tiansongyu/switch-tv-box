@@ -33,28 +33,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build NX-Cast in devkitPro container
+      - name: Test, build and package switch-tv-box
         run: |
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
             -e DEVKITPRO=/opt/devkitpro \
             -e NXCAST_MIN_NRO_SIZE=5000000 \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${TOOLCHAIN_IMAGE}" \
-            bash -lc 'set -euo pipefail; /usr/local/bin/verify_switch_ffmpeg_airplay.sh /opt/devkitpro/portlibs/switch; make RELEASE_JOBS=$(nproc) release-build'
-
-      - name: Package SD card layout
-        env:
-          NXCAST_MIN_NRO_SIZE: 5000000
-        run: ./scripts/package_release.sh
+            bash scripts/in-container-build.sh
 
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v3
         with:
-          name: NX-Cast ${{ github.ref_name }} - DLNA + IPTV + Experimental AirPlay
+          name: switch-tv-box ${{ github.ref_name }} - DLNA + IPTV + AirPlay 1
           body_path: .github/release-notes.md
           generate_release_notes: true
           overwrite_files: true
           fail_on_unmatched_files: true
           files: |
-            dist/NX-Cast-sdmc.zip
+            dist/switch-tv-box-sdmc.zip

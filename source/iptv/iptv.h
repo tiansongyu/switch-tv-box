@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#define IPTV_ROOT_DIR "sdmc:/switch/NX-Cast/iptv"
+#define IPTV_ROOT_DIR "sdmc:/switch/switch-tv-box/iptv"
 #define IPTV_PREINSTALLED_SOURCES_FILE IPTV_ROOT_DIR "/sources.txt"
 #define IPTV_MAX_RECENT 32
 #define IPTV_NAME_MAX 128

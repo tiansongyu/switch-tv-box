@@ -16,3 +16,12 @@ __pycache__/
 *.pyc
 
 # .vscode VSCode settings folder. you can use my settings.
+
+# Switch TV Box local outputs
+switch-tv-box.elf
+switch-tv-box.nacp
+switch-tv-box.nro
+switch-tv-box.lst
+switch-tv-box.map
+.deps/
+.runtime/

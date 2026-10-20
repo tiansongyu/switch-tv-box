@@ -1,4 +1,5 @@
-FROM devkitpro/devkita64:20260219
+ARG BASE_IMAGE=devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
+FROM ${BASE_IMAGE}
 
 WORKDIR /workspace
 
@@ -55,5 +56,8 @@ RUN /usr/local/bin/fetch_switch_ffmpeg_airplay.sh /tmp/nxcast-ffmpeg && \
     test -f /opt/devkitpro/portlibs/switch/include/mpv/client.h && \
     test -f /opt/devkitpro/portlibs/switch/lib/libmpv.a && \
     rm -rf /tmp/nxcast-ffmpeg
+
+RUN apt-get update && apt-get install -y --no-install-recommends zlib1g-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 CMD ["bash", "-lc", "make clean && make -j$(nproc)"]
