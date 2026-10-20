@@ -51,6 +51,7 @@ typedef struct
     unsigned int pause_wait_secs;
     unsigned int cache_secs;
     const char *hls_bitrate;
+    bool latest_hls_segment;
     const char *http_proxy;
 } PlayerCachePolicy;
 

@@ -216,6 +216,74 @@ static void test_iptv_quality_and_buffer_choices(void)
     assert(strcmp(invalid.hls_bitrate, "max") == 0);
 }
 
+static void test_iptv_hls_starts_at_latest_segment_only_for_hls_urls(void)
+{
+    IptvPlaybackSettings settings = {IPTV_QUALITY_ORIGINAL, IPTV_BUFFER_STABLE};
+    char options[512];
+    const char *hls_uris[] = {
+        "http://example.invalid/live/index.m3u8",
+        "HTTPS://example.invalid/live/MASTER.M3U8?token=.mp4#section",
+        "http://1.1.1.1:8080/channel.m3u8?token=a%2Fb",
+        "http://127.0.0.1:18952/fixture.m3u8",
+    };
+    for (size_t index = 0; index < sizeof(hls_uris) / sizeof(hls_uris[0]); ++index)
+    {
+        PlayerCachePolicy policy = player_cache_policy_for_media(
+            hls_uris[index], PLAYER_MEDIA_OWNER_IPTV, settings, false);
+        assert(policy.latest_hls_segment);
+        assert(player_cache_policy_format_options(&policy, true, options, sizeof(options)));
+        assert(strstr(options, ",demuxer-lavf-o=live_start_index=-1"));
+        assert(strstr(options, "cache-pause-wait=60,cache-secs=180"));
+        assert(!strstr(options, "demuxer-lavf-format="));
+
+        const PlayerMediaOwner owners[] = {
+            PLAYER_MEDIA_OWNER_NONE, PLAYER_MEDIA_OWNER_DLNA,
+            PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO, PLAYER_MEDIA_OWNER_AIRPLAY_MIRROR
+        };
+        for (size_t owner = 0; owner < sizeof(owners) / sizeof(owners[0]); ++owner)
+        {
+            policy = player_cache_policy_for_media(hls_uris[index], owners[owner],
+                                                  settings, false);
+            assert(!policy.latest_hls_segment);
+            assert(player_cache_policy_format_options(&policy, true, options, sizeof(options)));
+            assert(!strstr(options, "live_start_index"));
+        }
+    }
+
+    const char *other_uris[] = {
+        NULL, "", "http://example.invalid/clip.mp4?next=live.m3u8",
+        "http://example.invalid/live.m3u8/segment.ts", "http://example.m3u8",
+        "http://example.invalid?redirect=/live.m3u8",
+        "http://example.invalid/a#redirect=/live.m3u8",
+        "rtsp://example.invalid/live.m3u8", "udp://1.1.1.1:1234",
+        "file:///fixture.m3u8", "/fixture.m3u8",
+    };
+    for (size_t index = 0; index < sizeof(other_uris) / sizeof(other_uris[0]); ++index)
+    {
+        PlayerCachePolicy policy = player_cache_policy_for_media(
+            other_uris[index], PLAYER_MEDIA_OWNER_IPTV, settings, false);
+        assert(!policy.latest_hls_segment);
+        assert(player_cache_policy_format_options(&policy, true, options, sizeof(options)));
+        assert(!strstr(options, "live_start_index"));
+    }
+
+    /* An IPTV URL pointing to the local AirPlay relay retains both distinct
+     * options, while the subsequent AirPlay load gets only its own policy. */
+    const char *local = "http://127.0.0.1:7000/airplay-hls/session/master.m3u8";
+    PlayerCachePolicy policy = player_cache_policy_for_media(
+        local, PLAYER_MEDIA_OWNER_IPTV, settings, false);
+    assert(policy.disable_http_persistence && policy.latest_hls_segment);
+    assert(player_cache_policy_format_options(&policy, true, options, sizeof(options)));
+    assert(strstr(options, ",demuxer-lavf-o=http_persistent=no"));
+    assert(strstr(options, ",demuxer-lavf-o-append=live_start_index=-1"));
+    assert(!strstr(options, ",demuxer-lavf-o=live_start_index=-1"));
+    policy = player_cache_policy_for_media(
+        local, PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO, settings, false);
+    assert(player_cache_policy_format_options(&policy, true, options, sizeof(options)));
+    assert(strstr(options, ",demuxer-lavf-o=http_persistent=no"));
+    assert(!strstr(options, "live_start_index"));
+}
+
 static void test_direct_http_strict_public_ipv4(void)
 {
     const char *allowed[] = {
@@ -266,6 +334,7 @@ static void test_direct_http_per_file_isolation_and_capacity(void)
     assert(strstr(options, ",http-proxy=http://127.0.0.1:18957"));
     assert(strstr(options, "network-timeout=60"));
     assert(strstr(options, "demuxer-max-bytes=96MiB"));
+    assert(strstr(options, ",demuxer-lavf-o=live_start_index=-1"));
     size_t length = strlen(options);
     assert(length + 1u < sizeof(options));
     assert(!player_cache_policy_format_options(&policy, true, exact, length));
@@ -308,6 +377,7 @@ int main(void)
     test_unknown_uri_and_invalid_output();
     test_iptv_timeout_is_per_media_owner();
     test_iptv_quality_and_buffer_choices();
+    test_iptv_hls_starts_at_latest_segment_only_for_hls_urls();
     test_direct_http_strict_public_ipv4();
     test_direct_http_per_file_isolation_and_capacity();
     puts("player cache policy tests passed");

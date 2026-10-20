@@ -89,6 +89,28 @@ static bool is_direct_mp4_uri(const char *uri)
     return end - uri >= 4 && strncasecmp(end - 4, ".mp4", 4u) == 0;
 }
 
+static bool is_http_hls_uri(const char *uri)
+{
+    const char *authority;
+    const char *end;
+    const char *path;
+
+    if (!uri)
+        return false;
+    if (strncasecmp(uri, "http://", 7u) == 0)
+        authority = uri + 7u;
+    else if (strncasecmp(uri, "https://", 8u) == 0)
+        authority = uri + 8u;
+    else
+        return false;
+    end = strpbrk(authority, "?#");
+    if (!end)
+        end = authority + strlen(authority);
+    path = memchr(authority, '/', (size_t)(end - authority));
+    return path && end - path >= 6 &&
+           strncasecmp(end - 5, ".m3u8", 5u) == 0;
+}
+
 PlayerCachePolicy player_cache_policy_for_uri(const char *uri)
 {
     PlayerCachePolicy policy = {
@@ -159,6 +181,11 @@ PlayerCachePolicy player_cache_policy_for_media(const char *uri,
         policy.pause_wait_secs = buffer_secs[settings.buffer];
         policy.cache_secs = readahead_secs[settings.buffer];
         policy.hls_bitrate = bitrate[settings.quality];
+        /* Begin at the newest complete segment before filling the startup
+         * cache. FFmpeg's -3 default can start at the edge of a short live
+         * window; a slow first download then expires the following segments.
+         * FFmpeg ignores this live-only option for finished/VOD playlists. */
+        policy.latest_hls_segment = is_http_hls_uri(uri);
         policy.network_timeout_secs = network_timeout_secs[settings.buffer];
         if (iptv_direct_http_enabled && player_iptv_direct_http_uri_allowed(uri))
             policy.http_proxy = IPTV_DIRECT_HTTP_PROXY;
@@ -245,6 +272,20 @@ bool player_cache_policy_format_options(const PlayerCachePolicy *policy,
         written = snprintf(output + used, output_size - used,
                            ",network-timeout=%u",
                            policy->network_timeout_secs);
+        if (written < 0 || (size_t)written >= output_size - used)
+            return false;
+        used += (size_t)written;
+    }
+    if (policy->latest_hls_segment)
+    {
+        /* The append action keeps the existing AirPlay relay option if an
+         * IPTV entry happens to reference that local HLS endpoint. mpv 0.36
+         * supports append on key/value list options without nested commas. */
+        written = snprintf(
+            output + used, output_size - used,
+            policy->disable_http_persistence
+                ? ",demuxer-lavf-o-append=live_start_index=-1"
+                : ",demuxer-lavf-o=live_start_index=-1");
         if (written < 0 || (size_t)written >= output_size - used)
             return false;
         used += (size_t)written;
