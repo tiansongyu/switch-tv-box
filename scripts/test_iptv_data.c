@@ -1,6 +1,6 @@
 /* cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pthread
  * -Iscripts/iptv_test_stubs -Isource scripts/test_iptv_data.c
- * source/iptv/url.c source/iptv/xmltv.c source/player/ui/home.c -lz
+ * source/iptv/url.c source/iptv/xmltv.c source/iptv/playback_settings.c source/player/ui/home.c -lz
  * -fsanitize=address,undefined -o /tmp/test_iptv_data && /tmp/test_iptv_data
  */
 #define _DARWIN_C_SOURCE
@@ -68,6 +68,8 @@ static void *test_realloc(void *data, size_t size)
 
 static int play_requests;
 static bool owns_iptv;
+static char last_submitted_uri[IPTV_URL_MAX];
+static PlayerOwnershipLease last_submitted_lease;
 void log_info(const char *fmt, ...) { (void)fmt; }
 void log_warn(const char *fmt, ...) { (void)fmt; }
 bool iptv_fetch_to_file(const char *u, const char *d, size_t n,
@@ -84,9 +86,22 @@ bool protocol_coordinator_media_release_current(PlayerMediaOwner o, uint64_t t)
 { (void)o; (void)t; owns_iptv = false; return true; }
 bool player_ownership_matches(PlayerMediaOwner o, uint64_t t)
 { (void)o; (void)t; return owns_iptv; }
+bool protocol_coordinator_media_guard_begin(PlayerMediaOwner o, uint64_t t, ProtocolMediaGuard *g)
+{
+    if (!owns_iptv || o != PLAYER_MEDIA_OWNER_IPTV || t != g_playback_token)
+        return false;
+    *g = (ProtocolMediaGuard){.active = true, .lease = {o, t, 5}};
+    return true;
+}
+void protocol_coordinator_media_guard_end(ProtocolMediaGuard *g) { g->active = false; }
 const char *player_media_owner_name(PlayerMediaOwner o) { (void)o; return "test"; }
 PlayerCommandStatus player_submit_command_async(const PlayerCommandRequest *r)
-{ (void)r; ++play_requests; return PLAYER_COMMAND_STATUS_ACCEPTED; }
+{
+    iptv_copy(last_submitted_uri, sizeof(last_submitted_uri), r->uri);
+    last_submitted_lease = r->lease;
+    ++play_requests;
+    return PLAYER_COMMAND_STATUS_ACCEPTED;
+}
 bool player_command_status_succeeded(PlayerCommandStatus s)
 { return s == PLAYER_COMMAND_STATUS_ACCEPTED; }
 const char *player_command_status_name(PlayerCommandStatus s) { (void)s; return "accepted"; }
@@ -314,7 +329,65 @@ int main(void)
     iptv_set_filter(0);
     assert(iptv_play_channel(10000));
     assert(iptv_get_playing_channel_id() == channel.id);
+    assert(iptv_get_state(&state));
+    assert(strcmp(state.status, "Connecting IPTV: Channel 10000") == 0);
+    PlayerSnapshot playback = {
+        .has_media = true,
+        .media = {.uri = channel.url},
+        .state = PLAYER_STATE_ERROR,
+    };
+    /* A failed previous file must not overwrite the newly queued channel. */
+    playback.media.uri = "https://example.invalid/previous.ts";
+    iptv_sync_playback_state(&playback);
+    assert(iptv_get_state(&state));
+    assert(strcmp(state.status, "Connecting IPTV: Channel 10000") == 0);
+    playback.media.uri = channel.url;
+    iptv_sync_playback_state(&playback);
+    assert(iptv_get_state(&state));
+    assert(strcmp(state.status,
+                  "Channel playback failed. Retry or choose another channel.") == 0);
+    home_ui_toggle_language();
+    assert(iptv_get_state(&state));
+    assert(strcmp(state.status, "频道播放失败，请重试或切换频道。") == 0);
+    playback.state = PLAYER_STATE_LOADING;
+    iptv_sync_playback_state(&playback);
+    assert(iptv_get_state(&state));
+    assert(strcmp(state.status, "正在连接 IPTV：Channel 10000") == 0);
+    playback.state = PLAYER_STATE_PLAYING;
+    iptv_sync_playback_state(&playback);
+    assert(iptv_get_state(&state));
+    assert(strcmp(state.status, "正在播放 IPTV：Channel 10000") == 0);
+    iptv_set_status("Added to favorites.");
+    iptv_sync_playback_state(&playback);
+    assert(iptv_get_state(&state) && strcmp(state.status, "已添加到收藏。") == 0);
+    /* Save/replay must retain the playing URI even if another row is browsed. */
+    uint32_t recent_before[IPTV_MAX_RECENT];
+    memcpy(recent_before, g_recent_ids, sizeof(recent_before));
+    int recent_count_before = g_recent_count;
+    int favorites_before = state.favorite_count;
+    uint64_t token_before = g_playback_token;
+    iptv_set_selected_index(0);
+    assert(iptv_restart_current_playback(&playback));
+    assert(play_requests == 2 && strcmp(last_submitted_uri, channel.url) == 0);
+    assert(last_submitted_lease.owner == PLAYER_MEDIA_OWNER_IPTV &&
+           last_submitted_lease.token == token_before && last_submitted_lease.generation == 5);
+    assert(g_playback_token == token_before && iptv_get_selected_index() == 0);
+    assert(g_recent_count == recent_count_before &&
+           memcmp(recent_before, g_recent_ids, sizeof(recent_before)) == 0);
+    assert(iptv_get_state(&state) && state.favorite_count == favorites_before);
+    playback.media.uri = "https://example.invalid/other-owner.ts";
+    assert(!iptv_restart_current_playback(&playback));
+    playback.media.uri = channel.url;
+    playback.state = PLAYER_STATE_STOPPED;
+    assert(!iptv_restart_current_playback(&playback));
+    playback.state = PLAYER_STATE_PLAYING;
+    iptv_set_status("Added to favorites.");
     owns_iptv = false;
+    assert(!iptv_restart_current_playback(&playback) && play_requests == 2);
+    playback.state = PLAYER_STATE_ERROR;
+    iptv_sync_playback_state(&playback);
+    assert(iptv_get_state(&state) && strcmp(state.status, "已添加到收藏。") == 0);
+    home_ui_toggle_language();
     assert(iptv_get_playing_channel_id() == 0);
 
     /* Getter cost must be independent of catalog size after rebuilding. */
@@ -359,7 +432,7 @@ int main(void)
     iptv_deinit();
     assert(iptv_init());
     assert(iptv_get_channel_count() == 42);
-    assert(play_requests == 1); /* Startup/reload never submits playback. */
+    assert(play_requests == 2); /* Startup/reload never submits playback. */
     iptv_deinit();
     assert(iptv_get_filter(0, name, sizeof(name), &count) && count == 0);
     assert(iptv_get_filter_count() == 3);

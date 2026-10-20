@@ -4,6 +4,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "player/core/ownership.h"
+#include "iptv/playback_settings.h"
+
 #ifndef NXCAST_MEDIA_CACHE_FORWARD_MIB
 #define NXCAST_MEDIA_CACHE_FORWARD_MIB 20
 #endif
@@ -30,7 +33,8 @@ typedef enum
     PLAYER_CACHE_POLICY_NETWORK = 0,
     PLAYER_CACHE_POLICY_DIRECT_MP4,
     PLAYER_CACHE_POLICY_AIRPLAY_REMOTE_HLS,
-    PLAYER_CACHE_POLICY_AIRPLAY_MIRROR
+    PLAYER_CACHE_POLICY_AIRPLAY_MIRROR,
+    PLAYER_CACHE_POLICY_IPTV
 } PlayerCachePolicyKind;
 
 typedef struct
@@ -42,9 +46,21 @@ typedef struct
     unsigned int backward_mib;
     unsigned int readahead_secs;
     bool disable_http_persistence;
+    unsigned int network_timeout_secs;
+    bool pause_initial;
+    unsigned int pause_wait_secs;
+    unsigned int cache_secs;
+    const char *hls_bitrate;
+    const char *http_proxy;
 } PlayerCachePolicy;
 
+/* Optional Eden helper accepts only direct public IPv4 HTTP media URLs. */
+bool player_iptv_direct_http_uri_allowed(const char *uri);
 PlayerCachePolicy player_cache_policy_for_uri(const char *uri);
+PlayerCachePolicy player_cache_policy_for_media(const char *uri,
+                                                PlayerMediaOwner owner,
+                                                IptvPlaybackSettings settings,
+                                                bool iptv_direct_http_enabled);
 const char *player_cache_policy_name(PlayerCachePolicyKind kind);
 bool player_cache_policy_format_options(const PlayerCachePolicy *policy,
                                         bool paused,

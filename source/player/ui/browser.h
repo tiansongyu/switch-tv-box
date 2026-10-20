@@ -24,7 +24,8 @@ extern "C"
         PLAYER_BROWSER_MODAL_NONE,
         PLAYER_BROWSER_MODAL_CATEGORIES,
         PLAYER_BROWSER_MODAL_SOURCES,
-        PLAYER_BROWSER_MODAL_DELETE
+        PLAYER_BROWSER_MODAL_DELETE,
+        PLAYER_BROWSER_MODAL_PLAYBACK_SETTINGS
     } PlayerBrowserModal;
     typedef enum
     {
@@ -40,6 +41,7 @@ extern "C"
         PLAYER_BROWSER_RECENT,
         PLAYER_BROWSER_SEARCH,
         PLAYER_BROWSER_SOURCE_FILTER,
+        PLAYER_BROWSER_PLAYBACK_SETTINGS,
         PLAYER_BROWSER_TOOLBAR_COUNT
     } PlayerBrowserToolbar;
     typedef enum
@@ -54,7 +56,9 @@ extern "C"
         PLAYER_BROWSER_ACTION_SCAN_SD,
         PLAYER_BROWSER_ACTION_REFRESH,
         PLAYER_BROWSER_ACTION_EPG,
-        PLAYER_BROWSER_ACTION_DELETE
+        PLAYER_BROWSER_ACTION_DELETE,
+        PLAYER_BROWSER_ACTION_SETTINGS,
+        PLAYER_BROWSER_ACTION_SETTINGS_SAVE
     } PlayerBrowserActionKind;
     typedef struct
     {
@@ -71,6 +75,8 @@ extern "C"
         int toolbar_focus, action_focus;
         int modal_cursor, modal_count, modal_first_index;
         float scroll_offset, modal_scroll_offset;
+        int settings_quality, settings_buffer;
+        bool settings_save_failed;
     } PlayerBrowserView;
     typedef struct
     {
@@ -109,10 +115,14 @@ extern "C"
     PlayerBrowserRect player_browser_modal_rect(const PlayerBrowserView *v);
 /* Sources modal: 0 All, 1 Manage, 2+ source index + 2. Categories use filter indices. */
 PlayerBrowserRect player_browser_modal_item_rect(const PlayerBrowserView *v, int index);
+    PlayerBrowserRect player_browser_settings_choice_rect(const PlayerBrowserView *v, int row,
+                                                          int choice);
     PlayerBrowserRect player_browser_scrollbar_rect(const PlayerBrowserView *v, bool thumb);
     int player_browser_action_count(const PlayerBrowserView *v);
     void player_browser_init(PlayerBrowser *b);
     void player_browser_open(PlayerBrowser *b, bool playback_active);
+    /* Seeds an editable draft; only SETTINGS_SAVE may publish it. */
+    void player_browser_open_settings(PlayerBrowser *b, int quality, int buffer);
     void player_browser_sync(PlayerBrowser *b, int count, int selected, int filter_count,
                              int source_count);
     void player_browser_tick(PlayerBrowser *b, uint64_t now_ms);

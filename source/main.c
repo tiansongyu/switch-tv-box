@@ -15,6 +15,7 @@
 #include "app/protocol_coordinator.h"
 #include "app/runtime_diagnostics.h"
 #include "iptv/iptv.h"
+#include "iptv/playback_settings.h"
 #include "log/log.h"
 #include "player/player.h"
 #include "player/ui/channel_list.h"
@@ -592,28 +593,36 @@ static void build_home_view_state(PlayerHomeViewState *out,
     out->audio_playback_active = snapshot && out->playback_active &&
         player_media_is_airplay_audio(&snapshot->media);
     out->playback_state = snapshot ? snapshot->state : PLAYER_STATE_IDLE;
+    out->iptv_playback_active =
+        protocols &&
+        protocols->active_media.owner == PLAYER_MEDIA_OWNER_IPTV;
     if (snapshot && snapshot->state == PLAYER_STATE_ERROR)
     {
         out->has_error = true;
         snprintf(out->error_line, sizeof(out->error_line),
-                 "[ERROR] Playback failed; see the runtime log for details");
+                 "%s", out->iptv_playback_active
+                     ? home_ui_text(
+                           "Channel playback failed. Retry or choose another channel.",
+                           "频道播放失败，请重试或切换频道。")
+                     : home_ui_text(
+                           "Playback failed. Retry or choose another media source.",
+                           "播放失败，请重试或切换媒体来源。"));
     }
     else
     {
         out->has_error = get_latest_error_line(out->error_line,
                                                sizeof(out->error_line));
     }
-    out->iptv_playback_active =
-        protocols &&
-        protocols->active_media.owner == PLAYER_MEDIA_OWNER_IPTV;
     out->iptv_panel_open = iptv_panel_open;
     out->iptv_sources_open = iptv_sources_open;
     if (iptv_panel_open && g_iptv_browser.view.page == PLAYER_BROWSER_CLOSED)
         player_browser_open(&g_iptv_browser, out->iptv_playback_active && player_view_get_mode() == PLAYER_VIEW_VIDEO);
     if (!iptv_panel_open)
         g_iptv_browser.view.page = PLAYER_BROWSER_CLOSED;
+    g_iptv_browser.view.playback_active = out->iptv_playback_active && out->playback_active;
     main_browser_sync();
     out->iptv_browser = g_iptv_browser.view;
+    iptv_sync_playback_state(snapshot);
     if (iptv_get_state(&iptv_state))
     {
         out->iptv_ready = protocols &&
@@ -1001,6 +1010,36 @@ static void main_browser_apply(PlayerBrowserAction action, PlayerBrowserPage pre
     case PLAYER_BROWSER_ACTION_REFRESH: (void)iptv_refresh_selected_source_async(); break;
     case PLAYER_BROWSER_ACTION_EPG: (void)iptv_prompt_set_source_epg(); break;
     case PLAYER_BROWSER_ACTION_DELETE: (void)iptv_remove_selected_source(); break;
+    case PLAYER_BROWSER_ACTION_SETTINGS:
+    {
+        IptvPlaybackSettings settings = iptv_playback_settings_get();
+        player_browser_open_settings(&g_iptv_browser, settings.quality, settings.buffer);
+        break;
+    }
+    case PLAYER_BROWSER_ACTION_SETTINGS_SAVE:
+    {
+        IptvPlaybackSettings settings = {
+            .quality = (IptvQuality)g_iptv_browser.view.settings_quality,
+            .buffer = (IptvBufferMode)g_iptv_browser.view.settings_buffer,
+        };
+        if (!iptv_playback_settings_set(settings))
+        {
+            g_iptv_browser.view.settings_save_failed = true;
+            break;
+        }
+        g_iptv_browser.view.modal = PLAYER_BROWSER_MODAL_NONE;
+        iptv_set_status("Playback settings saved.");
+        PlayerSnapshot snapshot = {0};
+        if (player_ready && player_get_snapshot(&snapshot) &&
+            iptv_restart_current_playback(&snapshot))
+        {
+            player_browser_init(&g_iptv_browser);
+            g_iptv_browser.view.playback_active = true;
+            (void)player_view_show_video();
+        }
+        player_snapshot_clear(&snapshot);
+        break;
+    }
     default: break;
     }
     main_browser_sync();

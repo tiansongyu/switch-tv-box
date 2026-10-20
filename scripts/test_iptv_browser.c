@@ -281,6 +281,47 @@ static void test_transition_capture(void)
     press(&b, PLAYER_BROWSER_ACCEPT);
     assert(b.view.modal == PLAYER_BROWSER_MODAL_SOURCES);
 }
+
+static void test_playback_settings(void)
+{
+    for (int playback = 0; playback <= 1; ++playback)
+    {
+        PlayerBrowser b = fresh(playback);
+        PlayerBrowserAction a = tap(&b, player_browser_toolbar_rect(&b.view, PLAYER_BROWSER_PLAYBACK_SETTINGS));
+        assert(a.kind == PLAYER_BROWSER_ACTION_SETTINGS);
+        player_browser_open_settings(&b, 0, 1);
+        assert(b.view.modal == PLAYER_BROWSER_MODAL_PLAYBACK_SETTINGS && b.view.modal_count == 3);
+        assert(b.view.settings_quality == 0 && b.view.settings_buffer == 1);
+        press(&b, PLAYER_BROWSER_LEFT);
+        assert(b.view.settings_quality == 2);
+        press(&b, PLAYER_BROWSER_ACCEPT);
+        assert(b.view.settings_quality == 0 && b.view.modal_cursor == 0);
+        press(&b, PLAYER_BROWSER_DOWN);
+        press(&b, PLAYER_BROWSER_RIGHT);
+        assert(b.view.settings_buffer == 2);
+        press(&b, PLAYER_BROWSER_DOWN);
+        a = press(&b, PLAYER_BROWSER_ACCEPT);
+        assert(a.kind == PLAYER_BROWSER_ACTION_SETTINGS_SAVE);
+        /* The application closes only after successful persistence. */
+        assert(b.view.modal == PLAYER_BROWSER_MODAL_PLAYBACK_SETTINGS);
+        b.view.settings_save_failed = true;
+        tap(&b, player_browser_settings_choice_rect(&b.view, 0, 1));
+        assert(b.view.settings_quality == 1 && !b.view.settings_save_failed);
+        tap(&b, player_browser_settings_choice_rect(&b.view, 1, 0));
+        assert(b.view.settings_buffer == 0 && b.view.modal_cursor == 1);
+        assert(tap(&b, player_browser_modal_item_rect(&b.view, 2)).kind ==
+               PLAYER_BROWSER_ACTION_SETTINGS_SAVE);
+        press(&b, PLAYER_BROWSER_BACK);
+        assert(b.view.modal == PLAYER_BROWSER_MODAL_NONE &&
+               b.view.page == (playback ? PLAYER_BROWSER_DRAWER : PLAYER_BROWSER_LIBRARY));
+        /* Reopen from persisted values, not the cancelled draft. */
+        player_browser_open_settings(&b, 0, 1);
+        assert(b.view.settings_quality == 0 && b.view.settings_buffer == 1);
+        assert(tap(&b, (PlayerBrowserRect){1160, 300, 40, 40}).kind == PLAYER_BROWSER_ACTION_NONE);
+        assert(b.view.modal == PLAYER_BROWSER_MODAL_NONE);
+    }
+}
+
 int main(void)
 {
     PlayerBrowser drawer = fresh(true);
@@ -307,6 +348,7 @@ int main(void)
     test_modals_and_sources();
     test_modal_touch_and_empty_sources();
     test_transition_capture();
+    test_playback_settings();
     puts("IPTV browser tests passed");
     return 0;
 }

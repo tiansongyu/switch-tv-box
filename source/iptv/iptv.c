@@ -16,6 +16,7 @@
 #include "app/protocol_coordinator.h"
 #include "iptv/fetch.h"
 #include "iptv/data.h"
+#include "iptv/playback_settings.h"
 #include "iptv/url.h"
 #include "iptv/xmltv.h"
 #include "log/log.h"
@@ -106,6 +107,7 @@ static char g_status[IPTV_STATUS_MAX];
 static char g_last_name[IPTV_NAME_MAX];
 static char g_last_url[IPTV_URL_MAX];
 static uint64_t g_playback_token;
+static PlayerState g_playback_state = PLAYER_STATE_IDLE;
 static bool g_preinstalled_refresh_needed;
 static int g_preinstalled_changed_count;
 
@@ -147,6 +149,11 @@ static const char *iptv_text(const char *text)
         {"Local HLS", "本地 HLS"}, {"Remote HLS", "远程 HLS"},
         {"Direct IPTV URL", "直接播放 IPTV 地址"},
         {"Playing IPTV: Direct IPTV URL", "正在播放 IPTV：直接播放地址"},
+        {"Connecting IPTV: Direct IPTV URL", "正在连接 IPTV：直接播放地址"},
+        {"Channel playback failed. Retry or choose another channel.", "频道播放失败，请重试或切换频道。"},
+        {"IPTV playback stopped.", "IPTV 播放已停止。"},
+        {"Playback settings saved.", "播放设置已保存。"},
+        {"Settings saved, but the channel could not be restarted.", "设置已保存，但频道无法重新播放。"},
         {"Disabled", "已停用"},
         {"Not cached - refresh this source", "尚未缓存，请刷新此来源"},
         {"No playable channels", "没有可播放的频道"},
@@ -222,6 +229,9 @@ static void iptv_status_copy(char *out, size_t size, const char *status)
         {"Refreshing ", "...", "正在刷新 %.*s…"},
         {"Queued refresh for ", ".", "已将 %.*s 加入刷新队列。"},
         {"Playing IPTV: ", "", "正在播放 IPTV：%.*s"},
+        {"Connecting IPTV: ", "", "正在连接 IPTV：%.*s"},
+        {"Buffering IPTV: ", "", "正在缓冲 IPTV：%.*s"},
+        {"Paused IPTV: ", "", "IPTV 已暂停：%.*s"},
         {"Refresh failed for ", "", "刷新失败：%.*s"},
         {"", " and programme guide refreshed. Guide link found in M3U.", "%.*s 和节目单已刷新。节目单链接来自 M3U。"},
         {"", " and programme guide refreshed.", "%.*s 和节目单已刷新。"},
@@ -1807,6 +1817,7 @@ bool iptv_init(void)
     if (g_initialized)
         return true;
     iptv_ensure_directories();
+    iptv_playback_settings_init();
     atomic_store(&g_worker_stop, false);
     g_worker_busy = false;
     g_refresh_all_requested = false;
@@ -1887,6 +1898,7 @@ void iptv_deinit(void)
     g_group_count = g_recent_count = g_filter_index = 0;
     g_selected_index = g_source_selected_index = 0;
     g_source_filter_id = g_playing_channel_id = 0;
+    g_playback_state = PLAYER_STATE_IDLE;
     g_source_capacity = 0;
     g_search[0] = '\0';
     g_status[0] = g_last_name[0] = g_last_url[0] = '\0';
@@ -1972,6 +1984,63 @@ void iptv_set_status(const char *status)
         return;
     mutexLock(&g_mutex);
     iptv_copy(g_status, sizeof(g_status), status);
+    mutexUnlock(&g_mutex);
+}
+
+void iptv_sync_playback_state(const PlayerSnapshot *snapshot)
+{
+    uint64_t token;
+    const char *prefix = NULL;
+    const char *message = NULL;
+
+    if (!g_sync_initialized || !snapshot || !snapshot->has_media ||
+        !snapshot->media.uri)
+        return;
+    mutexLock(&g_mutex);
+    token = g_playback_token;
+    mutexUnlock(&g_mutex);
+    if (!token || !player_ownership_matches(PLAYER_MEDIA_OWNER_IPTV, token))
+        return;
+
+    mutexLock(&g_mutex);
+    /* Ignore old snapshots while the asynchronously submitted next channel
+     * is still waiting to replace the previous file. Update only on state
+     * transitions so a favourite/save message remains visible afterwards. */
+    if (!g_initialized || token != g_playback_token ||
+        strcmp(snapshot->media.uri, g_last_url) != 0 ||
+        snapshot->state == g_playback_state)
+    {
+        mutexUnlock(&g_mutex);
+        return;
+    }
+    g_playback_state = snapshot->state;
+    switch (snapshot->state)
+    {
+    case PLAYER_STATE_LOADING:
+        prefix = "Connecting IPTV: ";
+        break;
+    case PLAYER_STATE_BUFFERING:
+    case PLAYER_STATE_SEEKING:
+        prefix = "Buffering IPTV: ";
+        break;
+    case PLAYER_STATE_PLAYING:
+        prefix = "Playing IPTV: ";
+        break;
+    case PLAYER_STATE_PAUSED:
+        prefix = "Paused IPTV: ";
+        break;
+    case PLAYER_STATE_ERROR:
+        message = "Channel playback failed. Retry or choose another channel.";
+        break;
+    case PLAYER_STATE_IDLE:
+    case PLAYER_STATE_STOPPED:
+        message = "IPTV playback stopped.";
+        break;
+    }
+    if (prefix)
+        snprintf(g_status, sizeof(g_status), "%s%s", prefix, g_last_name);
+    else if (message)
+        iptv_copy(g_status, sizeof(g_status), message);
     mutexUnlock(&g_mutex);
 }
 
@@ -2737,7 +2806,8 @@ static bool iptv_play_url_named(const char *url,
     iptv_copy(g_last_url, sizeof(g_last_url), url);
     g_playing_channel_id = channel_id;
     iptv_copy(g_last_name, sizeof(g_last_name), name && name[0] ? name : "Direct IPTV URL");
-    snprintf(g_status, sizeof(g_status), "Playing IPTV: %s", g_last_name);
+    g_playback_state = PLAYER_STATE_LOADING;
+    snprintf(g_status, sizeof(g_status), "Connecting IPTV: %s", g_last_name);
     if (channel_id)
     {
         int existing = -1;
@@ -2800,6 +2870,53 @@ bool iptv_play_channel(int index)
 bool iptv_play_url(const char *url)
 {
     return iptv_play_url_named(url, "Direct IPTV URL", iptv_text("Direct IPTV URL"), 0);
+}
+
+bool iptv_restart_current_playback(const PlayerSnapshot *snapshot)
+{
+    char url[IPTV_URL_MAX], name[IPTV_NAME_MAX];
+    uint64_t token;
+    ProtocolMediaGuard guard;
+
+    if (!g_sync_initialized || !snapshot || !snapshot->has_media || !snapshot->media.uri ||
+        snapshot->state == PLAYER_STATE_IDLE || snapshot->state == PLAYER_STATE_STOPPED ||
+        snapshot->state == PLAYER_STATE_ERROR)
+        return false;
+    mutexLock(&g_mutex);
+    token = g_playback_token;
+    iptv_copy(url, sizeof(url), g_last_url);
+    iptv_copy(name, sizeof(name), g_last_name);
+    mutexUnlock(&g_mutex);
+    if (!token || !url[0] || strcmp(snapshot->media.uri, url) != 0 ||
+        !protocol_coordinator_media_guard_begin(PLAYER_MEDIA_OWNER_IPTV, token, &guard))
+        return false;
+
+    /* Keep the exact current lease. If another protocol takes over between
+     * saving and actor execution, the stale request is rejected, not reclaimed.
+     * Do not use the browsed channel or mutate favourites/recent ordering. */
+    PlayerCommandRequest request = {
+        .kind = PLAYER_COMMAND_OPEN,
+        .source = PLAYER_COMMAND_SOURCE_IPTV,
+        .lease = guard.lease,
+        .uri = url,
+        .metadata = snapshot->media.metadata ? snapshot->media.metadata : name,
+        .flag = true,
+    };
+    PlayerCommandStatus status = player_submit_command_async(&request);
+    protocol_coordinator_media_guard_end(&guard);
+    if (!player_command_status_succeeded(status))
+    {
+        iptv_set_status("Settings saved, but the channel could not be restarted.");
+        return false;
+    }
+    mutexLock(&g_mutex);
+    if (token == g_playback_token)
+    {
+        g_playback_state = PLAYER_STATE_LOADING;
+        snprintf(g_status, sizeof(g_status), "Connecting IPTV: %s", g_last_name);
+    }
+    mutexUnlock(&g_mutex);
+    return true;
 }
 
 bool iptv_prompt_url(char *out_url, size_t out_url_size)

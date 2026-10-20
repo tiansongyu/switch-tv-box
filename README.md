@@ -12,6 +12,7 @@
 
 - 首页只保留 **IPTV、AirPlay、DLNA** 三个入口，默认中文，支持手柄和触摸。
 - IPTV 支持 M3U/M3U8、分类、搜索、EPG；播放中可呼出频道列表切台，收藏栏目保存到 SD 卡。
+- IPTV 播放设置提供原画／均衡／流畅与 6／30／60 秒起播缓冲，默认选择 60 秒缓冲，后台最多预读 180 秒；画质选择取决于片源是否提供多码率版本，详见 [播放说明](docs/iptv.md#playback-quality-and-buffering)。
 - DLNA 视频投屏，接收手机应用发送的视频地址，支持播放、暂停、停止，以及可定位视频的进度跳转；[投屏指南与实现说明](docs/DLNA.md)记录了参考 wiliwili 的修复与验证范围。
 - AirPlay 1 RAOP：RSA/AES、ALAC/AAC/PCM、UDP 音频、音量、FLUSH、重传和实际音频输出链路。
 - AirPlay 1 照片：JPEG/PNG、预缓存、缓存显示；在播放器中保持显示至停止或替换。
@@ -33,6 +34,10 @@ switch/switch-tv-box/
   licenses/
 ```
 
+Release 同时提供 `switch-tv-box-v0.1.0-complete.zip`，包含 `sdmc/` 安装目录、
+`source/` 完整已提交源码与离线规范、`manifest.json` 构建标识。安装时复制
+`sdmc/` 里面的内容到 SD 卡根目录；下载完整性可用 `SHA256SUMS.txt` 核对。
+
 使用 Atmosphère/homebrew 环境，推荐完整应用模式启动。手机与 Switch 连接同一局域网，在支持 AirPlay 的应用中选择 **Switch TV Box**。镜像需要配对时，输入电视上显示的 PIN。
 
 直播源可以放入 `switch/switch-tv-box/iptv/`，也可在频道库的直播源管理中添加。配置目录与 NX-Cast 分开；要迁移直播源，请复制原 `iptv/` 下自己的配置文件。AirPlay 身份与配对记录由本机生成，不随安装包分发。
@@ -44,6 +49,7 @@ switch/switch-tv-box/
 | 频道列表中切台 | 方向键选择、A 播放、B 收起列表 |
 | 收藏 / 取消收藏 | 频道列表选中频道后按 Y |
 | 查看收藏频道 | 频道列表顶部选择“收藏” |
+| 调整画质与缓冲 | 频道列表顶部选择“播放设置”，保存后重播当前频道 |
 | 返回正在播放的画面 | 首页按 B，或在投屏页面选择播放控制 |
 | AirPlay 音乐暂停 / 继续 | AirPlay 页面选择播放控制后按 A |
 | 播放画面暂停 / 跳转 / 音量 | A / 左右或 L、R / 上下 |
@@ -64,7 +70,7 @@ switch/switch-tv-box/
 
 使用本机已有 Eden 在独立虚拟桌面运行实际 NRO：见 [模拟器启动与兼容说明](docs/EMULATOR.md)，包括独立 SD 配置、兼容 SDK 和局域网发现助手。
 
-生成十六种真实 UI 预览：`python3 scripts/preview_home.py`，输出到 `artifacts/ui/`。
+生成二十一种真实 UI 预览：`python3 scripts/preview_home.py`，输出到 `artifacts/ui/`。
 
 ## 本地规范与来源
 

@@ -92,6 +92,13 @@ PlayerBrowserRect player_browser_modal_item_rect(const PlayerBrowserView *v, int
                                w - 12, 76};
 }
 
+PlayerBrowserRect player_browser_settings_choice_rect(const PlayerBrowserView *v, int row,
+                                                       int choice)
+{
+    PlayerBrowserRect r = player_browser_modal_item_rect(v, row);
+    return (PlayerBrowserRect){r.x + 218 + choice * 214, r.y + 10, 204, r.h - 20};
+}
+
 static int modal_rows(const PlayerBrowserView *v)
 {
     return (v->modal_count + columns(v) - 1) / columns(v);
@@ -202,6 +209,14 @@ static void modal(PlayerBrowser *b, PlayerBrowserModal m, int count)
     b->suppress_held = true;
 }
 
+void player_browser_open_settings(PlayerBrowser *b, int quality, int buffer)
+{
+    modal(b, PLAYER_BROWSER_MODAL_PLAYBACK_SETTINGS, 3);
+    b->view.settings_quality = (int)clamp(quality, 0, 2);
+    b->view.settings_buffer = (int)clamp(buffer, 0, 2);
+    b->view.settings_save_failed = false;
+}
+
 static PlayerBrowserAction toolbar(PlayerBrowser *b)
 {
     switch (b->view.toolbar_focus)
@@ -220,6 +235,8 @@ static PlayerBrowserAction toolbar(PlayerBrowser *b)
     case PLAYER_BROWSER_SOURCE_FILTER:
         modal(b, PLAYER_BROWSER_MODAL_SOURCES, b->source_count + 2);
         break;
+    case PLAYER_BROWSER_PLAYBACK_SETTINGS:
+        return action(PLAYER_BROWSER_ACTION_SETTINGS, 0);
     }
     return none();
 }
@@ -255,6 +272,15 @@ static PlayerBrowserAction activate(PlayerBrowser *b)
             return none();
         int i = v->modal_cursor;
         PlayerBrowserModal m = v->modal;
+        if (m == PLAYER_BROWSER_MODAL_PLAYBACK_SETTINGS)
+        {
+            if (i == 2)
+                return action(PLAYER_BROWSER_ACTION_SETTINGS_SAVE, 0);
+            int *value = i == 0 ? &v->settings_quality : &v->settings_buffer;
+            *value = (*value + 1) % 3;
+            v->settings_save_failed = false;
+            return none();
+        }
         v->modal = PLAYER_BROWSER_MODAL_NONE;
         b->suppress_held = true;
         if (m == PLAYER_BROWSER_MODAL_CATEGORIES)
@@ -309,6 +335,17 @@ static void navigate(PlayerBrowser *b, unsigned d)
     PlayerBrowserView *v = &b->view;
     if (v->modal)
     {
+        if (v->modal == PLAYER_BROWSER_MODAL_PLAYBACK_SETTINGS &&
+            (d == PLAYER_BROWSER_LEFT || d == PLAYER_BROWSER_RIGHT))
+        {
+            if (v->modal_cursor < 2)
+            {
+                int *value = v->modal_cursor == 0 ? &v->settings_quality : &v->settings_buffer;
+                *value = (*value + (d == PLAYER_BROWSER_LEFT ? 2 : 1)) % 3;
+                v->settings_save_failed = false;
+            }
+            return;
+        }
         int delta = d == PLAYER_BROWSER_UP     ? -columns(v)
                     : d == PLAYER_BROWSER_DOWN ? columns(v)
                     : d == PLAYER_BROWSER_LEFT ? -1
@@ -515,6 +552,18 @@ PlayerBrowserAction player_browser_touch(PlayerBrowser *b, bool down, float x, f
                 if (hit(player_browser_modal_item_rect(v, i), x, y))
                 {
                     v->modal_cursor = i;
+                    if (v->modal == PLAYER_BROWSER_MODAL_PLAYBACK_SETTINGS && i < 2)
+                    {
+                        for (int choice = 0; choice < 3; ++choice)
+                            if (hit(player_browser_settings_choice_rect(v, i, choice), x, y))
+                            {
+                                int *value = i == 0 ? &v->settings_quality : &v->settings_buffer;
+                                *value = choice;
+                                v->settings_save_failed = false;
+                                return none();
+                            }
+                        return none();
+                    }
                     return activate(b);
                 }
         return none();

@@ -660,7 +660,7 @@ test-ui:
 
 test-iptv-data:
 	@mkdir -p "$(CURDIR)/$(BUILD)/tests"
-	$(HOST_CC) $(HOST_CFLAGS) -D_POSIX_C_SOURCE=200809L -pthread -Iscripts/iptv_test_stubs scripts/test_iptv_data.c source/iptv/url.c source/iptv/xmltv.c source/player/ui/home.c -lz -o "$(CURDIR)/$(BUILD)/tests/test_iptv_data"
+	$(HOST_CC) $(HOST_CFLAGS) -D_POSIX_C_SOURCE=200809L -pthread -Iscripts/iptv_test_stubs scripts/test_iptv_data.c source/iptv/url.c source/iptv/xmltv.c source/iptv/playback_settings.c source/player/ui/home.c -lz -o "$(CURDIR)/$(BUILD)/tests/test_iptv_data"
 	@"$(CURDIR)/$(BUILD)/tests/test_iptv_data"
 
 test-protocol-coordinator:
@@ -692,6 +692,12 @@ test-player-cache-policy:
 	@mkdir -p $(dir $(PLAYER_CACHE_POLICY_TEST_BIN))
 	$(HOST_CC) $(HOST_CFLAGS) source/player/cache_policy.c scripts/test_player_cache_policy.c -o $(PLAYER_CACHE_POLICY_TEST_BIN)
 	@$(PLAYER_CACHE_POLICY_TEST_BIN)
+
+.PHONY: test-iptv-playback-settings
+test-iptv-playback-settings:
+	@mkdir -p "$(CURDIR)/$(BUILD)/tests"
+	$(HOST_CC) $(HOST_CFLAGS) -pthread scripts/test_iptv_playback_settings.c -o "$(CURDIR)/$(BUILD)/tests/test_iptv_playback_settings"
+	@"$(CURDIR)/$(BUILD)/tests/test_iptv_playback_settings"
 
 test-log-mirror:
 	@mkdir -p $(dir $(LOG_MIRROR_TEST_BIN))
@@ -748,7 +754,7 @@ test-airplay-session:
 	$(HOST_CC) $(HOST_CFLAGS) $(HOST_THREAD_FLAGS) source/protocol/airplay/protocol/rtsp.c source/protocol/airplay/protocol/logical_session.c scripts/test_airplay_session.c -o $(AIRPLAY_SESSION_TEST_BIN)
 	@$(AIRPLAY_SESSION_TEST_BIN)
 
-test-c-safety: test-c-size test-soap-writer test-player-types test-player-utf8 test-player-cache-policy test-seek-target test-iptv-url test-airplay-dns
+test-c-safety: test-c-size test-soap-writer test-player-types test-player-utf8 test-player-cache-policy test-iptv-playback-settings test-seek-target test-iptv-url test-airplay-dns
 
 test-player-utf8:
 	@mkdir -p $(dir $(PLAYER_UTF8_TEST_BIN))

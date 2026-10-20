@@ -79,7 +79,7 @@ int main(int argc, char **argv)
     int tw, th;
     io.Fonts->GetTexDataAsAlpha8(&atlas, &tw, &th);
     io.Fonts->SetTexID((ImTextureID)1);
-    home_ui_init(nullptr, strncmp(scenario, "english", 7) != 0);
+    home_ui_init(nullptr, strstr(scenario, "english") == nullptr);
     PlayerHomeViewState home = {};
     home.storage_ready = home.video_ready = home.network_ready = true;
     home.dlna_running = home.airplay_running = true;
@@ -139,10 +139,15 @@ int main(int argc, char **argv)
         preview_channels = strstr(scenario, "empty") ? 0 : 20;
         PlayerBrowser browser;
         player_browser_init(&browser);
-        player_browser_open(&browser, !strcmp(scenario, "iptv-drawer"));
+        player_browser_open(&browser, strstr(scenario, "drawer") != nullptr);
         player_browser_sync(&browser, preview_channels, 3, 4, 1);
+        if (strstr(scenario, "settings"))
+        {
+            player_browser_open_settings(&browser, strstr(scenario, "default") ? 0 : 2, 2);
+            browser.view.modal_cursor = 2;
+        }
         home.iptv_browser = browser.view;
-        home.iptv_playback_active = !strcmp(scenario, "iptv-drawer");
+        home.iptv_playback_active = strstr(scenario, "drawer") != nullptr;
         home.iptv_channel_count = 20;
         home.iptv_visible_count = preview_channels;
         snprintf(home.iptv_active_filter, sizeof(home.iptv_active_filter), "%s", preview_filter ? "收藏" : "全部频道");

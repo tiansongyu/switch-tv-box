@@ -74,6 +74,29 @@ IPv4 会自动从该网卡读取，也可用 `--address` 明确指定。系统�
 启动器会用文件锁和进程环境检查拒绝重复启动，也能识别同一状态目录下的
 手动 GDB/Eden 会话。准备配置前必须先关闭该会话。
 
+### IPTV 物理网卡 HTTP 直连（可选）
+
+如果宿主的透明代理 / TUN 影响直播吞吐，可显式启动本项目的 HTTP 辅助：
+
+```sh
+python3 scripts/run-eden-virtual.py --interface enp7s0 --iptv-direct-http
+```
+
+它只监听宿主 `127.0.0.1:18957`，通过指定物理网卡转发请求，不修改系统代理、
+路由或其他程序。启动器等待辅助程序就绪后创建临时 `iptv-direct-http.flag`，
+退出时清理；辅助程序异常退出时关闭本次 Eden，避免保留失效的代理配置。
+未添加开关时使用原网络路径；`--prepare-only` 不启动后台辅助程序。
+
+当前范围仅为 **IPTV 的公共 IPv4 HTTP 地址**，例如本次测试的 CCTV-3 备用源。
+初始地址为域名、HTTPS、IPv6 或局域网地址时不应用该辅助。经辅助转发的地址
+如果重定向到域名或 HTTPS，会明确失败；它不提供 DNS 绕过或 CONNECT 隧道。
+AirPlay、DLNA 和实体 Switch 不启用这条路径。
+
+用于排查缓存与解码时，在该测试 SD 的 `switch/switch-tv-box/` 中创建
+`iptv-diagnostics.flag` 后重启。`iptv-playback.log` 每三秒记录播放位置、缓存
+秒数、实际视频尺寸和两类掉帧数，最多 240 条，不记录 URL 或令牌。
+删除标记并重启即可关闭。该标记与日志不进入安装包。
+
 如果 Eden 提示缺少解密组件，对本项目自制 NRO 选择 **No** 即可。
 启动器会等到其 Eden 子进程拥有 7000 端口、实际 `/info` 响应可用后，
 启动 `scripts/eden-airplay-advertise.py`，在指定网卡上发布真实接收器发现记录。

@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
+import select
 import signal
 import socket
 import stat
@@ -28,6 +29,8 @@ CONTROL_TEMPLATE = (
 )
 HELPER = ROOT / "scripts/eden-airplay-advertise.py"
 HELPER_PYTHON = Path("/usr/bin/python3")
+IPTV_DIRECT_HELPER = ROOT / "scripts/eden-iptv-direct.py"
+IPTV_DIRECT_MARKER = "iptv-direct-http.flag"
 
 
 def ini():
@@ -190,6 +193,9 @@ def prepare(state, nro, interface):
     app = sd.joinpath(*APP.parts)
     atomic_write(state, app / "switch-tv-box.nro", nro.read_bytes())
     atomic_write(state, app / "eden-compat.flag", b"", mode=0o600)
+    # This marker represents a live launcher-owned relay, never a persisted
+    # preference. Preparing or launching without the option clears crash debris.
+    checked_target(state, app / IPTV_DIRECT_MARKER).unlink(missing_ok=True)
 
     config_path = checked_target(state, state / "config/eden/qt-config.ini")
     config = ini()
@@ -238,6 +244,14 @@ def preflight(args, state, nro):
         damaged = archive.testzip()
         if damaged:
             raise ValueError(f"Damaged SD package member: {damaged}")
+    if args.iptv_direct_http:
+        if not IPTV_DIRECT_HELPER.is_file():
+            raise ValueError(f"IPTV direct HTTP helper is missing: {IPTV_DIRECT_HELPER}")
+        subprocess.run(
+            [str(HELPER_PYTHON), str(IPTV_DIRECT_HELPER),
+             "--interface", args.interface, "--check"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
     if not args.prepare_only:
         if not os.environ.get("DISPLAY"):
             raise ValueError("DISPLAY is unset; run from the current desktop session.")
@@ -274,12 +288,51 @@ def stop_child(child):
         child.wait(timeout=5)
 
 
-def launch(state, nro, interface, address, lock_fd):
+@contextlib.contextmanager
+def iptv_direct_session(state, interface, log):
+    """Publish the runtime marker only after this process's relay is ready."""
+    child = None
+    identity = None
+    marker = checked_target(
+        state, state / "data/eden/sdmc" / Path(*APP.parts) / IPTV_DIRECT_MARKER
+    )
+    read_fd, write_fd = os.pipe()
+    try:
+        child = subprocess.Popen(
+            [str(HELPER_PYTHON), str(IPTV_DIRECT_HELPER),
+             "--interface", interface, "--parent-pid", str(os.getpid()),
+             "--ready-fd", str(write_fd)],
+            cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+            pass_fds=(write_fd,), start_new_session=True,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        if (not select.select([read_fd], [], [], 5)[0] or
+                os.read(read_fd, 1) != b"R" or child.poll() is not None):
+            raise RuntimeError("IPTV direct HTTP helper did not become ready; see its log.")
+        atomic_write(state, marker, f"launcher_pid={os.getpid()}\n".encode(), mode=0o600)
+        current = marker.stat()
+        identity = (current.st_dev, current.st_ino)
+        yield child
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+        stop_child(child)
+        if identity is not None:
+            with contextlib.suppress(FileNotFoundError):
+                current = marker.stat()
+                if (current.st_dev, current.st_ino) == identity:
+                    marker.unlink()
+
+
+def launch(state, nro, interface, address, lock_fd, iptv_direct_http=False):
     logs = ROOT / "artifacts/validation"
     logs.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     eden_log_path = logs / f"eden-desktop-{stamp}.log"
     helper_log_path = logs / f"eden-discovery-{stamp}.log"
+    direct_log_path = logs / f"eden-iptv-direct-{stamp}.log"
     environment = os.environ.copy()
     environment.update({
         "XDG_CONFIG_HOME": str(state / "config"),
@@ -289,6 +342,8 @@ def launch(state, nro, interface, address, lock_fd):
         "QT_QPA_PLATFORM": "xcb",
     })
     eden = helper = None
+    direct = None
+    direct_resources = contextlib.ExitStack()
     stop_requested = False
 
     def request_stop(_signum, _frame):
@@ -300,6 +355,11 @@ def launch(state, nro, interface, address, lock_fd):
         for number in (signal.SIGINT, signal.SIGTERM)
     }
     try:
+        if iptv_direct_http:
+            direct_log = direct_resources.enter_context(direct_log_path.open("wb"))
+            direct = direct_resources.enter_context(iptv_direct_session(state, interface, direct_log))
+            print(f"IPTV direct HTTP enabled; public IPv4 HTTP only; log: {direct_log_path}",
+                  flush=True)
         with eden_log_path.open("wb") as eden_log, helper_log_path.open("wb") as helper_log:
             eden = subprocess.Popen(
                 [str(EDEN), "-g", str(nro)], env=environment, cwd=ROOT,
@@ -322,6 +382,8 @@ def launch(state, nro, interface, address, lock_fd):
             # A first-run Qt modal may hold boot, so wait while the GUI lives.
             last_error = None
             while eden.poll() is None and not stop_requested:
+                if direct is not None and direct.poll() is not None:
+                    raise RuntimeError("IPTV direct HTTP helper exited; stopping this Eden session.")
                 try:
                     probe = subprocess.run(
                         helper_command + ["--check"], cwd=ROOT,
@@ -345,6 +407,8 @@ def launch(state, nro, interface, address, lock_fd):
             )
             warned = False
             while eden.poll() is None and not stop_requested:
+                if direct is not None and direct.poll() is not None:
+                    raise RuntimeError("IPTV direct HTTP helper exited; stopping this Eden session.")
                 if helper.poll() is not None and not warned:
                     print(
                         f"AirPlay helper exited ({helper.returncode}); "
@@ -358,6 +422,7 @@ def launch(state, nro, interface, address, lock_fd):
         # Signal only the subprocesses created by this launcher.
         stop_child(helper)
         stop_child(eden)
+        direct_resources.close()
         for number, handler in old_handlers.items():
             signal.signal(number, handler)
 
@@ -378,6 +443,9 @@ def main():
                         help="isolated Eden state directory")
     parser.add_argument("--nro", type=Path, default=ROOT / "switch-tv-box.nro",
                         help="NRO to install over the packaged executable")
+    parser.add_argument("--iptv-direct-http", action="store_true",
+                        help="optional Eden relay through --interface; public IPv4 HTTP IPTV only "
+                             "(no domains or HTTPS, no system proxy changes)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--prepare-only", action="store_true",
                       help="install SD resources and configure Eden without starting it")
@@ -403,7 +471,8 @@ def main():
             print(f"Prepared {installed}; LAN {args.interface} {address}", flush=True)
             if args.prepare_only:
                 return 0
-            return launch(state, installed, args.interface, address, lock.fileno())
+            return launch(state, installed, args.interface, address, lock.fileno(),
+                          args.iptv_direct_http)
     except (OSError, ValueError, RuntimeError, configparser.Error,
             subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(f"run-eden: {error}", file=sys.stderr)

@@ -73,7 +73,7 @@ struct SwitchActionHint { const char *button; const char *label; };
                         "-I", str(ROOT / "source"), str(build / "preview.cpp"), str(build / "home.o"), str(build / "browser.o"),
                         *(str(imgui / name) for name in ["imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp"]),
                         "-o", str(build / "preview")], check=True)
-        for scenario in ["home", "airplay", "dlna", "playing", "music", "music-paused", "pairing", "offline", "english", "english-airplay", "english-dlna", "long-title", "iptv", "iptv-drawer", "iptv-favorites", "iptv-empty-favorites"]:
+        for scenario in ["home", "airplay", "dlna", "playing", "music", "music-paused", "pairing", "offline", "english", "english-airplay", "english-dlna", "long-title", "iptv", "iptv-drawer", "iptv-favorites", "iptv-empty-favorites", "iptv-settings", "iptv-drawer-settings", "iptv-settings-english", "iptv-settings-default", "iptv-settings-default-english"]:
             ppm = build / f"{scenario}.ppm"
             subprocess.run([str(build / "preview"), str(ROOT / "assets/fonts/switch_font.ttf"),
                             str(ppm), scenario], check=True)

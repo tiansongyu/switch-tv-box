@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "player/types.h"
+
 #define IPTV_ROOT_DIR "sdmc:/switch/switch-tv-box/iptv"
 #define IPTV_PREINSTALLED_SOURCES_FILE IPTV_ROOT_DIR "/sources.txt"
 #define IPTV_MAX_RECENT 32
@@ -99,6 +101,7 @@ IptvPlaylistKind iptv_classify_playlist_file(const char *path);
 const char *iptv_playlist_kind_name(IptvPlaylistKind kind);
 
 bool iptv_get_state(IptvState *out);
+void iptv_sync_playback_state(const PlayerSnapshot *snapshot);
 int iptv_get_channel_count(void);
 int iptv_get_selected_index(void);
 void iptv_set_selected_index(int index);
@@ -136,5 +139,8 @@ bool iptv_toggle_selected_favorite(void);
 
 bool iptv_play_channel(int index);
 bool iptv_play_url(const char *url);
+/* Reopen the currently owned IPTV URI using the same lease and current settings.
+ * Returns false without submitting when the supplied playback has ended/changed. */
+bool iptv_restart_current_playback(const PlayerSnapshot *snapshot);
 bool iptv_prompt_url(char *out_url, size_t out_url_size);
 void iptv_set_status(const char *status);

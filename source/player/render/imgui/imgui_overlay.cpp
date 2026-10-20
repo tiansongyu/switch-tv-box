@@ -1477,6 +1477,15 @@ void browser_toolbar_icon(ImDrawList *draw, ImVec2 c, int icon, ImU32 color)
             draw->AddLine(ImVec2(c.x - 2, c.y + i * 5), ImVec2(c.x + 7, c.y + i * 5), color, 1.6f);
         }
     }
+    else if (icon == PLAYER_BROWSER_PLAYBACK_SETTINGS)
+    {
+        for (int i = -1; i <= 1; ++i)
+        {
+            const float y = c.y + i * 5;
+            draw->AddLine(ImVec2(c.x - 7, y), ImVec2(c.x + 7, y), color, 1.6f);
+            draw->AddCircleFilled(ImVec2(c.x + (i == 0 ? 3 : -3), y), 2.4f, color, 12);
+        }
+    }
 }
 
 void browser_button(ImDrawList *draw, PlayerBrowserRect r, const char *label,
@@ -1526,6 +1535,52 @@ void draw_browser_modal(ImDrawList *draw, const PlayerBrowserView &v, const Brow
     const PlayerBrowserRect modal = player_browser_modal_rect(&v);
     draw->AddRectFilled(ImVec2(0, 0), ImVec2(1280, 720), IM_COL32(0, 0, 0, 145));
     draw->AddRectFilled(browser_min(modal), browser_max(modal), p.background, 24);
+    if (v.modal == PLAYER_BROWSER_MODAL_PLAYBACK_SETTINGS)
+    {
+        draw_home_text(draw, modal.x + 32, modal.y + 24, 28, p.text,
+                       home_ui_text("Playback settings", "播放设置"));
+        const char *quality[] = {home_ui_text("Original", "原画"),
+                                 home_ui_text("Balanced", "均衡"),
+                                 home_ui_text("Smooth", "流畅")};
+        const char *buffer[] = {home_ui_text("Quick · 6 s", "较快 · 6 秒"),
+                                home_ui_text("Stable · 30 s", "稳定 · 30 秒"),
+                                home_ui_text("Extra buffer · 60 s", "更稳 · 60 秒")};
+        for (int row = 0; row < 2; ++row)
+        {
+            const PlayerBrowserRect r = player_browser_modal_item_rect(&v, row);
+            draw->AddRectFilled(browser_min(r), browser_max(r), p.surface, 12);
+            draw->AddRect(browser_min(r), browser_max(r), v.modal_cursor == row ? p.accent : p.line,
+                          12, 0, v.modal_cursor == row ? 2.5f : 1.0f);
+            browser_text(draw, {r.x + 20, r.y, 190, r.h},
+                         row == 0 ? home_ui_text("Quality", "画质") : home_ui_text("Buffer", "缓冲"),
+                         23, p.text);
+            for (int choice = 0; choice < 3; ++choice)
+            {
+                const bool selected = choice == (row == 0 ? v.settings_quality : v.settings_buffer);
+                browser_button(draw, player_browser_settings_choice_rect(&v, row, choice),
+                               row == 0 ? quality[choice] : buffer[choice], p,
+                               v.modal_cursor == row && selected, selected);
+            }
+        }
+        browser_button(draw, player_browser_modal_item_rect(&v, 2),
+                       v.playback_active ? home_ui_text("Save & replay current channel", "保存并重播当前频道")
+                                         : home_ui_text("Save settings", "保存设置"),
+                       p, v.modal_cursor == 2, true, -1, "A");
+        browser_text(draw, {192, 450, 896, 28},
+                     home_ui_text("Quality selects HLS variants. Single-quality sources keep their original resolution.",
+                                  "画质用于选择 HLS 多码率；单一码率直播源仍保持原分辨率。"), 17, p.muted);
+        browser_text(draw, {192, 481, 896, 28},
+                     home_ui_text("More buffer starts later and increases live delay, but can reduce network interruptions.",
+                                  "缓冲更长，起播会更慢、直播会更晚，可减少网络波动引起的卡顿。"), 17, p.muted);
+        browser_text(draw, {192, 542, 896, 48},
+                     v.settings_save_failed
+                         ? home_ui_text("Could not save. Check SD storage, then try again. B cancels.",
+                                        "保存失败，请检查 SD 卡后重试。B 取消。")
+                         : home_ui_text("Up / Down  Move     Left / Right or A  Change     B  Cancel",
+                                        "上 / 下选择     左 / 右或 A 切换     B 取消修改"),
+                     17, v.settings_save_failed ? IM_COL32(255, 158, 144, 255) : p.muted);
+        return;
+    }
     const char *title = v.modal == PLAYER_BROWSER_MODAL_CATEGORIES ? home_ui_text("Categories", "分类") :
                         v.modal == PLAYER_BROWSER_MODAL_SOURCES ? home_ui_text("Playlist sources", "直播源") :
                         home_ui_text("Delete this source?", "删除此直播源？");
@@ -1619,7 +1674,8 @@ void draw_iptv_panel(ImDrawList *draw, const PlayerHomeViewState &home, float wi
     const char *toolbar[] = {
         home_ui_text("All", "全部频道"), home_ui_text("Favorites", "收藏"),
         home_ui_text("Categories", "分类"), home_ui_text("Recent", "最近"),
-        home_ui_text("Search", "搜索"), home_ui_text("Sources", "直播源")};
+        home_ui_text("Search", "搜索"), home_ui_text("Sources", "直播源"),
+        home_ui_text("Settings", "播放设置")};
     const int filter = iptv_get_filter_index();
     for (int i = 0; i < PLAYER_BROWSER_TOOLBAR_COUNT; ++i)
     {

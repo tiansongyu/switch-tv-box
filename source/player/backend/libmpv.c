@@ -132,6 +132,20 @@ static u64 g_process_volume_pid = 0;
 static unsigned int g_log_noise_seen[LIBMPV_LOG_NOISE_COUNT];
 static unsigned int g_log_noise_suppressed[LIBMPV_LOG_NOISE_COUNT];
 
+/* Explicit, bounded emulator diagnostics. No property queries or disk writes
+ * occur unless this marker existed when libmpv was first initialized. */
+#define IPTV_DIAGNOSTIC_ROOT "sdmc:/switch/switch-tv-box/"
+#define IPTV_DIAGNOSTIC_MAX_SAMPLES 240u
+static bool g_iptv_diagnostic_checked;
+static bool g_iptv_diagnostic_enabled;
+static unsigned int g_iptv_diagnostic_count;
+static uint64_t g_iptv_diagnostic_next_ms;
+static uint64_t g_iptv_diagnostic_start_ms;
+static uint64_t g_iptv_diagnostic_load_ms;
+static IptvPlaybackSettings g_iptv_diagnostic_settings;
+static bool g_iptv_direct_http_checked;
+static bool g_iptv_direct_http_enabled;
+
 #if defined(NXCAST_RUNTIME_OBSERVABILITY) && NXCAST_RUNTIME_OBSERVABILITY
 static bool g_dlna_observe_active = false;
 static uint64_t g_dlna_observe_last_ms = 0u;
@@ -144,6 +158,108 @@ static void libmpv_on_render_update(void *ctx);
 static uint64_t libmpv_monotonic_ms(void)
 {
     return armTicksToNs(armGetSystemTick()) / 1000000ULL;
+}
+
+static void libmpv_iptv_direct_http_init(void)
+{
+    if (g_iptv_direct_http_checked)
+        return;
+    g_iptv_direct_http_checked = true;
+    if (!tvbox_eden_compat_enabled())
+        return;
+    FILE *marker = fopen(IPTV_DIAGNOSTIC_ROOT "iptv-direct-http.flag", "rb");
+    if (marker)
+    {
+        fclose(marker);
+        g_iptv_direct_http_enabled = true;
+        log_info("[player-libmpv] Eden IPTV direct HTTP helper enabled\n");
+    }
+}
+
+static void libmpv_iptv_diagnostic_init(void)
+{
+    if (g_iptv_diagnostic_checked)
+        return;
+    g_iptv_diagnostic_checked = true;
+    if (!tvbox_eden_compat_enabled())
+        return;
+    FILE *marker = fopen(IPTV_DIAGNOSTIC_ROOT "iptv-diagnostics.flag", "rb");
+    if (!marker)
+        return;
+    fclose(marker);
+    FILE *file = fopen(IPTV_DIAGNOSTIC_ROOT "iptv-playback.log", "wb");
+    if (!file)
+        return;
+    g_iptv_diagnostic_start_ms = libmpv_monotonic_ms();
+    bool written = fprintf(file,
+        "IPTV diagnostics initialized_ms=%llu interval_ms=3000 max_samples=%u "
+        "quality=0:original,1:balanced,2:smooth buffer=0:fast,1:balanced,2:stable "
+        "unavailable=-1\n",
+        (unsigned long long)g_iptv_diagnostic_start_ms,
+        IPTV_DIAGNOSTIC_MAX_SAMPLES) >= 0;
+    if (fclose(file) != 0)
+        written = false;
+    g_iptv_diagnostic_enabled = written;
+}
+
+static void libmpv_iptv_diagnostic_sample(void)
+{
+    if (!g_iptv_diagnostic_enabled ||
+        g_iptv_diagnostic_count >= IPTV_DIAGNOSTIC_MAX_SAMPLES)
+        return;
+    uint64_t now_ms = libmpv_monotonic_ms();
+    if (now_ms < g_iptv_diagnostic_next_ms)
+        return;
+    g_iptv_diagnostic_next_ms = now_ms + 3000u;
+    PlayerOwnershipLease lease = {0};
+    if (!player_ownership_current(&lease) || lease.owner != PLAYER_MEDIA_OWNER_IPTV)
+        return;
+    mutexLock(&g_mutex);
+    mpv_handle *mpv = g_mpv;
+    PlayerState state = g_state;
+    IptvPlaybackSettings settings = g_iptv_diagnostic_settings;
+    uint64_t load_ms = g_iptv_diagnostic_load_ms;
+    mutexUnlock(&g_mutex);
+    if (!mpv || !load_ms)
+        return;
+
+    double position = -1.0, cache_seconds = -1.0;
+    int64_t width = -1, height = -1, dropped = -1, decoder_dropped = -1;
+    (void)mpv_get_property(mpv, "time-pos", MPV_FORMAT_DOUBLE, &position);
+    (void)mpv_get_property(mpv, "demuxer-cache-duration", MPV_FORMAT_DOUBLE,
+                           &cache_seconds);
+    (void)mpv_get_property(mpv, "video-params/w", MPV_FORMAT_INT64, &width);
+    (void)mpv_get_property(mpv, "video-params/h", MPV_FORMAT_INT64, &height);
+    (void)mpv_get_property(mpv, "frame-drop-count", MPV_FORMAT_INT64, &dropped);
+    (void)mpv_get_property(mpv, "decoder-frame-drop-count", MPV_FORMAT_INT64,
+                           &decoder_dropped);
+    static const char *const state_names[] = {
+        "idle", "stopped", "loading", "buffering", "seeking", "playing",
+        "paused", "error"
+    };
+    const char *state_name = state >= PLAYER_STATE_IDLE && state <= PLAYER_STATE_ERROR
+        ? state_names[state] : "unknown";
+    ++g_iptv_diagnostic_count;
+    FILE *file = fopen(IPTV_DIAGNOSTIC_ROOT "iptv-playback.log", "ab");
+    if (!file)
+    {
+        g_iptv_diagnostic_enabled = false;
+        return;
+    }
+    bool written = fprintf(file,
+        "sample=%u elapsed_ms=%llu load_age_ms=%llu state=%s "
+        "quality=%d buffer=%d time_pos=%.3f cache_s=%.3f video=%lldx%lld "
+        "frame_drop=%lld decoder_drop=%lld\n",
+        g_iptv_diagnostic_count,
+        (unsigned long long)(now_ms - g_iptv_diagnostic_start_ms),
+        (unsigned long long)(now_ms - load_ms), state_name,
+        (int)settings.quality, (int)settings.buffer, position, cache_seconds,
+        (long long)width, (long long)height, (long long)dropped,
+        (long long)decoder_dropped) >= 0;
+    if (fclose(file) != 0)
+        written = false;
+    if (!written)
+        g_iptv_diagnostic_enabled = false;
 }
 
 static void libmpv_log_resource_boundary(const char *event)
@@ -1368,16 +1484,21 @@ static bool libmpv_maybe_issue_pending_seek_locked(LibmpvPendingEvents *pending)
 static bool libmpv_async_load_current(bool paused)
 {
     const char *args[5];
-    char options[256];
+    char options[512];
     int rc;
     LibmpvPendingEvents pending = {0};
     char detail[96];
     PlayerCachePolicy cache_policy;
+    PlayerOwnershipLease media_lease = {0};
+    bool has_owner = player_ownership_current(&media_lease);
+    IptvPlaybackSettings iptv_settings = {
+        IPTV_QUALITY_ORIGINAL, IPTV_BUFFER_STABLE
+    };
+    if (has_owner && media_lease.owner == PLAYER_MEDIA_OWNER_IPTV)
+        iptv_settings = iptv_playback_settings_get();
 #if defined(NXCAST_RUNTIME_OBSERVABILITY) && NXCAST_RUNTIME_OBSERVABILITY
-    PlayerOwnershipLease observe_lease = {0};
     bool observe_dlna =
-        player_ownership_current(&observe_lease) &&
-        observe_lease.owner == PLAYER_MEDIA_OWNER_DLNA;
+        has_owner && media_lease.owner == PLAYER_MEDIA_OWNER_DLNA;
 #endif
 
     libmpv_log_resource_boundary("next-loadfile");
@@ -1389,7 +1510,9 @@ static bool libmpv_async_load_current(bool paused)
         return false;
     }
 
-    cache_policy = player_cache_policy_for_uri(g_uri);
+    cache_policy = player_cache_policy_for_media(
+        g_uri, has_owner ? media_lease.owner : PLAYER_MEDIA_OWNER_NONE,
+        iptv_settings, g_iptv_direct_http_enabled);
     if (!player_cache_policy_format_options(&cache_policy, paused, options,
                                             sizeof(options)))
     {
@@ -1481,6 +1604,13 @@ static bool libmpv_async_load_current(bool paused)
     g_play_requested = !paused;
     g_play_unpause_pending = false;
     g_startup_hold_deadline_ms = libmpv_monotonic_ms() + LIBMPV_STARTUP_GATE_TIMEOUT_MS;
+    if (g_iptv_diagnostic_enabled && has_owner &&
+        media_lease.owner == PLAYER_MEDIA_OWNER_IPTV)
+    {
+        g_iptv_diagnostic_settings = iptv_settings;
+        g_iptv_diagnostic_load_ms = libmpv_monotonic_ms();
+        g_iptv_diagnostic_next_ms = 0u;
+    }
     g_seeking = false;
     g_paused_for_cache = false;
 #if defined(NXCAST_RUNTIME_OBSERVABILITY) && NXCAST_RUNTIME_OBSERVABILITY
@@ -1936,6 +2066,9 @@ static bool libmpv_init(void)
     }
 
     libmpv_set_option_string_checked("config", "no");
+    /* All three receivers pass media URLs directly. Switch cannot spawn the
+     * external yt-dlp/youtube-dl fallback after an unavailable channel URL. */
+    libmpv_set_option_string_checked("ytdl", "no");
     libmpv_set_option_string_checked("terminal", "no");
     libmpv_set_option_string_checked("input-default-bindings", "no");
     libmpv_set_option_string_checked("input-vo-keyboard", "no");
@@ -1988,6 +2121,8 @@ static bool libmpv_init(void)
     }
 
     process_volume = libmpv_process_volume_init();
+    libmpv_iptv_direct_http_init();
+    libmpv_iptv_diagnostic_init();
     if (process_volume)
     {
         (void)mpv_set_property(g_mpv, "volume", MPV_FORMAT_DOUBLE, &neutral_volume);
@@ -2500,6 +2635,7 @@ static bool libmpv_pump_events(int timeout_ms)
 
     libmpv_release_expired_startup_gate();
     libmpv_observe_dlna_sample();
+    libmpv_iptv_diagnostic_sample();
 
     return handled;
 }

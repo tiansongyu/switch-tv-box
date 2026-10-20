@@ -20,6 +20,7 @@ if [[ "${TVBOX_ACTION:-release}" == test || "${TVBOX_ACTION:-release}" == releas
     python3 scripts/test_platform_compat.py
     python3 scripts/test_eden_socket_compat.py
     python3 scripts/test_eden_airplay_advertise.py
+    python3 scripts/test_eden_iptv_direct.py
 fi
 if [[ "${TVBOX_ACTION:-release}" == build || "${TVBOX_ACTION:-release}" == release ]]; then
     make RELEASE_JOBS="${BUILD_JOBS:-8}" release-build
