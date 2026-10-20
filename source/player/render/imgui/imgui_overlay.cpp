@@ -279,7 +279,8 @@ void load_switch_fonts(ImGuiIO &io)
     PlFontData extended_simplified;
     PlFontData extended;
     ImFontConfig cfg;
-    ImWchar extended_range[] = {0xe000, 0xe152, 0};
+    /* ImGui retains this pointer until the atlas is built after this function. */
+    static const ImWchar extended_range[] = {0xe000, 0xe152, 0};
 
     if (load_packaged_font(io))
         return;

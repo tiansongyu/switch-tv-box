@@ -8,6 +8,7 @@
 #include <switch.h>
 
 #include "app/runtime_observability.h"
+#include "app/platform_compat.h"
 #include "log/log.h"
 #include "player/backend/libmpv_airplay.h"
 #include "player/cache_policy.h"
@@ -805,6 +806,11 @@ static bool libmpv_process_volume_init(void)
     u64 pid = 0;
 
     libmpv_process_volume_shutdown();
+
+    /* Eden does not provide aud:a; requesting it blocks service acquisition.
+     * Let the existing mpv volume/mute path handle emulator playback. */
+    if (tvbox_eden_compat_enabled())
+        return false;
 
     if (!hosversionAtLeast(11, 0, 0))
         return false;

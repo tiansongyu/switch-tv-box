@@ -6,6 +6,7 @@
 
 #include <switch.h>
 
+#include "app/platform_compat.h"
 #include "app/protocol_coordinator.h"
 #include "log/log.h"
 #include "player/renderer.h"
@@ -888,7 +889,10 @@ static bool integration_start_sync(void)
     receiver_config.features = AIRPLAY_MDNS_FEATURES_MIRROR_COMPAT |
                                AIRPLAY_MDNS_FEATURE_VIDEO |
                                AIRPLAY_MDNS_FEATURE_HLS;
-    receiver_config.enable_discovery = NXCAST_AIRPLAY_DISCOVERY_ENABLED != 0;
+    /* Eden stubs multicast interface/membership options. The desktop launcher
+     * publishes this live receiver via Avahi on the selected LAN interface. */
+    receiver_config.enable_discovery =
+        NXCAST_AIRPLAY_DISCOVERY_ENABLED != 0 && !tvbox_eden_compat_enabled();
     receiver_config.pin_display_callback = integration_pin_display;
     receiver_config.pin_dismiss_callback = integration_pin_dismiss;
     receiver_config.transport_prepare_callback = integration_mirror_prepare;

@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "app/network_diagnostics.h"
+#include "app/platform_compat.h"
 #include "app/protocol_coordinator.h"
 #include "app/runtime_diagnostics.h"
 #include "iptv/iptv.h"
@@ -294,6 +295,11 @@ static void main_input_trace(const char *fmt, ...)
 
 static void set_power_policy(bool active, bool use_logger)
 {
+    /* Eden 0.2.1 asserts on the optional application media-state IPC.
+     * Desktop power management is handled by the host in this opt-in mode. */
+    if (tvbox_eden_compat_enabled())
+        return;
+
     Result media_rc = appletSetMediaPlaybackState(active);
     Result sleep_rc = appletSetAutoSleepDisabled(active);
 
