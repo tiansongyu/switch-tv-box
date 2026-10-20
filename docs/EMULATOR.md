@@ -9,6 +9,33 @@
 
 模拟器的配置、SD 卡和缓存使用独立目录，不使用网易项目的账号数据。
 
+## Windows 自动组播
+
+Windows 上在 Eden 中打开 NRO 后，运行独立的 `Switch-TV-Box-Discovery.exe`。
+它自动枚举已连接的物理网卡，检测 Eden 实际拥有的接收端口，在对应网卡发布
+AirPlay / RAOP mDNS 和 DLNA SSDP。无需输入 IP、安装 Python 或修改系统路由。
+完整步骤见 [Windows 说明](EDEN-WINDOWS.txt)。
+
+组件沿用 wiliwili/libpdr 的 SSDP 发现交互：启动公告、周期 `ssdp:alive`、
+`M-SEARCH` 应答和退出 `ssdp:byebye`，支持 MediaRenderer、AVTransport、
+RenderingControl、ConnectionManager、UUID 和 rootdevice 查询。
+测试包含 wiliwili `source/api/dlna.cpp` 实际发送的搜索报文。
+
+Eden 的 BSD `SetSockOptImpl` 对 IP 层选项仍只记录 STUBBED 并返回成功，
+这使 NRO 无法可靠设置宿主组播入组和出口网卡。Windows 组件在宿主网络栈
+执行这些操作；手机配对、媒体接收、视频播放和 SOAP 控制仍由 NRO 完成。
+它不会把查找其他播放器作为接收投屏功能。
+
+为适应默认网卡、VPN 和多网卡，它从各 LAN 地址的 TCP 18958 提供真实接收器的
+设备描述，将 URLBase、控制、事件和资源 URL 指向该网卡的 NRO TCP 49152。
+TCP 18958 不代理 SOAP 或媒体。接收器停止、PID 被复用、身份改变或网卡变化时
+撤销旧记录并自动重新检测；只运行辅助组件不会生成一个虚假的可播放设备。
+同一子网有多个物理网卡时只发布一次。跨隔离网络仍需要网络本身支持互访和组播。
+
+源码为 `scripts/eden-lan-discovery.py` 与 `scripts/eden_receiver.py`；
+Windows CI 运行协议/生命周期测试，构建 PyInstaller 独立程序，并对打包后的 EXE
+执行模块与进程检查。包内保留对应源代码、运行库许可证和构建清单。
+
 ## Eden 中只显示英文文字界面
 
 `QUICK START`、`PLAYER CONTROLS`、`IPTV`、`DIAGNOSTICS` 是程序保留的文字首页。

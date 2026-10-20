@@ -1,0 +1,53 @@
+name: Eden Windows discovery
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/eden-lan-discovery.py'
+      - 'scripts/eden_receiver.py'
+      - 'scripts/requirements-eden-discovery.txt'
+      - 'scripts/test_eden_lan_discovery.py'
+      - 'scripts/package_eden_windows.py'
+      - 'docs/EDEN-WINDOWS.txt'
+      - '.github/workflows/eden-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned discovery dependencies
+        run: python -m pip install -r scripts/requirements-eden-discovery.txt pyinstaller==6.16.0
+      - name: Test Windows sockets, discovery and lifecycle
+        run: python scripts/test_eden_lan_discovery.py
+      - name: Build standalone Windows component
+        run: >-
+          python -m PyInstaller --noconfirm --clean --console
+          --name Switch-TV-Box-Discovery --paths scripts
+          --distpath build/windows-discovery
+          --workpath build/windows-discovery-work
+          --specpath build/windows-discovery-work
+          scripts/eden-lan-discovery.py
+      - name: Verify the packaged executable
+        run: |
+          & build/windows-discovery/Switch-TV-Box-Discovery/Switch-TV-Box-Discovery.exe --self-check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & build/windows-discovery/Switch-TV-Box-Discovery/Switch-TV-Box-Discovery.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package binary, source and licenses
+        run: python scripts/package_eden_windows.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: switch-tv-box-eden-windows
+          path: |
+            dist/switch-tv-box-eden-windows.zip
+            dist/switch-tv-box-eden-windows.zip.sha256
+          if-no-files-found: error

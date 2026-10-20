@@ -45,6 +45,10 @@ Release 同时提供 `switch-tv-box-v0.1.1-complete.zip`，包含 `sdmc/` 安装
 `PLAYER CONTROLS` 英文文字界面。请按 [Eden 启动与文字界面排查](docs/EMULATOR.md#eden-中只显示英文文字界面)
 配置模拟 SD，或使用本项目的 `scripts/run-eden.py` 自动准备。实体 Switch 无需该标记。
 
+Windows / Eden 的手机投屏发现使用 [自动组播组件](docs/EDEN-WINDOWS.txt)：
+运行 `Switch-TV-Box-Discovery.exe` 后自动识别物理网卡和接收器，发布 AirPlay 与 DLNA，
+无需手填 IP。组播仅在网络允许互访的局域网内工作。
+
 直播源可以放入 `switch/switch-tv-box/iptv/`，也可在频道库的直播源管理中添加。配置目录与 NX-Cast 分开；要迁移直播源，请复制原 `iptv/` 下自己的配置文件。AirPlay 身份与配对记录由本机生成，不随安装包分发。
 
 | 操作 | 按键 |

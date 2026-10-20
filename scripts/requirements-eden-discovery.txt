@@ -1,0 +1,2 @@
+psutil==7.0.0
+zeroconf==0.148.0
