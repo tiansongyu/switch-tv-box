@@ -28,7 +28,8 @@ python3 scripts/run-eden.py --interface enp7s0
 2. 将 `switch-tv-box-sdmc.zip` 解压到该 `sdmc` 根目录，保留
    `switch/switch-tv-box/switch-tv-box.nro`、`fonts/` 等完整目录。
 3. 在 `sdmc/switch/switch-tv-box/` 中新建一个空文件 **`eden-compat.flag`**。
-   确认没有被文件管理器自动添加 `.txt` 扩展名；不要只放在下载目录或 NRO 旁边。
+   确认没有被文件管理器自动添加 `.txt` 扩展名。标记必须位于模拟 SD 的上述固定路径；
+   如果从下载目录打开 NRO，单独把标记放在下载目录不会生效。
 4. 重新启动 NRO。兼容标记只在程序启动时读取，运行中添加不会生效。
    如果提示缺少解密组件，对本项目自制 NRO 选择 **No**。
 
