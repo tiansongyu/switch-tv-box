@@ -596,17 +596,25 @@ static void build_home_view_state(PlayerHomeViewState *out,
     out->iptv_playback_active =
         protocols &&
         protocols->active_media.owner == PLAYER_MEDIA_OWNER_IPTV;
-    if (snapshot && snapshot->state == PLAYER_STATE_ERROR)
+    bool iptv_route_queued = iptv_sync_playback_state(snapshot);
+    if (out->iptv_playback_active)
+    {
+        /* A log line may describe an earlier failed route. Only a terminal
+         * error in the current playback should report a failed channel. */
+        out->has_error = snapshot && snapshot->state == PLAYER_STATE_ERROR &&
+                         !iptv_route_queued;
+        if (out->has_error)
+            snprintf(out->error_line, sizeof(out->error_line), "%s",
+                     home_ui_text("Channel playback failed. Retry or choose another channel.",
+                                  "频道播放失败，请重试或切换频道。"));
+    }
+    else if (snapshot && snapshot->state == PLAYER_STATE_ERROR)
     {
         out->has_error = true;
         snprintf(out->error_line, sizeof(out->error_line),
-                 "%s", out->iptv_playback_active
-                     ? home_ui_text(
-                           "Channel playback failed. Retry or choose another channel.",
-                           "频道播放失败，请重试或切换频道。")
-                     : home_ui_text(
-                           "Playback failed. Retry or choose another media source.",
-                           "播放失败，请重试或切换媒体来源。"));
+                 "%s", home_ui_text(
+                     "Playback failed. Retry or choose another media source.",
+                     "播放失败，请重试或切换媒体来源。"));
     }
     else
     {
@@ -622,7 +630,6 @@ static void build_home_view_state(PlayerHomeViewState *out,
     g_iptv_browser.view.playback_active = out->iptv_playback_active && out->playback_active;
     main_browser_sync();
     out->iptv_browser = g_iptv_browser.view;
-    iptv_sync_playback_state(snapshot);
     if (iptv_get_state(&iptv_state))
     {
         out->iptv_ready = protocols &&

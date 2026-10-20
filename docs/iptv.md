@@ -129,6 +129,26 @@ playback when no IPTV session is active. AirPlay and DLNA keep their own
 per-file settings. Network timeouts are 20 / 45 / 60 seconds respectively;
 underlying network failures remain available in the runtime log.
 
+## Alternate routes after a failed channel
+
+When a channel reports a playback error, the player now tries other URLs for
+the same station already present in the loaded catalog, including other sources
+outside the current list filter. It retains the requested channel's title,
+favorites, recent history, and playback lease. It does not claim the player
+again after another protocol or channel has taken over.
+
+Matching uses explicit `tvg-id` values, ignoring case and known quality suffixes
+(`@SD`, `@HD`, `@FHD`, `@UHD`, `@4K`, `@8K`). Numbered legacy CCTV IDs such as
+`cctv3` also match the `CCTV3.cn` namespace used by iptv-org. Unknown suffixes
+and regional station IDs remain distinct; channel names are not fuzzy-matched.
+The player tries at most three alternate URLs, never retries a URL within the
+same request, and reports a final failure if all available attempts fail.
+Direct media URLs have no implicit channel alternatives.
+
+This connects the existing third-row **CCTV-3 综艺** entry to the already loaded
+**CCTV-3 (720p)** alternative when its original mobile-network route fails.
+It does not make an unreachable upstream route available or add a transcoder.
+
 ## CCTV-3 Source Check (2026-10-20)
 
 The installed **CCTV-3 综艺** entry at

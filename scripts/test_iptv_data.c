@@ -68,6 +68,8 @@ static void *test_realloc(void *data, size_t size)
 
 static int play_requests;
 static bool owns_iptv;
+static bool reject_open;
+static bool preempt_on_guard;
 static char last_submitted_uri[IPTV_URL_MAX];
 static PlayerOwnershipLease last_submitted_lease;
 void log_info(const char *fmt, ...) { (void)fmt; }
@@ -88,6 +90,8 @@ bool player_ownership_matches(PlayerMediaOwner o, uint64_t t)
 { (void)o; (void)t; return owns_iptv; }
 bool protocol_coordinator_media_guard_begin(PlayerMediaOwner o, uint64_t t, ProtocolMediaGuard *g)
 {
+    if (preempt_on_guard)
+        owns_iptv = false;
     if (!owns_iptv || o != PLAYER_MEDIA_OWNER_IPTV || t != g_playback_token)
         return false;
     *g = (ProtocolMediaGuard){.active = true, .lease = {o, t, 5}};
@@ -100,7 +104,7 @@ PlayerCommandStatus player_submit_command_async(const PlayerCommandRequest *r)
     iptv_copy(last_submitted_uri, sizeof(last_submitted_uri), r->uri);
     last_submitted_lease = r->lease;
     ++play_requests;
-    return PLAYER_COMMAND_STATUS_ACCEPTED;
+    return reject_open ? PLAYER_COMMAND_STATUS_QUEUE_FULL : PLAYER_COMMAND_STATUS_ACCEPTED;
 }
 bool player_command_status_succeeded(PlayerCommandStatus s)
 { return s == PLAYER_COMMAND_STATUS_ACCEPTED; }
@@ -227,6 +231,80 @@ static void test_favorites_restart(void)
     puts("IPTV favorites survived restart; failed saves rolled back; removal survived restart.");
 }
 
+static void test_alternate_routes(void)
+{
+    const char *path = IPTV_ROOT_DIR "/routes.m3u";
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    fputs("#EXTM3U\n"
+          "#EXTINF:-1 tvg-id=\"cctv3\",CCTV-3 综艺\nhttp://example.com/old.ts\n"
+          "#EXTINF:-1 tvg-id=\"CCTV13.cn@SD\",CCTV-13\nhttp://example.com/wrong13.ts\n"
+          "#EXTINF:-1 tvg-id=\"CCTV5Plus.cn@SD\",CCTV-5+\nhttp://example.com/wrong5.ts\n"
+          "#EXTINF:-1 tvg-id=\"CCTV3.cn@SD\",Duplicate URL\nhttp://example.com/old.ts\n"
+          "#EXTINF:-1 tvg-id=\"CCTV3.cn@East\",Regional ID\nhttp://example.com/wrong-region.ts\n"
+          "#EXTINF:-1 tvg-id=\"CCTV3.cn@SD\",CCTV-3 (720p)\nhttp://example.com/route1.ts\n"
+          "#EXTINF:-1 tvg-id=\"CCTV3.cn@HD\",CCTV-3 HD\nhttp://example.com/route2.ts\n"
+          "#EXTINF:-1 tvg-id=\"CCTV3.cn@FHD\",CCTV-3 FHD\nhttp://example.com/route3.ts\n"
+          "#EXTINF:-1 tvg-id=\"CCTV3.cn@UHD\",CCTV-3 UHD\nhttp://example.com/route4.ts\n", f);
+    assert(fclose(f) == 0);
+    assert(iptv_init());
+    IptvChannel origin;
+    assert(iptv_get_channel(0, &origin));
+    assert(iptv_toggle_selected_favorite());
+    assert(iptv_play_channel(0));
+    uint64_t token = g_playback_token;
+    uint32_t history[IPTV_MAX_RECENT];
+    memcpy(history, g_recent_ids, sizeof(history));
+    PlayerSnapshot snap = {.has_media = true, .state = PLAYER_STATE_ERROR,
+                           .media = {.uri = origin.url}};
+    iptv_set_selected_index(1); /* Browsing another row must not change the fallback identity. */
+    assert(iptv_sync_playback_state(&snap));
+    assert(play_requests == 2 && !strcmp(last_submitted_uri, "http://example.com/route1.ts"));
+    assert(g_playback_token == token && last_submitted_lease.token == token);
+    assert(last_submitted_lease.owner == PLAYER_MEDIA_OWNER_IPTV);
+    assert(iptv_get_playing_channel_id() == origin.id && iptv_get_selected_index() == 1);
+    assert(!memcmp(history, g_recent_ids, sizeof(history)));
+    IptvState state;
+    assert(iptv_get_state(&state) && state.favorite_count == 1);
+    assert(!iptv_sync_playback_state(&snap)); /* Repeated/stale failure cannot queue twice. */
+    assert(play_requests == 2);
+    snap.media.uri = "http://example.com/route1.ts";
+    assert(iptv_sync_playback_state(&snap));
+    assert(play_requests == 3 && !strcmp(last_submitted_uri, "http://example.com/route2.ts"));
+    snap.media.uri = "http://example.com/route2.ts";
+    assert(iptv_sync_playback_state(&snap));
+    assert(play_requests == 4 && !strcmp(last_submitted_uri, "http://example.com/route3.ts"));
+    snap.media.uri = "http://example.com/route3.ts";
+    assert(!iptv_sync_playback_state(&snap));
+    assert(play_requests == 4); /* Three alternates is the hard limit. */
+    assert(iptv_get_state(&state) && strstr(state.status, "playback failed"));
+
+    assert(iptv_play_channel(0));
+    snap.media.uri = origin.url;
+    preempt_on_guard = true;
+    int before = play_requests;
+    iptv_sync_playback_state(&snap);
+    assert(play_requests == before && !owns_iptv);
+    preempt_on_guard = false;
+    assert(iptv_play_channel(0));
+    reject_open = true;
+    iptv_sync_playback_state(&snap);
+    reject_open = false;
+    assert(!strcmp(g_last_url, origin.url) && g_playback_state == PLAYER_STATE_ERROR);
+    /* A direct media URL does not inherit the previous channel's routes. */
+    assert(iptv_play_url("http://example.com/direct.ts"));
+    snap.media.uri = "http://example.com/direct.ts";
+    before = play_requests;
+    iptv_sync_playback_state(&snap);
+    assert(play_requests == before);
+    iptv_deinit();
+    assert(remove(path) == 0);
+    assert(remove(IPTV_FAVORITES_FILE) == 0);
+    assert(remove(IPTV_RECENT_FILE) == 0);
+    play_requests = 0;
+    puts("IPTV alternate routes: exact station IDs, no duplicates, bounded retries, stale snapshots, ownership preemption, queue rejection, history/favorites retained.");
+}
+
 int main(void)
 {
     char early_name[64];
@@ -256,6 +334,7 @@ int main(void)
     iptv_deinit();
     test_configuration_save_failures();
     test_favorites_restart();
+    test_alternate_routes();
 
     const char *large = IPTV_ROOT_DIR "/large.m3u8";
     write_playlist(large, 10001);

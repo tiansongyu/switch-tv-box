@@ -101,7 +101,8 @@ IptvPlaylistKind iptv_classify_playlist_file(const char *path);
 const char *iptv_playlist_kind_name(IptvPlaylistKind kind);
 
 bool iptv_get_state(IptvState *out);
-void iptv_sync_playback_state(const PlayerSnapshot *snapshot);
+/* True when a failed channel queued another route under the same lease. */
+bool iptv_sync_playback_state(const PlayerSnapshot *snapshot);
 int iptv_get_channel_count(void);
 int iptv_get_selected_index(void);
 void iptv_set_selected_index(int index);

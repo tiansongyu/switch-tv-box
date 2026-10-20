@@ -39,6 +39,7 @@
 #define IPTV_RESOURCE_TRANSITION_TIMEOUT_MS 6000u
 #define IPTV_BACKGROUND_QUIESCE_TIMEOUT_MS 4000u
 #define IPTV_FALLBACK_NAME "IPTV Channel"
+#define IPTV_MAX_PLAYBACK_ROUTES 4
 
 typedef struct
 {
@@ -108,10 +109,16 @@ static char g_last_name[IPTV_NAME_MAX];
 static char g_last_url[IPTV_URL_MAX];
 static uint64_t g_playback_token;
 static PlayerState g_playback_state = PLAYER_STATE_IDLE;
+/* Keep the requested channel's identity/history while trying another route.
+ * URI copies survive catalog refreshes and prevent retrying duplicate URLs. */
+static IptvChannel g_route_origin;
+static char g_tried_routes[IPTV_MAX_PLAYBACK_ROUTES][IPTV_URL_MAX];
+static int g_tried_route_count;
 static bool g_preinstalled_refresh_needed;
 static int g_preinstalled_changed_count;
 
 static void iptv_queue_selected_logo_locked(void);
+static bool iptv_try_alternate_route(uint64_t token, const char *failed_url);
 
 static bool iptv_background_fetch_cancelled(void *context)
 {
@@ -230,6 +237,7 @@ static void iptv_status_copy(char *out, size_t size, const char *status)
         {"Queued refresh for ", ".", "已将 %.*s 加入刷新队列。"},
         {"Playing IPTV: ", "", "正在播放 IPTV：%.*s"},
         {"Connecting IPTV: ", "", "正在连接 IPTV：%.*s"},
+        {"Trying alternate IPTV: ", "", "正在尝试备用线路：%.*s"},
         {"Buffering IPTV: ", "", "正在缓冲 IPTV：%.*s"},
         {"Paused IPTV: ", "", "IPTV 已暂停：%.*s"},
         {"Refresh failed for ", "", "刷新失败：%.*s"},
@@ -1899,6 +1907,8 @@ void iptv_deinit(void)
     g_selected_index = g_source_selected_index = 0;
     g_source_filter_id = g_playing_channel_id = 0;
     g_playback_state = PLAYER_STATE_IDLE;
+    memset(&g_route_origin, 0, sizeof(g_route_origin));
+    g_tried_route_count = 0;
     g_source_capacity = 0;
     g_search[0] = '\0';
     g_status[0] = g_last_name[0] = g_last_url[0] = '\0';
@@ -1987,7 +1997,7 @@ void iptv_set_status(const char *status)
     mutexUnlock(&g_mutex);
 }
 
-void iptv_sync_playback_state(const PlayerSnapshot *snapshot)
+bool iptv_sync_playback_state(const PlayerSnapshot *snapshot)
 {
     uint64_t token;
     const char *prefix = NULL;
@@ -1995,12 +2005,12 @@ void iptv_sync_playback_state(const PlayerSnapshot *snapshot)
 
     if (!g_sync_initialized || !snapshot || !snapshot->has_media ||
         !snapshot->media.uri)
-        return;
+        return false;
     mutexLock(&g_mutex);
     token = g_playback_token;
     mutexUnlock(&g_mutex);
     if (!token || !player_ownership_matches(PLAYER_MEDIA_OWNER_IPTV, token))
-        return;
+        return false;
 
     mutexLock(&g_mutex);
     /* Ignore old snapshots while the asynchronously submitted next channel
@@ -2011,7 +2021,7 @@ void iptv_sync_playback_state(const PlayerSnapshot *snapshot)
         snapshot->state == g_playback_state)
     {
         mutexUnlock(&g_mutex);
-        return;
+        return false;
     }
     g_playback_state = snapshot->state;
     switch (snapshot->state)
@@ -2042,6 +2052,9 @@ void iptv_sync_playback_state(const PlayerSnapshot *snapshot)
     else if (message)
         iptv_copy(g_status, sizeof(g_status), message);
     mutexUnlock(&g_mutex);
+    if (snapshot->state == PLAYER_STATE_ERROR)
+        return iptv_try_alternate_route(token, snapshot->media.uri);
+    return false;
 }
 
 bool iptv_get_state(IptvState *out)
@@ -2723,6 +2736,97 @@ bool iptv_toggle_selected_favorite(void)
     return saved;
 }
 
+/* Only match explicit station IDs. Quality suffixes used by iptv-org do not
+ * change the station. Keep unknown suffixes (regions, languages, etc.) intact.
+ * The legacy Chinese list omits .cn on numbered CCTV IDs. */
+static void iptv_station_key(const char *id, char key[IPTV_TVG_ID_MAX])
+{
+    iptv_copy(key, IPTV_TVG_ID_MAX, id);
+    for (char *p = key; *p; ++p)
+        *p = (char)tolower((unsigned char)*p);
+    char *quality = strrchr(key, '@');
+    if (quality && (!strcmp(quality, "@sd") || !strcmp(quality, "@hd") ||
+                    !strcmp(quality, "@fhd") || !strcmp(quality, "@uhd") ||
+                    !strcmp(quality, "@4k") || !strcmp(quality, "@8k")))
+        *quality = '\0';
+    if (!strncmp(key, "cctv", 4) && isdigit((unsigned char)key[4]))
+    {
+        char *suffix = key + 4;
+        while (isdigit((unsigned char)*suffix))
+            ++suffix;
+        if (!strcmp(suffix, ".cn"))
+            *suffix = '\0';
+    }
+}
+
+static bool iptv_try_alternate_route(uint64_t token, const char *failed_url)
+{
+    char origin_key[IPTV_TVG_ID_MAX];
+    char title[IPTV_NAME_MAX];
+    uint32_t origin_id;
+    IptvChannel candidate = {0};
+    ProtocolMediaGuard guard;
+    int attempt = 0;
+
+    mutexLock(&g_mutex);
+    if (!g_initialized || token != g_playback_token || !g_route_origin.id ||
+        strcmp(failed_url, g_last_url) ||
+        g_tried_route_count >= IPTV_MAX_PLAYBACK_ROUTES)
+    {
+        mutexUnlock(&g_mutex);
+        return false;
+    }
+    iptv_station_key(g_route_origin.tvg_id, origin_key);
+    iptv_copy(title, sizeof(title), g_route_origin.name);
+    origin_id = g_route_origin.id;
+    for (int i = 0; origin_key[0] && i < g_channel_count; ++i)
+    {
+        char key[IPTV_TVG_ID_MAX];
+        iptv_station_key(g_channels[i].tvg_id, key);
+        if (strcmp(origin_key, key) || !iptv_url_is_playable(g_channels[i].url))
+            continue;
+        bool tried = false;
+        for (int j = 0; j < g_tried_route_count; ++j)
+            tried |= strcmp(g_tried_routes[j], g_channels[i].url) == 0;
+        if (tried)
+            continue;
+        candidate = g_channels[i];
+        attempt = g_tried_route_count;
+        iptv_copy(g_tried_routes[g_tried_route_count++], IPTV_URL_MAX, candidate.url);
+        break;
+    }
+    mutexUnlock(&g_mutex);
+    if (!candidate.id ||
+        !protocol_coordinator_media_guard_begin(PLAYER_MEDIA_OWNER_IPTV, token, &guard))
+        return false;
+
+    /* Retain the current lease: a failed old session must never reclaim the
+     * player from AirPlay/DLNA or a channel selected in the meantime. */
+    PlayerCommandRequest request = {
+        .kind = PLAYER_COMMAND_OPEN,
+        .source = PLAYER_COMMAND_SOURCE_IPTV,
+        .lease = guard.lease,
+        .uri = candidate.url,
+        .metadata = title,
+        .flag = true,
+    };
+    PlayerCommandStatus status = player_submit_command_async(&request);
+    protocol_coordinator_media_guard_end(&guard);
+    if (!player_command_status_succeeded(status))
+        return false;
+    mutexLock(&g_mutex);
+    if (token == g_playback_token)
+    {
+        iptv_copy(g_last_url, sizeof(g_last_url), candidate.url);
+        g_playback_state = PLAYER_STATE_LOADING;
+        snprintf(g_status, sizeof(g_status), "Trying alternate IPTV: %s", g_last_name);
+    }
+    mutexUnlock(&g_mutex);
+    log_info("[iptv-fallback] attempt=%d channel_id=%08x route_id=%08x url_hash=%08x\n",
+             attempt, origin_id, candidate.id, player_trace_uri_hash(candidate.url));
+    return true;
+}
+
 static bool iptv_play_url_named(const char *url,
                                 const char *name,
                                 const char *display_title,
@@ -2805,6 +2909,15 @@ static bool iptv_play_url_named(const char *url,
     mutexLock(&g_mutex);
     iptv_copy(g_last_url, sizeof(g_last_url), url);
     g_playing_channel_id = channel_id;
+    memset(&g_route_origin, 0, sizeof(g_route_origin));
+    g_tried_route_count = 0;
+    for (int i = 0; channel_id && i < g_channel_count; ++i)
+        if (g_channels[i].id == channel_id)
+        {
+            g_route_origin = g_channels[i];
+            iptv_copy(g_tried_routes[g_tried_route_count++], IPTV_URL_MAX, url);
+            break;
+        }
     iptv_copy(g_last_name, sizeof(g_last_name), name && name[0] ? name : "Direct IPTV URL");
     g_playback_state = PLAYER_STATE_LOADING;
     snprintf(g_status, sizeof(g_status), "Connecting IPTV: %s", g_last_name);

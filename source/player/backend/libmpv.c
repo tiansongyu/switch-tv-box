@@ -219,6 +219,7 @@ static void libmpv_iptv_diagnostic_sample(void)
     PlayerState state = g_state;
     IptvPlaybackSettings settings = g_iptv_diagnostic_settings;
     uint64_t load_ms = g_iptv_diagnostic_load_ms;
+    uint32_t uri_hash = g_uri ? player_trace_uri_hash(g_uri) : 0;
     mutexUnlock(&g_mutex);
     if (!mpv || !load_ms)
         return;
@@ -249,13 +250,13 @@ static void libmpv_iptv_diagnostic_sample(void)
     bool written = fprintf(file,
         "sample=%u elapsed_ms=%llu load_age_ms=%llu state=%s "
         "quality=%d buffer=%d time_pos=%.3f cache_s=%.3f video=%lldx%lld "
-        "frame_drop=%lld decoder_drop=%lld\n",
+        "frame_drop=%lld decoder_drop=%lld uri_hash=%08x\n",
         g_iptv_diagnostic_count,
         (unsigned long long)(now_ms - g_iptv_diagnostic_start_ms),
         (unsigned long long)(now_ms - load_ms), state_name,
         (int)settings.quality, (int)settings.buffer, position, cache_seconds,
         (long long)width, (long long)height, (long long)dropped,
-        (long long)decoder_dropped) >= 0;
+        (long long)decoder_dropped, uri_hash) >= 0;
     if (fclose(file) != 0)
         written = false;
     if (!written)
