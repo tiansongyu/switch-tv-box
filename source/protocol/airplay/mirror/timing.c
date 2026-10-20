@@ -75,21 +75,6 @@ static void write_be64(uint8_t *output, uint64_t value)
         output[index] = (uint8_t)(value >> ((7u - index) * 8u));
 }
 
-static void timing_sleep_ms(uint32_t milliseconds)
-{
-#ifdef __SWITCH__
-    svcSleepThread((int64_t)milliseconds * 1000000LL);
-#else
-    struct timespec delay = {
-        .tv_sec = (time_t)(milliseconds / 1000u),
-        .tv_nsec = (long)(milliseconds % 1000u) * 1000000L};
-
-    while (nanosleep(&delay, &delay) != 0 && errno == EINTR)
-    {
-    }
-#endif
-}
-
 static bool timing_thread_start(AirPlayTimingThread *thread,
                                 AirPlayTimingThreadEntry entry,
                                 void *argument)
@@ -143,7 +128,7 @@ static void timing_wait_response(AirPlayMirrorTiming *timing, int socket_fd)
     fd_set read_fds;
     struct timeval timeout = {
         .tv_sec = 0,
-        .tv_usec = AIRPLAY_TIMING_RESPONSE_TIMEOUT_MS * 1000u};
+        .tv_usec = AIRPLAY_TIMING_SLEEP_SLICE_MS * 1000u};
     int selected;
 
     FD_ZERO(&read_fds);
@@ -151,11 +136,28 @@ static void timing_wait_response(AirPlayMirrorTiming *timing, int socket_fd)
     selected = select(socket_fd + 1, &read_fds, NULL, NULL, &timeout);
     if (selected <= 0 || !FD_ISSET(socket_fd, &read_fds))
         return;
-    if (recvfrom(socket_fd, response, sizeof(response), 0, NULL, NULL) >=
-        (ssize_t)AIRPLAY_TIMING_PACKET_SIZE)
+    struct sockaddr_in peer = {0};
+    socklen_t peer_size = sizeof(peer);
+    ssize_t size = recvfrom(socket_fd, response, sizeof(response), 0,
+                            (struct sockaddr *)&peer, &peer_size);
+    uint64_t received_at = timing_now_ntp();
+    if (size < (ssize_t)AIRPLAY_TIMING_PACKET_SIZE || response[0] >> 6 != 2u ||
+        peer.sin_addr.s_addr != timing->peer.sin_addr.s_addr ||
+        peer.sin_port != timing->peer.sin_port)
+        return;
+    if ((response[1] & 0x7fu) == 0x52u)
+    {
+        /* Some senders initiate timing probes as well as answering ours. */
+        response[1] = 0xd3u;
+        memcpy(response + 8u, response + 24u, 8u);
+        write_be64(response + 16u, received_at);
+        write_be64(response + 24u, timing_now_ntp());
+        (void)sendto(socket_fd, response, AIRPLAY_TIMING_PACKET_SIZE, 0,
+                     (const struct sockaddr *)&peer, peer_size);
+    }
+    else if ((response[1] & 0x7fu) == 0x53u)
     {
         uint64_t count = atomic_fetch_add(&timing->responses_received, 1u) + 1u;
-
         if (count == 1u)
             AIRPLAY_TRACE("[airplay-timing] first NTP response received\n");
     }
@@ -165,29 +167,27 @@ static AIRPLAY_TIMING_THREAD_RETURN timing_worker(void *argument)
 {
     AirPlayMirrorTiming *timing = argument;
 
+    uint64_t next_request = 0u;
+    uint16_t sequence = 7u;
     while (atomic_load(&timing->running))
     {
-        uint8_t request[AIRPLAY_TIMING_PACKET_SIZE] = {
-            0x80u, 0xd2u, 0x00u, 0x07u};
+        uint8_t request[AIRPLAY_TIMING_PACKET_SIZE] = {0x80u, 0xd2u};
         int socket_fd = atomic_load(&timing->socket_fd);
-
+        uint64_t now = timing_now_ntp();
         if (socket_fd < 0)
             break;
-        write_be64(request + 24u, timing_now_ntp());
-        if (sendto(socket_fd, request, sizeof(request), 0,
-                   (const struct sockaddr *)&timing->peer,
-                   sizeof(timing->peer)) == (ssize_t)sizeof(request))
+        if (!next_request || now >= next_request)
         {
-            atomic_fetch_add(&timing->requests_sent, 1u);
-            timing_wait_response(timing, socket_fd);
+            request[2] = (uint8_t)(sequence >> 8);
+            request[3] = (uint8_t)sequence++;
+            write_be64(request + 24u, now);
+            if (sendto(socket_fd, request, sizeof(request), 0,
+                       (const struct sockaddr *)&timing->peer,
+                       sizeof(timing->peer)) == (ssize_t)sizeof(request))
+                atomic_fetch_add(&timing->requests_sent, 1u);
+            next_request = now + ((uint64_t)AIRPLAY_TIMING_INTERVAL_MS << 32) / 1000u;
         }
-        for (uint32_t waited = 0u;
-             waited < AIRPLAY_TIMING_INTERVAL_MS &&
-             atomic_load(&timing->running);
-             waited += AIRPLAY_TIMING_SLEEP_SLICE_MS)
-        {
-            timing_sleep_ms(AIRPLAY_TIMING_SLEEP_SLICE_MS);
-        }
+        timing_wait_response(timing, socket_fd);
     }
     AIRPLAY_TIMING_THREAD_FINISH();
 }
@@ -267,7 +267,9 @@ void airplay_mirror_timing_destroy(AirPlayMirrorTiming *timing)
     if (!timing)
         return;
     atomic_store(&timing->running, false);
-    timing_close_socket(timing);
+    int socket_fd = atomic_load(&timing->socket_fd);
+    if (socket_fd >= 0)
+        shutdown(socket_fd, SHUT_RDWR);
     if (timing->thread_started)
     {
         timing_thread_join(&timing->thread);
@@ -275,6 +277,7 @@ void airplay_mirror_timing_destroy(AirPlayMirrorTiming *timing)
             RUNTIME_DIAGNOSTIC_THREAD_AIRPLAY_TIMING,
             timing->diagnostic_thread_generation);
     }
+    timing_close_socket(timing);
     memset(timing, 0, sizeof(*timing));
     free(timing);
 }

@@ -252,7 +252,7 @@ def run_smoke(host: str, requested_port: int, server_binary: Path) -> None:
         with connect(host, port) as connection:
             reader = ResponseReader(connection)
             connection.sendall(
-                b"POST /pair-setup RTSP/1.0\r\nCSeq: 6\r\nContent-Length: 1048577\r\n\r\n"
+                b"POST /pair-setup RTSP/1.0\r\nCSeq: 6\r\nContent-Length: 4194305\r\n\r\n"
             )
             expect_response(reader, 413)
 

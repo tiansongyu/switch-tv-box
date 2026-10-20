@@ -379,6 +379,8 @@ static bool build_raop_txt_record(const AirPlayMdnsConfig *config,
 {
     char public_key[65];
     char features[32];
+    char metadata[6] = {0};
+    size_t metadata_size = 0u;
     int written;
 
     if (!config || !service || config->features == 0u ||
@@ -390,17 +392,30 @@ static bool build_raop_txt_record(const AirPlayMdnsConfig *config,
                        (unsigned)(config->features >> 32));
     if (written <= 0 || (size_t)written >= sizeof(features))
         return false;
+    for (unsigned index = 0u; index < 3u; ++index)
+    {
+        unsigned bit = index == 0u ? 17u : index == 1u ? 15u : 16u;
+        if (!(config->features & (UINT64_C(1) << bit)))
+            continue;
+        if (metadata_size)
+            metadata[metadata_size++] = ',';
+        metadata[metadata_size++] = (char)('0' + index);
+    }
     return append_txt(service, "ch", "2") &&
            append_txt(service, "cn", "0,1,2,3") &&
            append_txt(service, "da", "true") &&
-           append_txt(service, "et", "0,3,5") &&
+           append_txt(service, "et",
+                      config->features & AIRPLAY_MDNS_FEATURE_RSA_AUTHENTICATION
+                          ? "0,1,3,5" : "0,3,5") &&
            append_txt(service, "vv", "2") &&
            append_txt(service, "ft", features) &&
            append_txt(service, "am", "AppleTV3,2") &&
-           append_txt(service, "md", "0,1,2") &&
+           append_txt(service, "md", metadata) &&
            append_txt(service, "rhd", "5.6.0.0") &&
-           append_txt(service, "pw", config->pin_required ? "true" : "false") &&
-           append_txt(service, "sf", config->pin_required ? "0x8c" : "0x4") &&
+           append_txt(service, "pw", config->pin_required && !config->legacy_raop
+                                        ? "true" : "false") &&
+           append_txt(service, "sf", config->pin_required && !config->legacy_raop
+                                        ? "0x8c" : "0x4") &&
            append_txt(service, "sr", "44100") &&
            append_txt(service, "ss", "16") &&
            append_txt(service, "sv", "false") &&

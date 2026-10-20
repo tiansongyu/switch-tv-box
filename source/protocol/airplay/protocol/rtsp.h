@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define AIRPLAY_RTSP_MAX_HEADER_BYTES (32U * 1024U)
-#define AIRPLAY_RTSP_MAX_BODY_BYTES (1024U * 1024U)
+#define AIRPLAY_RTSP_MAX_BODY_BYTES (4U * 1024U * 1024U)
 #define AIRPLAY_RTSP_MAX_RESPONSE_BODY_BYTES (4U * 1024U * 1024U)
 #define AIRPLAY_RTSP_MAX_MESSAGE_BYTES (AIRPLAY_RTSP_MAX_HEADER_BYTES + AIRPLAY_RTSP_MAX_BODY_BYTES)
 #define AIRPLAY_RTSP_MAX_RESPONSE_MESSAGE_BYTES \
@@ -90,6 +90,8 @@ typedef struct
     uint64_t logical_session_id;
     uint32_t request_count;
     uint32_t peer_ipv4_address;
+    /* Local address of the accepted control socket, in network byte order. */
+    uint32_t local_ipv4_address;
     AirPlayRtspSessionState state;
     void *security_context;
     void *protocol_context;

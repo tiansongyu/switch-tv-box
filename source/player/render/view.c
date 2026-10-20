@@ -231,7 +231,9 @@ void player_view_sync(const PlayerSnapshot *snapshot)
     {
         g_view.last_video_state_ms = now_ms;
         g_view.stop_hold_until_ms = 0;
-        g_view.status.desired_view = g_view.home_override ? PLAYER_VIEW_HOME : PLAYER_VIEW_VIDEO;
+        g_view.status.desired_view =
+            g_view.home_override || player_media_is_airplay_audio(&snapshot->media) ?
+                PLAYER_VIEW_HOME : PLAYER_VIEW_VIDEO;
     }
     else
     {

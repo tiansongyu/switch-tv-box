@@ -20,7 +20,13 @@
 #define AIRPLAY_MDNS_FEATURE_SCREEN_ROTATE (UINT64_C(1) << 8)
 #define AIRPLAY_MDNS_FEATURE_AUDIO (UINT64_C(1) << 9)
 #define AIRPLAY_MDNS_FEATURE_VIDEO (UINT64_C(1) << 0)
+#define AIRPLAY_MDNS_FEATURE_PHOTO (UINT64_C(1) << 1)
+#define AIRPLAY_MDNS_FEATURE_PHOTO_CACHING (UINT64_C(1) << 13)
+#define AIRPLAY_MDNS_FEATURE_RSA_AUTHENTICATION (UINT64_C(1) << 23)
 #define AIRPLAY_MDNS_FEATURE_HLS (UINT64_C(1) << 4)
+#define AIRPLAY_MDNS_FEATURE_SLIDESHOW (UINT64_C(1) << 5)
+#define AIRPLAY_MDNS_FEATURE_METADATA \
+    ((UINT64_C(1) << 15) | (UINT64_C(1) << 16) | (UINT64_C(1) << 17))
 #define AIRPLAY_MDNS_FEATURE_RAOP_NOT_REQUIRED (UINT64_C(1) << 30)
 #define AIRPLAY_MDNS_FEATURES_FAIRPLAY_AUTH \
     (AIRPLAY_MDNS_FEATURE_FAIRPLAY_VIDEO | \
@@ -41,6 +47,7 @@ typedef struct
     char pairing_id[AIRPLAY_MDNS_PAIRING_ID_SIZE];
     uint64_t features;
     bool pin_required;
+    bool legacy_raop;
 #if defined(AIRPLAY_TESTING)
     uint16_t test_bind_port;
     uint16_t test_announcement_port;

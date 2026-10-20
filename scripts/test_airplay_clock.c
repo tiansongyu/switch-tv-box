@@ -134,6 +134,22 @@ static void test_external_audio_timeline(void)
 
 int main(void)
 {
+    AirPlayMirrorClock *standalone = NULL;
+    AirPlayMirrorClockStats stats = {0};
+    CHECK(airplay_mirror_clock_create(&standalone));
+    CHECK(airplay_mirror_clock_set_audio_rate(standalone, 44100u));
+    airplay_mirror_clock_set_audio_only(standalone, true);
+    for (uint32_t second = 0u; second <= 120u; ++second)
+    {
+        int64_t pts = -1;
+        CHECK(airplay_mirror_clock_map_audio(
+            standalone, UINT32_C(0xfffffff0) + second * 44100u,
+            (uint64_t)second * 1000000u, &pts) == AIRPLAY_MIRROR_CLOCK_OK);
+        CHECK(pts == (int64_t)second * 90000);
+    }
+    CHECK(airplay_mirror_clock_get_stats(standalone, &stats));
+    CHECK(stats.unsynced_audio_drops == 0u && stats.skew_audio_drops == 0u);
+    airplay_mirror_clock_destroy(standalone);
     test_timeline();
     test_ntp_wrap();
     test_external_audio_timeline();

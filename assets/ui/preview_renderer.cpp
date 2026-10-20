@@ -88,6 +88,11 @@ int main(int argc, char **argv)
     snprintf(home.ip_address, sizeof(home.ip_address), "192.168.1.108");
     snprintf(home.iptv_last_name, sizeof(home.iptv_last_name), "%s", home_ui_text("CCTV 9 · Documentary", "CCTV 9 · 纪录频道"));
     if (!strcmp(scenario, "playing")) home.playback_active = home.iptv_playback_active = home.player_focused = true;
+    if (!strcmp(scenario, "music") || !strcmp(scenario, "music-paused"))
+    {
+        home.playback_active = home.audio_playback_active = home.player_focused = true;
+        home.playback_state = !strcmp(scenario, "music-paused") ? PLAYER_STATE_PAUSED : PLAYER_STATE_PLAYING;
+    }
     if (!strcmp(scenario, "pairing"))
     {
         home.airplay_pin_visible = true;

@@ -1,3 +1,7 @@
+#if !defined(__SWITCH__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "audio.h"
 
 #include <arpa/inet.h>
@@ -8,11 +12,13 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __SWITCH__
 #include <switch.h>
 typedef Thread AirPlayAudioThread;
+typedef Mutex AirPlayAudioMutex;
 typedef void (*AirPlayAudioThreadEntry)(void *argument);
 #define AIRPLAY_AUDIO_THREAD_RETURN void
 #define AIRPLAY_AUDIO_THREAD_FINISH() return
@@ -20,6 +26,7 @@ typedef void (*AirPlayAudioThreadEntry)(void *argument);
 #else
 #include <pthread.h>
 typedef pthread_t AirPlayAudioThread;
+typedef pthread_mutex_t AirPlayAudioMutex;
 typedef void *(*AirPlayAudioThreadEntry)(void *argument);
 #define AIRPLAY_AUDIO_THREAD_RETURN void *
 #define AIRPLAY_AUDIO_THREAD_FINISH() return NULL
@@ -30,7 +37,9 @@ typedef void *(*AirPlayAudioThreadEntry)(void *argument);
 #include "protocol/airplay/trace.h"
 
 #define AIRPLAY_AUDIO_REORDER_THRESHOLD 3u
-#define AIRPLAY_AUDIO_POLL_MS 100u
+#define AIRPLAY_AUDIO_POLL_MS 10u
+#define AIRPLAY_AUDIO_RESEND_INTERVAL_MS 15u
+#define AIRPLAY_AUDIO_GAP_TIMEOUT_MS 80u
 
 typedef struct
 {
@@ -46,6 +55,15 @@ struct AirPlayMirrorAudio
     uint64_t session_id;
     uint8_t key[16];
     uint8_t iv[16];
+    bool encrypted;
+    AirPlayAudioMutex mutex;
+    bool mutex_ready;
+    struct sockaddr_in peer_control;
+    uint64_t gap_started_ms;
+    uint64_t resend_sent_ms;
+    uint16_t resend_sequence;
+    bool flush_timestamp_ready;
+    uint32_t flush_timestamp;
     AirPlayMirrorAudioFormat format;
     AirPlayMirrorAudioCallback callback;
     AirPlayMirrorAudioSyncCallback sync_callback;
@@ -58,6 +76,7 @@ struct AirPlayMirrorAudio
     AirPlayAudioThread thread;
     atomic_bool running;
     atomic_bool recording;
+    atomic_uint_fast64_t flush_request;
     atomic_int data_fd;
     atomic_int control_fd;
     uint16_t data_port;
@@ -87,65 +106,150 @@ static uint64_t read_be64(const uint8_t *data)
     return ((uint64_t)read_be32(data) << 32) | read_be32(data + 4u);
 }
 
+static void write_be16(uint8_t *data, uint16_t value)
+{
+    data[0] = (uint8_t)(value >> 8);
+    data[1] = (uint8_t)value;
+}
+
+static void write_be32(uint8_t *data, uint32_t value)
+{
+    data[0] = (uint8_t)(value >> 24);
+    data[1] = (uint8_t)(value >> 16);
+    data[2] = (uint8_t)(value >> 8);
+    data[3] = (uint8_t)value;
+}
+
+static bool audio_mutex_init(AirPlayAudioMutex *mutex)
+{
+#ifdef __SWITCH__
+    mutexInit(mutex);
+    return true;
+#else
+    return pthread_mutex_init(mutex, NULL) == 0;
+#endif
+}
+
+static void audio_mutex_lock(AirPlayAudioMutex *mutex)
+{
+#ifdef __SWITCH__
+    mutexLock(mutex);
+#else
+    pthread_mutex_lock(mutex);
+#endif
+}
+
+static void audio_mutex_unlock(AirPlayAudioMutex *mutex)
+{
+#ifdef __SWITCH__
+    mutexUnlock(mutex);
+#else
+    pthread_mutex_unlock(mutex);
+#endif
+}
+
+static uint64_t audio_now_ms(void)
+{
+#ifdef __SWITCH__
+    return armTicksToNs(armGetSystemTick()) / UINT64_C(1000000);
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0u;
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+#endif
+}
+
+/* SDP fmtp values map directly to Apple's 24-byte ALACSpecificConfig. */
+bool airplay_mirror_audio_format_alac(const uint32_t fmtp[11],
+                                      AirPlayMirrorAudioFormat *format_out)
+{
+    if (!fmtp || !format_out || fmtp[0] == 0u || fmtp[0] > 4096u ||
+        fmtp[1] != 0u || (fmtp[2] != 16u && fmtp[2] != 24u) ||
+        fmtp[3] > 255u || fmtp[4] > 255u || fmtp[5] > 31u ||
+        (fmtp[6] != 1u && fmtp[6] != 2u) || fmtp[7] > 65535u ||
+        fmtp[8] > AIRPLAY_MIRROR_AUDIO_MAX_PACKET ||
+        fmtp[10] < 8000u || fmtp[10] > 96000u)
+        return false;
+    memset(format_out, 0, sizeof(*format_out));
+    format_out->codec = AIRPLAY_MIRROR_AUDIO_CODEC_ALAC;
+    format_out->compression_type = AIRPLAY_MIRROR_AUDIO_CT_ALAC;
+    format_out->rtp_payload_type = 96u;
+    format_out->sample_rate = fmtp[10];
+    format_out->channels = (uint16_t)fmtp[6];
+    format_out->bits_per_sample = (uint16_t)fmtp[2];
+    format_out->samples_per_frame = (uint16_t)fmtp[0];
+    format_out->codec_config_size = 36u;
+    uint8_t *cookie = format_out->codec_config;
+    write_be32(cookie, 36u);
+    memcpy(cookie + 4u, "alac", 4u);
+    write_be32(cookie + 12u, fmtp[0]);
+    for (size_t i = 1u; i <= 6u; ++i)
+        cookie[15u + i] = (uint8_t)fmtp[i];
+    write_be16(cookie + 22u, (uint16_t)fmtp[7]);
+    write_be32(cookie + 24u, fmtp[8]);
+    write_be32(cookie + 28u, fmtp[9]);
+    write_be32(cookie + 32u, fmtp[10]);
+    return true;
+}
+
 bool airplay_mirror_audio_format(uint8_t compression_type,
                                  uint16_t samples_per_frame,
                                  uint32_t sample_rate,
                                  AirPlayMirrorAudioFormat *format_out)
 {
-    static const uint8_t alac[] = {
-        0x00u, 0x00u, 0x00u, 0x24u, 0x61u, 0x6cu, 0x61u, 0x63u,
-        0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x01u, 0x60u,
-        0x00u, 0x10u, 0x28u, 0x0au, 0x0eu, 0x02u, 0x00u, 0xffu,
-        0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u,
-        0x00u, 0x00u, 0xacu, 0x44u};
-    static const uint8_t aac_lc[] = {0x12u, 0x10u};
-    static const uint8_t aac_eld[] = {0xf8u, 0xe8u, 0x50u, 0x00u};
-    AirPlayMirrorAudioCodec codec;
-    const uint8_t *config;
-    size_t config_size;
-
+    static const uint32_t rates[] = {
+        96000u, 88200u, 64000u, 48000u, 44100u, 32000u, 24000u,
+        22050u, 16000u, 12000u, 11025u, 8000u};
+    unsigned rate_index = 0u;
     if (!format_out)
         return false;
-    if (sample_rate == 0u)
+    if (!sample_rate)
         sample_rate = 44100u;
     if (compression_type == AIRPLAY_MIRROR_AUDIO_CT_ALAC)
     {
-        codec = AIRPLAY_MIRROR_AUDIO_CODEC_ALAC;
-        config = alac;
-        config_size = sizeof(alac);
-        if (samples_per_frame == 0u)
-            samples_per_frame = 352u;
-        if (samples_per_frame != 352u)
-            return false;
+        uint32_t fmtp[11] = {samples_per_frame ? samples_per_frame : 352u,
+                            0u, 16u, 40u, 10u, 14u, 2u, 255u, 0u, 0u,
+                            sample_rate};
+        return airplay_mirror_audio_format_alac(fmtp, format_out);
+    }
+    for (; rate_index < sizeof(rates) / sizeof(rates[0]); ++rate_index)
+        if (rates[rate_index] == sample_rate)
+            break;
+    if (rate_index == sizeof(rates) / sizeof(rates[0]))
+        return false;
+    memset(format_out, 0, sizeof(*format_out));
+    format_out->compression_type = compression_type;
+    format_out->rtp_payload_type = 96u;
+    format_out->sample_rate = sample_rate;
+    format_out->channels = 2u;
+    format_out->bits_per_sample = 16u;
+    if (compression_type == AIRPLAY_MIRROR_AUDIO_CT_PCM)
+    {
+        format_out->codec = AIRPLAY_MIRROR_AUDIO_CODEC_PCM_S16BE;
+        format_out->samples_per_frame = samples_per_frame ? samples_per_frame : 352u;
     }
     else if (compression_type == AIRPLAY_MIRROR_AUDIO_CT_AAC_LC)
     {
-        codec = AIRPLAY_MIRROR_AUDIO_CODEC_AAC;
-        config = aac_lc;
-        config_size = sizeof(aac_lc);
-        if (samples_per_frame == 0u)
-            samples_per_frame = 1024u;
+        format_out->codec = AIRPLAY_MIRROR_AUDIO_CODEC_AAC;
+        format_out->samples_per_frame = samples_per_frame ? samples_per_frame : 1024u;
+        /* AudioSpecificConfig: AAC-LC (2), frequency index, stereo (2). */
+        format_out->codec_config[0] = (uint8_t)(0x10u | (rate_index >> 1));
+        format_out->codec_config[1] = (uint8_t)((rate_index << 7) | 0x10u);
+        format_out->codec_config_size = 2u;
     }
     else if (compression_type == AIRPLAY_MIRROR_AUDIO_CT_AAC_ELD)
     {
-        codec = AIRPLAY_MIRROR_AUDIO_CODEC_AAC;
-        config = aac_eld;
-        config_size = sizeof(aac_eld);
-        if (samples_per_frame == 0u)
-            samples_per_frame = 480u;
+        if (sample_rate != 44100u)
+            return false;
+        static const uint8_t eld[] = {0xf8u, 0xe8u, 0x50u, 0x00u};
+        format_out->codec = AIRPLAY_MIRROR_AUDIO_CODEC_AAC;
+        format_out->samples_per_frame = samples_per_frame ? samples_per_frame : 480u;
+        memcpy(format_out->codec_config, eld, sizeof(eld));
+        format_out->codec_config_size = sizeof(eld);
     }
     else
         return false;
-    if (sample_rate != 44100u || samples_per_frame == 0u)
-        return false;
-    memset(format_out, 0, sizeof(*format_out));
-    format_out->codec = codec;
-    format_out->compression_type = compression_type;
-    format_out->sample_rate = sample_rate;
-    format_out->channels = 2u;
-    format_out->samples_per_frame = samples_per_frame;
-    memcpy(format_out->codec_config, config, config_size);
-    format_out->codec_config_size = config_size;
     return true;
 }
 
@@ -157,6 +261,21 @@ static void audio_slots_clear(AirPlayMirrorAudio *audio)
         memset(&audio->slots[index], 0, sizeof(audio->slots[index]));
     }
     audio->buffered = 0u;
+}
+
+static void audio_apply_flush_locked(AirPlayMirrorAudio *audio)
+{
+    uint64_t request = atomic_exchange(&audio->flush_request, 0u);
+    if (!(request & (UINT64_C(1) << 63)))
+        return;
+    audio_slots_clear(audio);
+    audio->expected_sequence = (uint16_t)((request >> 32) + 1u);
+    audio->sequence_ready = (request & (UINT64_C(1) << 62)) != 0u;
+    audio->flush_timestamp = (uint32_t)request;
+    audio->flush_timestamp_ready = (request & (UINT64_C(1) << 61)) != 0u;
+    audio->discontinuity = true;
+    audio->gap_started_ms = 0u;
+    audio->resend_sent_ms = 0u;
 }
 
 static void audio_emit_ready(AirPlayMirrorAudio *audio)
@@ -195,9 +314,15 @@ static void audio_skip_gap_if_needed(AirPlayMirrorAudio *audio)
 {
     uint16_t nearest = 0u;
     uint16_t nearest_distance = UINT16_MAX;
+    uint64_t now = audio_now_ms();
+    bool can_resend = audio->peer_control.sin_port != 0u;
 
-    if (audio->buffered < AIRPLAY_AUDIO_REORDER_THRESHOLD)
+    if (!audio->buffered)
+    {
+        audio->gap_started_ms = 0u;
+        audio->resend_sent_ms = 0u;
         return;
+    }
     for (size_t index = 0u; index < AIRPLAY_MIRROR_AUDIO_WINDOW; ++index)
     {
         AirPlayAudioSlot *slot = &audio->slots[index];
@@ -214,12 +339,40 @@ static void audio_skip_gap_if_needed(AirPlayMirrorAudio *audio)
     }
     if (nearest_distance != UINT16_MAX && nearest_distance != 0u)
     {
+        if (can_resend)
+        {
+            if (!audio->gap_started_ms)
+                audio->gap_started_ms = now;
+            if (!audio->resend_sent_ms ||
+                now - audio->resend_sent_ms >= AIRPLAY_AUDIO_RESEND_INTERVAL_MS)
+            {
+                /* RAOP's resend request uses an 8-byte control header:
+                 * request sequence, first missing sequence, packet count. */
+                uint8_t request[8] = {0x80u, 0xd5u};
+                write_be16(request + 2u, ++audio->resend_sequence);
+                write_be16(request + 4u, audio->expected_sequence);
+                write_be16(request + 6u, nearest_distance);
+                int fd = atomic_load(&audio->control_fd);
+                if (fd >= 0)
+                    (void)sendto(fd, request, sizeof(request), 0,
+                                 (const struct sockaddr *)&audio->peer_control,
+                                 sizeof(audio->peer_control));
+                audio->resend_sent_ms = now;
+            }
+            if (now - audio->gap_started_ms < AIRPLAY_AUDIO_GAP_TIMEOUT_MS &&
+                audio->buffered < AIRPLAY_MIRROR_AUDIO_WINDOW - 1u)
+                return;
+        }
+        else if (audio->buffered < AIRPLAY_AUDIO_REORDER_THRESHOLD)
+            return;
         audio->expected_sequence = nearest;
         audio->discontinuity = true;
+        audio->gap_started_ms = 0u;
+        audio->resend_sent_ms = 0u;
     }
 }
 
-bool airplay_mirror_audio_process_packet(AirPlayMirrorAudio *audio,
+static bool audio_process_packet_locked(AirPlayMirrorAudio *audio,
                                          const uint8_t *packet,
                                          size_t packet_size)
 {
@@ -228,22 +381,49 @@ bool airplay_mirror_audio_process_packet(AirPlayMirrorAudio *audio,
     uint8_t *payload;
     size_t payload_size;
     size_t encrypted_size;
+    size_t header_size;
     uint16_t sequence;
     uint32_t timestamp;
     int16_t distance;
 
     if (!audio || !packet || packet_size < AIRPLAY_MIRROR_AUDIO_RTP_HEADER_SIZE ||
         packet_size > AIRPLAY_MIRROR_AUDIO_MAX_PACKET ||
-        packet[0] >> 6 != 2u || (packet[1] & 0x7fu) != 96u)
+        packet[0] >> 6 != 2u ||
+        (packet[1] & 0x7fu) != audio->format.rtp_payload_type)
         return false;
-    payload_size = packet_size - AIRPLAY_MIRROR_AUDIO_RTP_HEADER_SIZE;
+    header_size = AIRPLAY_MIRROR_AUDIO_RTP_HEADER_SIZE +
+                  (packet[0] & 0x0fu) * 4u;
+    if (header_size > packet_size)
+        return false;
+    if (packet[0] & 0x10u)
+    {
+        if (packet_size - header_size < 4u)
+            return false;
+        size_t extension_size = 4u + (size_t)read_be16(packet + header_size + 2u) * 4u;
+        if (extension_size > packet_size - header_size)
+            return false;
+        header_size += extension_size;
+    }
+    payload_size = packet_size - header_size;
+    if (packet[0] & 0x20u)
+    {
+        if (!payload_size || !packet[packet_size - 1u] ||
+            packet[packet_size - 1u] > payload_size)
+            return false;
+        payload_size -= packet[packet_size - 1u];
+    }
     if (payload_size == 0u ||
-        (payload_size == sizeof(empty_marker) &&
-         memcmp(packet + AIRPLAY_MIRROR_AUDIO_RTP_HEADER_SIZE,
+        (audio->format.codec == AIRPLAY_MIRROR_AUDIO_CODEC_AAC &&
+         payload_size == sizeof(empty_marker) &&
+         memcmp(packet + header_size,
                 empty_marker, sizeof(empty_marker)) == 0))
         return true;
     sequence = read_be16(packet + 2u);
     timestamp = read_be32(packet + 4u);
+    if (audio->flush_timestamp_ready &&
+        (int32_t)(timestamp - audio->flush_timestamp) <= 0)
+        return true;
+    audio->flush_timestamp_ready = false;
     if (!audio->sequence_ready)
     {
         audio->expected_sequence = sequence;
@@ -271,18 +451,27 @@ bool airplay_mirror_audio_process_packet(AirPlayMirrorAudio *audio,
     payload = malloc(payload_size);
     if (!payload)
         return false;
-    encrypted_size = payload_size / AIRPLAY_CRYPTO_AES_BLOCK_SIZE *
-                     AIRPLAY_CRYPTO_AES_BLOCK_SIZE;
-    if (!airplay_crypto_aes_cbc_decrypt(audio->key, audio->iv,
-                                        packet + AIRPLAY_MIRROR_AUDIO_RTP_HEADER_SIZE,
+    encrypted_size = audio->encrypted
+                         ? payload_size / AIRPLAY_CRYPTO_AES_BLOCK_SIZE *
+                               AIRPLAY_CRYPTO_AES_BLOCK_SIZE
+                         : 0u;
+    if (encrypted_size &&
+        !airplay_crypto_aes_cbc_decrypt(audio->key, audio->iv,
+                                        packet + header_size,
                                         payload, encrypted_size))
     {
         free(payload);
         return false;
     }
     memcpy(payload + encrypted_size,
-           packet + AIRPLAY_MIRROR_AUDIO_RTP_HEADER_SIZE + encrypted_size,
+           packet + header_size + encrypted_size,
            payload_size - encrypted_size);
+    if (audio->format.codec == AIRPLAY_MIRROR_AUDIO_CODEC_PCM_S16BE &&
+        payload_size % (2u * audio->format.channels) != 0u)
+    {
+        free(payload);
+        return false;
+    }
     slot->data = payload;
     slot->size = payload_size;
     slot->sequence = sequence;
@@ -295,7 +484,7 @@ bool airplay_mirror_audio_process_packet(AirPlayMirrorAudio *audio,
     return true;
 }
 
-bool airplay_mirror_audio_process_control_packet(AirPlayMirrorAudio *audio,
+static bool audio_process_control_locked(AirPlayMirrorAudio *audio,
                                                  const uint8_t *packet,
                                                  size_t packet_size)
 {
@@ -308,7 +497,7 @@ bool airplay_mirror_audio_process_control_packet(AirPlayMirrorAudio *audio,
     packet_type = packet[1] & 0x7fu;
     if (packet_type == 0x56u)
         return packet_size >= 4u + AIRPLAY_MIRROR_AUDIO_RTP_HEADER_SIZE &&
-               airplay_mirror_audio_process_packet(audio, packet + 4u,
+               audio_process_packet_locked(audio, packet + 4u,
                                                     packet_size - 4u);
     if (packet_type != 0x54u || packet_size < 20u)
         return false;
@@ -320,6 +509,32 @@ bool airplay_mirror_audio_process_control_packet(AirPlayMirrorAudio *audio,
         audio->sync_callback(rtp_timestamp, ntp_timestamp,
                              audio->callback_user_data);
     return true;
+}
+
+bool airplay_mirror_audio_process_packet(AirPlayMirrorAudio *audio,
+                                         const uint8_t *packet,
+                                         size_t packet_size)
+{
+    if (!audio)
+        return false;
+    audio_mutex_lock(&audio->mutex);
+    audio_apply_flush_locked(audio);
+    bool result = audio_process_packet_locked(audio, packet, packet_size);
+    audio_mutex_unlock(&audio->mutex);
+    return result;
+}
+
+bool airplay_mirror_audio_process_control_packet(AirPlayMirrorAudio *audio,
+                                                 const uint8_t *packet,
+                                                 size_t packet_size)
+{
+    if (!audio)
+        return false;
+    audio_mutex_lock(&audio->mutex);
+    audio_apply_flush_locked(audio);
+    bool result = audio_process_control_locked(audio, packet, packet_size);
+    audio_mutex_unlock(&audio->mutex);
+    return result;
 }
 
 static bool audio_thread_start(AirPlayAudioThread *thread,
@@ -382,6 +597,11 @@ static AIRPLAY_AUDIO_THREAD_RETURN audio_thread(void *argument)
         struct timeval timeout = {0, AIRPLAY_AUDIO_POLL_MS * 1000u};
         int result;
 
+        audio_mutex_lock(&audio->mutex);
+        audio_apply_flush_locked(audio);
+        audio_skip_gap_if_needed(audio);
+        audio_emit_ready(audio);
+        audio_mutex_unlock(&audio->mutex);
         if (maximum < 0)
             break;
         FD_ZERO(&read_set);
@@ -402,9 +622,14 @@ static AIRPLAY_AUDIO_THREAD_RETURN audio_thread(void *argument)
             continue;
         if (data_fd >= 0 && FD_ISSET(data_fd, &read_set))
         {
+            struct sockaddr_in sender = {0};
+            socklen_t sender_size = sizeof(sender);
             ssize_t received = recvfrom(data_fd, packet,
                                         AIRPLAY_MIRROR_AUDIO_MAX_PACKET,
-                                        0, NULL, NULL);
+                                        0, (struct sockaddr *)&sender, &sender_size);
+            if (audio->peer_control.sin_addr.s_addr &&
+                sender.sin_addr.s_addr != audio->peer_control.sin_addr.s_addr)
+                continue;
             if (received > 0)
             {
                 if (audio->data_received++ == 0u)
@@ -413,8 +638,12 @@ static AIRPLAY_AUDIO_THREAD_RETURN audio_thread(void *argument)
                         (unsigned long long)audio->session_id, received,
                         received >= 2 ? packet[1] & 0x7fu : 0u,
                         atomic_load(&audio->recording) ? 1u : 0u);
-                if (!airplay_mirror_audio_process_packet(audio, packet,
-                                                         (size_t)received) &&
+                bool accepted = received >= 2 && (packet[1] & 0x7fu) == 0x56u
+                    ? airplay_mirror_audio_process_control_packet(audio, packet,
+                                                                  (size_t)received)
+                    : airplay_mirror_audio_process_packet(audio, packet,
+                                                          (size_t)received);
+                if (!accepted &&
                     audio->data_rejected++ == 0u)
                     AIRPLAY_OBSERVE(
                         "[airplay-audio] session=%llu stage=data-rejected bytes=%zd type=%u\n",
@@ -424,9 +653,14 @@ static AIRPLAY_AUDIO_THREAD_RETURN audio_thread(void *argument)
         }
         if (control_fd >= 0 && FD_ISSET(control_fd, &read_set))
         {
+            struct sockaddr_in sender = {0};
+            socklen_t sender_size = sizeof(sender);
             ssize_t received = recvfrom(control_fd, packet,
                                         AIRPLAY_MIRROR_AUDIO_MAX_PACKET,
-                                        0, NULL, NULL);
+                                        0, (struct sockaddr *)&sender, &sender_size);
+            if (audio->peer_control.sin_addr.s_addr &&
+                sender.sin_addr.s_addr != audio->peer_control.sin_addr.s_addr)
+                continue;
             if (received > 0)
             {
                 if (audio->control_received++ == 0u)
@@ -481,7 +715,7 @@ bool airplay_mirror_audio_create(const AirPlayMirrorAudioConfig *config,
     const char *failure_stage = "config";
 
     if (!config || !audio_out || *audio_out || config->session_id == 0u ||
-        !config->aes_key || !config->aes_iv || !config->callback)
+        (!config->aes_key != !config->aes_iv) || !config->callback)
     {
         AIRPLAY_OBSERVE(
             "[airplay-setup-failure] session=%llu stream=audio stage=config\n",
@@ -497,19 +731,41 @@ bool airplay_mirror_audio_create(const AirPlayMirrorAudioConfig *config,
         return false;
     }
     audio->session_id = config->session_id;
-    memcpy(audio->key, config->aes_key, sizeof(audio->key));
-    memcpy(audio->iv, config->aes_iv, sizeof(audio->iv));
+    audio->encrypted = config->aes_key != NULL;
+    if (audio->encrypted)
+    {
+        memcpy(audio->key, config->aes_key, sizeof(audio->key));
+        memcpy(audio->iv, config->aes_iv, sizeof(audio->iv));
+    }
+    audio->peer_control.sin_family = AF_INET;
+    audio->peer_control.sin_addr.s_addr = config->peer_ipv4_address;
+    audio->peer_control.sin_port = htons(config->peer_control_port);
     audio->callback = config->callback;
     audio->sync_callback = config->sync_callback;
     audio->callback_user_data = config->callback_user_data;
     atomic_init(&audio->running, false);
     atomic_init(&audio->recording, false);
+    atomic_init(&audio->flush_request, 0u);
     atomic_init(&audio->data_fd, -1);
     atomic_init(&audio->control_fd, -1);
+    if (!audio_mutex_init(&audio->mutex))
+        goto failure;
+    audio->mutex_ready = true;
     failure_stage = "format";
-    if (!airplay_mirror_audio_format(config->compression_type,
+    if (config->format)
+        audio->format = *config->format;
+    else if (!airplay_mirror_audio_format(config->compression_type,
                                      config->samples_per_frame,
                                      config->sample_rate, &audio->format))
+        goto failure;
+    if (!audio->format.rtp_payload_type)
+        audio->format.rtp_payload_type = 96u;
+    if (audio->format.sample_rate < 8000u || audio->format.sample_rate > 96000u ||
+        audio->format.rtp_payload_type < 96u || audio->format.rtp_payload_type > 127u ||
+        audio->format.channels < 1u || audio->format.channels > 2u ||
+        !audio->format.samples_per_frame ||
+        audio->format.codec_config_size > AIRPLAY_MIRROR_AUDIO_CODEC_CONFIG_MAX ||
+        audio->format.codec == AIRPLAY_MIRROR_AUDIO_CODEC_INVALID)
         goto failure;
     failure_stage = "socket-data";
     if (!create_udp_socket(&audio->data_fd, &audio->data_port))
@@ -550,13 +806,33 @@ void airplay_mirror_audio_set_recording(AirPlayMirrorAudio *audio, bool recordin
         atomic_store(&audio->recording, recording);
 }
 
+void airplay_mirror_audio_flush(AirPlayMirrorAudio *audio,
+                                bool has_sequence, uint16_t sequence,
+                                bool has_timestamp, uint32_t timestamp)
+{
+    if (!audio)
+        return;
+    /* Apply on the packet thread, avoiding runtime/audio lock inversion. */
+    uint64_t request = (UINT64_C(1) << 63) | ((uint64_t)sequence << 32) |
+                       timestamp;
+    if (has_sequence)
+        request |= UINT64_C(1) << 62;
+    if (has_timestamp)
+        request |= UINT64_C(1) << 61;
+    atomic_store(&audio->flush_request, request);
+}
+
 void airplay_mirror_audio_destroy(AirPlayMirrorAudio *audio)
 {
     if (!audio)
         return;
     atomic_store(&audio->running, false);
-    close_owned_socket(&audio->data_fd);
-    close_owned_socket(&audio->control_fd);
+    int data_fd = atomic_load(&audio->data_fd);
+    int control_fd = atomic_load(&audio->control_fd);
+    if (data_fd >= 0)
+        shutdown(data_fd, SHUT_RDWR);
+    if (control_fd >= 0)
+        shutdown(control_fd, SHUT_RDWR);
     if (audio->thread_started)
     {
         audio_thread_join(&audio->thread);
@@ -564,6 +840,10 @@ void airplay_mirror_audio_destroy(AirPlayMirrorAudio *audio)
             RUNTIME_DIAGNOSTIC_THREAD_AIRPLAY_AUDIO,
             audio->diagnostic_thread_generation);
     }
+    /* Join before closing so another thread cannot reuse a descriptor still
+     * present in this worker's select/recvfrom call. */
+    close_owned_socket(&audio->data_fd);
+    close_owned_socket(&audio->control_fd);
     AIRPLAY_OBSERVE(
         "[airplay-audio-summary] session=%llu data=%llu rejected=%llu control=%llu rejected=%llu delivered=%llu\n",
         (unsigned long long)audio->session_id,
@@ -573,6 +853,10 @@ void airplay_mirror_audio_destroy(AirPlayMirrorAudio *audio)
         (unsigned long long)audio->control_rejected,
         (unsigned long long)audio->frames_emitted);
     audio_slots_clear(audio);
+#ifndef __SWITCH__
+    if (audio->mutex_ready)
+        pthread_mutex_destroy(&audio->mutex);
+#endif
     airplay_crypto_secure_zero(audio->key, sizeof(audio->key));
     airplay_crypto_secure_zero(audio->iv, sizeof(audio->iv));
     free(audio);

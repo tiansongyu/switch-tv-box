@@ -558,9 +558,11 @@ static bool bridge_configure_audio_locked(
 
     if (!bridge || !format ||
         (format->codec != AIRPLAY_MIRROR_AUDIO_CODEC_AAC &&
-         format->codec != AIRPLAY_MIRROR_AUDIO_CODEC_ALAC) ||
+         format->codec != AIRPLAY_MIRROR_AUDIO_CODEC_ALAC &&
+         format->codec != AIRPLAY_MIRROR_AUDIO_CODEC_PCM_S16BE) ||
         format->sample_rate == 0u || format->channels == 0u ||
-        format->codec_config_size == 0u ||
+        (format->codec_config_size == 0u &&
+         format->codec != AIRPLAY_MIRROR_AUDIO_CODEC_PCM_S16BE) ||
         format->codec_config_size > sizeof(format->codec_config))
         return false;
     if (bridge->header_written || bridge->mux_finished ||
@@ -583,6 +585,13 @@ static bool bridge_configure_audio_locked(
         stream->codecpar->codec_id = AV_CODEC_ID_AAC;
     else if (format->codec == AIRPLAY_MIRROR_AUDIO_CODEC_ALAC)
         stream->codecpar->codec_id = AV_CODEC_ID_ALAC;
+    else if (format->codec == AIRPLAY_MIRROR_AUDIO_CODEC_PCM_S16BE)
+    {
+        stream->codecpar->codec_id = AV_CODEC_ID_PCM_S16BE;
+        stream->codecpar->bits_per_coded_sample = 16;
+        stream->codecpar->block_align = 2 * format->channels;
+    }
+    stream->codecpar->bits_per_raw_sample = format->bits_per_sample;
     stream->codecpar->codec_tag = 0u;
     stream->codecpar->sample_rate = (int)format->sample_rate;
     av_channel_layout_default(&stream->codecpar->ch_layout, format->channels);
@@ -681,8 +690,15 @@ bool airplay_stream_bridge_push_audio(AirPlayStreamBridge *bridge,
         pts, (AVRational){1, AIRPLAY_MIRROR_CLOCK_TIME_BASE},
         bridge->format->streams[bridge->audio_stream_index]->time_base);
     packet->dts = packet->pts;
+    AVCodecParameters *audio_codec =
+        bridge->format->streams[bridge->audio_stream_index]->codecpar;
+    int64_t duration = bridge->audio_frame_duration;
+    if (audio_codec->codec_id == AV_CODEC_ID_PCM_S16BE &&
+        audio_codec->block_align > 0 && audio_codec->sample_rate > 0)
+        duration = (int64_t)(frame->size / (size_t)audio_codec->block_align) *
+                   AIRPLAY_MIRROR_CLOCK_TIME_BASE / audio_codec->sample_rate;
     packet->duration = av_rescale_q(
-        bridge->audio_frame_duration,
+        duration,
         (AVRational){1, AIRPLAY_MIRROR_CLOCK_TIME_BASE},
         bridge->format->streams[bridge->audio_stream_index]->time_base);
     if (packet->duration < 1)

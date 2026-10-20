@@ -435,7 +435,10 @@ static void test_large_condensed_playlist(void)
     CHECK(airplay_rtsp_response_init(&response, "HTTP/1.1", 200));
     CHECK(airplay_remote_hls_serve(hls, &request, &response, &handled));
     CHECK(handled && response.status_code == 200);
-    CHECK(response.body_length > AIRPLAY_RTSP_MAX_BODY_BYTES);
+    /* Expanding condensed URLs must not truncate at the former 1 MiB cap.
+     * Request limits can change independently (for example, photo uploads). */
+    CHECK(response.body_length > 1024u * 1024u);
+    CHECK(response.body_length <= AIRPLAY_RTSP_MAX_RESPONSE_BODY_BYTES);
     CHECK(body_contains(response.body, response.body_length,
                         "video/slice/4095"));
     CHECK(airplay_rtsp_response_encode(&response, &encoded, &encoded_length));

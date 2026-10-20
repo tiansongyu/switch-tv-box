@@ -22,6 +22,21 @@ typedef pthread_mutex_t AirPlayRemoteMutex;
 
 #define AIRPLAY_REMOTE_TEXT_BODY_MAX (16u * 1024u)
 #define AIRPLAY_REMOTE_XML_MAX 2048u
+#define AIRPLAY_REMOTE_PHOTO_KEY_MAX 128u
+
+typedef struct
+{
+    uint8_t *data;
+    size_t size;
+    uint64_t session_id;
+    uint64_t serial;
+    uint64_t last_used;
+    unsigned pending_users;
+    bool retired;
+    bool png;
+    char key[AIRPLAY_REMOTE_PHOTO_KEY_MAX + 1u];
+    char path[128];
+} AirPlayRemotePhoto;
 
 typedef struct
 {
@@ -45,6 +60,7 @@ struct AirPlayRemoteVideo
     AirPlayRemoteMutex mutex;
     uint64_t owner_session_id;
     uint32_t generation;
+    uint32_t owner_claim_generation;
     int pending_seek_ms;
     int pending_scrub_ms;
     double pending_fraction;
@@ -58,6 +74,11 @@ struct AirPlayRemoteVideo
     bool mutex_ready;
     char pending_metadata[AIRPLAY_REMOTE_VIDEO_METADATA_MAX + 1u];
     AirPlayRemoteHls *hls;
+    AirPlayRemotePhoto photos[AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS];
+    uint64_t photo_serial;
+    uint64_t photo_clock;
+    uint64_t cache_snapshot_version;
+    uint64_t active_photo_serial;
 };
 
 static bool remote_mutex_init(AirPlayRemoteMutex *mutex)
@@ -95,6 +116,54 @@ static void remote_mutex_unlock(AirPlayRemoteMutex *mutex)
 #else
     pthread_mutex_unlock(mutex);
 #endif
+}
+
+static void photo_clear(AirPlayRemotePhoto *photo)
+{
+    free(photo->data);
+    memset(photo, 0, sizeof(*photo));
+}
+
+/* All cache helpers run with remote->mutex held. A pending start and the
+ * currently displayed image stay resident until their async player load ends
+ * or is replaced/stopped. HTTP responses own a separate copy of the bytes. */
+static void photo_collect_locked(AirPlayRemoteVideo *remote)
+{
+    for (size_t i = 0; i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+    {
+        AirPlayRemotePhoto *photo = &remote->photos[i];
+        if (photo->retired && !photo->pending_users &&
+            photo->serial != remote->active_photo_serial)
+            photo_clear(photo);
+    }
+}
+
+static bool photo_clear_session_locked(AirPlayRemoteVideo *remote, uint64_t session_id)
+{
+    bool found = false;
+    for (size_t i = 0; i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+        if (remote->photos[i].data && remote->photos[i].session_id == session_id)
+        {
+            remote->photos[i].retired = true;
+            found = true;
+        }
+    photo_collect_locked(remote);
+    return found;
+}
+
+static AirPlayRemotePhoto *photo_find_locked(AirPlayRemoteVideo *remote,
+                                            uint64_t session_id, const char *key)
+{
+    AirPlayRemotePhoto *found = NULL;
+    for (size_t i = 0; i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+    {
+        AirPlayRemotePhoto *photo = &remote->photos[i];
+        if (photo->data && !photo->retired && photo->session_id == session_id &&
+            strcmp(photo->key, key) == 0 &&
+            (!found || photo->serial > found->serial))
+            found = photo;
+    }
+    return found;
 }
 
 static bool content_type_is(const AirPlayRtspRequest *request,
@@ -436,7 +505,19 @@ static void clear_owner_locked(AirPlayRemoteVideo *remote)
     remote->pending_metadata[0] = '\0';
     remote->state = AIRPLAY_REMOTE_VIDEO_SESSION_IDLE;
     remote->owner_claimed = false;
+    remote->owner_claim_generation = 0u;
     remote->control_attached = false;
+    remote->active_photo_serial = 0u;
+    photo_collect_locked(remote);
+}
+
+static bool stop_owner(AirPlayRemoteVideo *remote, uint64_t session_id,
+                       uint32_t claim_generation)
+{
+    if (remote->ops.stop_owner)
+        return remote->ops.stop_owner(session_id, claim_generation,
+                                      remote->ops.user_data);
+    return remote->ops.stop(remote->ops.user_data);
 }
 
 static bool send_hls_event(AirPlayRemoteVideo *remote, uint64_t session_id,
@@ -472,6 +553,7 @@ static void fail_generation(AirPlayRemoteVideo *remote, uint64_t session_id,
 {
     bool stop = false;
     bool release = false;
+    uint32_t claim_generation = 0u;
 
     remote_mutex_lock(&remote->mutex);
     if (remote->state != AIRPLAY_REMOTE_VIDEO_SESSION_IDLE &&
@@ -480,22 +562,26 @@ static void fail_generation(AirPlayRemoteVideo *remote, uint64_t session_id,
     {
         stop = remote->state == AIRPLAY_REMOTE_VIDEO_SESSION_ACTIVE;
         release = remote->owner_claimed;
+        claim_generation = remote->owner_claim_generation;
         clear_owner_locked(remote);
         remote->generation++;
     }
     remote_mutex_unlock(&remote->mutex);
     airplay_remote_hls_reset(remote->hls, session_id, generation);
     if (stop)
-        (void)remote->ops.stop(remote->ops.user_data);
+        (void)stop_owner(remote, session_id, claim_generation);
     if (release && remote->ops.release_owner)
-        remote->ops.release_owner(session_id, remote->ops.user_data);
+        remote->ops.release_owner(session_id, claim_generation,
+                                  remote->ops.user_data);
 }
 
-static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
-                        const AirPlayRtspRequest *request,
-                        AirPlayRtspResponse *response)
+static bool start_play(AirPlayRemoteVideo *remote, uint64_t session_id,
+                       const AirPlayRtspRequest *request,
+                       const AirPlayRemotePlayRequest *parsed,
+                       uint64_t photo_serial,
+                       AirPlayRtspResponse *response)
 {
-    AirPlayRemotePlayRequest play;
+    const AirPlayRemotePlayRequest play = *parsed;
     AirPlayRemoteHlsEvent event = {0};
     const char *apple_session_id;
     uint32_t generation;
@@ -508,11 +594,8 @@ static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
     bool previous_claimed = false;
     uint64_t previous_session_id = 0u;
     uint32_t previous_generation = 0u;
+    uint32_t previous_claim_generation = 0u;
 
-    if (strcmp(request->method, "POST") != 0)
-        return airplay_rtsp_response_set_status(response, 405);
-    if (!parse_play_request(request, &play))
-        return airplay_rtsp_response_set_status(response, 400);
     reverse_hls = airplay_remote_hls_locator_supported(play.url);
     apple_session_id = airplay_rtsp_request_header(request,
                                                     "X-Apple-Session-ID");
@@ -525,6 +608,20 @@ static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
             return airplay_rtsp_response_set_status(response, 503);
     }
     remote_mutex_lock(&remote->mutex);
+    if (photo_serial)
+    {
+        bool available = false;
+        for (size_t i = 0; i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+            if (remote->photos[i].serial == photo_serial &&
+                remote->photos[i].session_id == session_id &&
+                !remote->photos[i].retired)
+                available = true;
+        if (!available)
+        {
+            remote_mutex_unlock(&remote->mutex);
+            return airplay_rtsp_response_set_status(response, 409);
+        }
+    }
     reuse_owner = !reverse_hls &&
                   remote->state == AIRPLAY_REMOTE_VIDEO_SESSION_ACTIVE &&
                   remote->owner_session_id == session_id &&
@@ -538,13 +635,18 @@ static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
         previous_claimed = remote->owner_claimed;
         previous_session_id = remote->owner_session_id;
         previous_generation = remote->generation;
+        previous_claim_generation = remote->owner_claim_generation;
     }
     remote->state = reverse_hls ? AIRPLAY_REMOTE_VIDEO_SESSION_PENDING_HLS
                                 : AIRPLAY_REMOTE_VIDEO_SESSION_ACTIVE;
     remote->owner_claimed = reuse_owner;
+    if (!reuse_owner)
+        remote->owner_claim_generation = 0u;
     remote->owner_session_id = session_id;
     remote->generation++;
     generation = remote->generation;
+    remote->active_photo_serial = photo_serial;
+    photo_collect_locked(remote);
     remote->requested_rate = 1.0;
     remote->pending_seek = play.has_start && !play.start_is_fraction &&
                            play.start_value > 0.0;
@@ -565,9 +667,11 @@ static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
         airplay_remote_hls_reset(remote->hls, previous_session_id,
                                  previous_generation);
         if (previous_active)
-            (void)remote->ops.stop(remote->ops.user_data);
+            (void)stop_owner(remote, previous_session_id,
+                             previous_claim_generation);
         if (previous_claimed && remote->ops.release_owner)
             remote->ops.release_owner(previous_session_id,
+                                      previous_claim_generation,
                                       remote->ops.user_data);
     }
     airplay_remote_hls_reset(remote->hls, 0u, 0u);
@@ -587,7 +691,8 @@ static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
         bool claimed = false;
 
         if (!reuse_owner && claim_available &&
-            !remote->ops.claim_owner(session_id, remote->ops.user_data))
+            !remote->ops.claim_owner(session_id, generation,
+                                     remote->ops.user_data))
         {
             remote_mutex_lock(&remote->mutex);
             if (remote->generation == generation &&
@@ -604,13 +709,15 @@ static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
         if (!claim_generation)
         {
             remote_mutex_unlock(&remote->mutex);
-            if (claim_available && remote->ops.release_owner)
-                remote->ops.release_owner(session_id, remote->ops.user_data);
+            if (!reuse_owner && claim_available && remote->ops.release_owner)
+                remote->ops.release_owner(session_id, generation,
+                                          remote->ops.user_data);
             return airplay_rtsp_response_set_status(response, 409);
         }
         if (!reuse_owner && claim_available)
         {
             remote->owner_claimed = true;
+            remote->owner_claim_generation = generation;
             remote->control_attached = true;
             claimed = true;
         }
@@ -625,12 +732,14 @@ static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
                    remote->ops.play(remote->ops.user_data);
         if (!accepted)
         {
+            uint32_t failed_claim_generation = remote->owner_claim_generation;
             clear_owner_locked(remote);
             remote->generation++;
             remote_mutex_unlock(&remote->mutex);
-            (void)remote->ops.stop(remote->ops.user_data);
+            (void)stop_owner(remote, session_id, failed_claim_generation);
             if (claimed && remote->ops.release_owner)
-                remote->ops.release_owner(session_id, remote->ops.user_data);
+                remote->ops.release_owner(session_id, failed_claim_generation,
+                                          remote->ops.user_data);
             return airplay_rtsp_response_set_status(response, 503);
         }
         remote_mutex_unlock(&remote->mutex);
@@ -646,6 +755,130 @@ static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
                   play.has_start ? (play.start_is_fraction ? "fraction" : "seconds")
                                  : "none");
     return true;
+}
+
+static bool handle_play(AirPlayRemoteVideo *remote, uint64_t session_id,
+                        const AirPlayRtspRequest *request,
+                        AirPlayRtspResponse *response)
+{
+    AirPlayRemotePlayRequest play;
+    if (strcmp(request->method, "POST") != 0)
+        return airplay_rtsp_response_set_status(response, 405);
+    if (!parse_play_request(request, &play))
+        return airplay_rtsp_response_set_status(response, 400);
+    return start_play(remote, session_id, request, &play, 0u, response);
+}
+
+static bool handle_photo(AirPlayRemoteVideo *remote, uint64_t session_id,
+                         const AirPlayRtspRequest *request,
+                         AirPlayRtspResponse *response)
+{
+    const char *key = airplay_rtsp_request_header(request, "X-Apple-AssetKey");
+    const char *action = airplay_rtsp_request_header(request, "X-Apple-AssetAction");
+    bool cache_only = action && strcmp(action, "cacheOnly") == 0;
+    bool display_cached = action && strcmp(action, "displayCached") == 0;
+    AirPlayRemotePhoto *photo = NULL;
+    AirPlayRemotePlayRequest play = {0};
+    uint16_t port = 0u;
+    uint64_t serial;
+    bool result;
+
+    if (strcmp(request->method, "PUT") != 0)
+        return airplay_rtsp_response_set_status(response, 405);
+    if (action && !cache_only && !display_cached)
+        return airplay_rtsp_response_set_status(response, 400);
+    if ((key && (!key[0] || strlen(key) > AIRPLAY_REMOTE_PHOTO_KEY_MAX)) ||
+        ((cache_only || display_cached) && !key))
+        return airplay_rtsp_response_set_status(response, 400);
+    if (request->body_length > AIRPLAY_REMOTE_PHOTO_MAX_BYTES)
+        return airplay_rtsp_response_set_status(response, 413);
+    if (display_cached && request->body_length)
+        return airplay_rtsp_response_set_status(response, 400);
+    if (!cache_only && (!remote->ops.control_port ||
+        !(port = remote->ops.control_port(remote->ops.user_data))))
+        return airplay_rtsp_response_set_status(response, 503);
+
+    remote_mutex_lock(&remote->mutex);
+    if (display_cached)
+    {
+        photo = photo_find_locked(remote, session_id, key);
+        if (!photo)
+        {
+            remote_mutex_unlock(&remote->mutex);
+            return airplay_rtsp_response_set_status(response, 412);
+        }
+    }
+    else
+    {
+        static const uint8_t png_signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+        const bool png = request->body && request->body_length >= 8u &&
+                         memcmp(request->body, png_signature, 8u) == 0;
+        const bool jpeg = request->body && request->body_length >= 4u &&
+                          request->body[0] == 0xff && request->body[1] == 0xd8 &&
+                          request->body[2] == 0xff;
+        if (!png && !jpeg)
+        {
+            remote_mutex_unlock(&remote->mutex);
+            return airplay_rtsp_response_set_status(response, 415);
+        }
+        AirPlayRemotePhoto *same = key ? photo_find_locked(remote, session_id, key) : NULL;
+        if (same && !same->pending_users && same->serial != remote->active_photo_serial)
+            photo = same;
+        for (size_t i = 0; !photo && i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+            if (!remote->photos[i].data)
+                photo = &remote->photos[i];
+        if (!photo)
+            for (size_t i = 0; i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+            {
+                AirPlayRemotePhoto *candidate = &remote->photos[i];
+                if (!candidate->pending_users &&
+                    candidate->serial != remote->active_photo_serial &&
+                    (!photo || candidate->last_used < photo->last_used))
+                    photo = candidate;
+            }
+        if (!photo)
+        {
+            remote_mutex_unlock(&remote->mutex);
+            return airplay_rtsp_response_set_status(response, 503);
+        }
+        uint8_t *data = malloc(request->body_length);
+        if (!data)
+        {
+            remote_mutex_unlock(&remote->mutex);
+            return airplay_rtsp_response_set_status(response, 503);
+        }
+        memcpy(data, request->body, request->body_length);
+        photo_clear(photo);
+        photo->data = data;
+        photo->size = request->body_length;
+        photo->session_id = session_id;
+        photo->serial = ++remote->photo_serial;
+        photo->png = png;
+        snprintf(photo->key, sizeof(photo->key), "%s", key ? key : "");
+        snprintf(photo->path, sizeof(photo->path),
+                 AIRPLAY_REMOTE_PHOTO_LOCAL_PREFIX "%016llx/%016llx.%s",
+                 (unsigned long long)session_id, (unsigned long long)photo->serial,
+                 png ? "png" : "jpg");
+    }
+    photo->last_used = ++remote->photo_clock;
+    if (cache_only)
+    {
+        remote_mutex_unlock(&remote->mutex);
+        return true;
+    }
+    serial = photo->serial;
+    photo->pending_users++;
+    snprintf(play.url, sizeof(play.url), "http://127.0.0.1:%u%s", (unsigned)port, photo->path);
+    snprintf(play.metadata, sizeof(play.metadata), "AirPlay Photo");
+    remote_mutex_unlock(&remote->mutex);
+    result = start_play(remote, session_id, request, &play, serial, response);
+    remote_mutex_lock(&remote->mutex);
+    // pending_users prevents this slot from being reused while start_play calls
+    // the coordinator outside our mutex, including cancellation during claim.
+    photo->pending_users--;
+    photo_collect_locked(remote);
+    remote_mutex_unlock(&remote->mutex);
+    return result;
 }
 
 static bool handle_action(AirPlayRemoteVideo *remote, uint64_t session_id,
@@ -728,14 +961,31 @@ static bool handle_action(AirPlayRemoteVideo *remote, uint64_t session_id,
         remote_mutex_unlock(&remote->mutex);
         return airplay_rtsp_response_set_status(response, 409);
     }
-    if (!remote->ops.claim_owner(session_id, remote->ops.user_data))
+    /* Resource handoff may wait or reenter the receiver. Never hold the remote
+     * mutex across a claim; revalidate the request after it completes. */
+    remote_mutex_unlock(&remote->mutex);
+    if (!remote->ops.claim_owner(session_id, action.generation,
+                                 remote->ops.user_data))
+    {
+        fail_generation(remote, session_id, action.generation);
+        return airplay_rtsp_response_set_status(response, 409);
+    }
+    remote_mutex_lock(&remote->mutex);
+    pending_generation =
+        remote->state == AIRPLAY_REMOTE_VIDEO_SESSION_PENDING_HLS &&
+        remote->owner_session_id == session_id &&
+        remote->generation == action.generation;
+    if (!pending_generation)
     {
         remote_mutex_unlock(&remote->mutex);
-        fail_generation(remote, session_id, action.generation);
+        if (remote->ops.release_owner)
+            remote->ops.release_owner(session_id, action.generation,
+                                      remote->ops.user_data);
         return airplay_rtsp_response_set_status(response, 409);
     }
     remote->state = AIRPLAY_REMOTE_VIDEO_SESSION_ACTIVE;
     remote->owner_claimed = true;
+    remote->owner_claim_generation = action.generation;
     remote->control_attached = true;
     accepted = remote->ops.load(action.playback_url,
                                 metadata[0] ? metadata : NULL,
@@ -748,9 +998,10 @@ static bool handle_action(AirPlayRemoteVideo *remote, uint64_t session_id,
         remote_mutex_unlock(&remote->mutex);
         airplay_remote_hls_reset(remote->hls, session_id,
                                  action.generation);
-        (void)remote->ops.stop(remote->ops.user_data);
+        (void)stop_owner(remote, session_id, action.generation);
         if (remote->ops.release_owner)
-            remote->ops.release_owner(session_id, remote->ops.user_data);
+            remote->ops.release_owner(session_id, action.generation,
+                                      remote->ops.user_data);
         return airplay_rtsp_response_set_status(response, 503);
     }
     remote_mutex_unlock(&remote->mutex);
@@ -1013,7 +1264,9 @@ static bool terminate_session(AirPlayRemoteVideo *remote, uint64_t session_id,
     bool pending = false;
     bool release_owner = false;
     uint32_t generation = 0u;
+    uint32_t claim_generation = 0u;
     bool stopped = true;
+    bool cached = false;
 
     if (!remote || !session_id || !stopped_out)
         return false;
@@ -1026,17 +1279,20 @@ static bool terminate_session(AirPlayRemoteVideo *remote, uint64_t session_id,
     {
         generation = remote->generation;
         release_owner = remote->owner_claimed;
+        claim_generation = remote->owner_claim_generation;
         clear_owner_locked(remote);
         remote->generation++;
     }
+    cached = photo_clear_session_locked(remote, session_id);
     remote_mutex_unlock(&remote->mutex);
-    if (!active && !pending)
+    if (!active && !pending && !cached)
         return false;
     airplay_remote_hls_reset(remote->hls, session_id, generation);
     if (active)
-        stopped = remote->ops.stop(remote->ops.user_data);
+        stopped = stop_owner(remote, session_id, claim_generation);
     if (release_owner && remote->ops.release_owner)
-        remote->ops.release_owner(session_id, remote->ops.user_data);
+        remote->ops.release_owner(session_id, claim_generation,
+                                  remote->ops.user_data);
     *stopped_out = stopped;
     return true;
 }
@@ -1087,6 +1343,7 @@ void airplay_remote_video_destroy(AirPlayRemoteVideo *remote)
     bool stop;
     bool release_owner;
     uint64_t session_id;
+    uint32_t claim_generation;
 
     if (!remote)
         return;
@@ -1094,13 +1351,17 @@ void airplay_remote_video_destroy(AirPlayRemoteVideo *remote)
     stop = remote->state == AIRPLAY_REMOTE_VIDEO_SESSION_ACTIVE;
     release_owner = remote->owner_claimed;
     session_id = remote->owner_session_id;
+    claim_generation = remote->owner_claim_generation;
     clear_owner_locked(remote);
+    for (size_t i = 0; i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+        photo_clear(&remote->photos[i]);
     remote_mutex_unlock(&remote->mutex);
     if (stop)
     {
-        (void)remote->ops.stop(remote->ops.user_data);
+        (void)stop_owner(remote, session_id, claim_generation);
         if (release_owner && remote->ops.release_owner)
-            remote->ops.release_owner(session_id, remote->ops.user_data);
+            remote->ops.release_owner(session_id, claim_generation,
+                                      remote->ops.user_data);
     }
     airplay_remote_hls_destroy(remote->hls);
     remote->hls = NULL;
@@ -1135,6 +1396,8 @@ bool airplay_remote_video_route(AirPlayRemoteVideo *remote, uint64_t session_id,
     uri = request->uri;
     if (strcmp(uri, "/play") == 0)
         return handle_play(remote, session_id, request, response);
+    if (strcmp(uri, "/photo") == 0)
+        return handle_photo(remote, session_id, request, response);
     if (strcmp(uri, "/action") == 0)
         return handle_action(remote, session_id, request, response);
     if (strncmp(uri, "/rate?", 6u) == 0 || strcmp(uri, "/rate") == 0)
@@ -1151,7 +1414,9 @@ bool airplay_remote_video_route(AirPlayRemoteVideo *remote, uint64_t session_id,
 
 bool airplay_remote_video_is_local_uri(const char *uri)
 {
-    return airplay_remote_hls_is_local_uri(uri);
+    return (uri && strncmp(uri, AIRPLAY_REMOTE_PHOTO_LOCAL_PREFIX,
+                           sizeof(AIRPLAY_REMOTE_PHOTO_LOCAL_PREFIX) - 1u) == 0) ||
+           airplay_remote_hls_is_local_uri(uri);
 }
 
 bool airplay_remote_video_route_local(AirPlayRemoteVideo *remote,
@@ -1159,8 +1424,32 @@ bool airplay_remote_video_route_local(AirPlayRemoteVideo *remote,
                                       AirPlayRtspResponse *response,
                                       bool *handled_out)
 {
-    if (!remote)
+    if (!remote || !request || !response || !handled_out)
         return false;
+    if (strncmp(request->uri, AIRPLAY_REMOTE_PHOTO_LOCAL_PREFIX,
+                sizeof(AIRPLAY_REMOTE_PHOTO_LOCAL_PREFIX) - 1u) == 0)
+    {
+        *handled_out = true;
+        response->close_connection = true;
+        if (strcmp(request->method, "GET") != 0)
+            return airplay_rtsp_response_set_status(response, 405);
+        remote_mutex_lock(&remote->mutex);
+        for (size_t i = 0; i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+        {
+            AirPlayRemotePhoto *photo = &remote->photos[i];
+            if (photo->data && !photo->retired && strcmp(photo->path, request->uri) == 0)
+            {
+                bool ok = airplay_rtsp_response_set_body(response, photo->data,
+                            photo->size, photo->png ? "image/png" : "image/jpeg") &&
+                          airplay_rtsp_response_add_header(response, "Cache-Control", "no-store");
+                photo->last_used = ++remote->photo_clock;
+                remote_mutex_unlock(&remote->mutex);
+                return ok;
+            }
+        }
+        remote_mutex_unlock(&remote->mutex);
+        return airplay_rtsp_response_set_status(response, 404);
+    }
     return airplay_remote_hls_serve(remote->hls, request, response,
                                     handled_out);
 }
@@ -1190,6 +1479,9 @@ void airplay_remote_video_session_closed(AirPlayRemoteVideo *remote,
         remote->control_attached = false;
         control_detached = true;
     }
+    /* HTTP connections may close between cacheOnly and displayCached. Cache
+     * ownership has its own bounded logical-session reference, independent of
+     * playback ownership. Eviction, explicit stop and destruction clear it. */
     remote_mutex_unlock(&remote->mutex);
     if (pending)
     {
@@ -1204,6 +1496,35 @@ void airplay_remote_video_session_closed(AirPlayRemoteVideo *remote,
         remote->ops.control_detached(session_id, remote->ops.user_data);
 }
 
+size_t airplay_remote_video_cached_sessions(
+    AirPlayRemoteVideo *remote,
+    uint64_t session_ids[AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS],
+    uint64_t *snapshot_version)
+{
+    size_t count = 0u;
+
+    if (!remote || !session_ids || !snapshot_version)
+        return 0u;
+    remote_mutex_lock(&remote->mutex);
+    for (size_t i = 0; i < AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS; ++i)
+    {
+        AirPlayRemotePhoto *photo = &remote->photos[i];
+        bool duplicate = false;
+        if (!photo->data || photo->retired || !photo->session_id)
+            continue;
+        for (size_t j = 0; j < count; ++j)
+            if (session_ids[j] == photo->session_id)
+                duplicate = true;
+        if (!duplicate)
+            session_ids[count++] = photo->session_id;
+    }
+    if (++remote->cache_snapshot_version == 0u)
+        ++remote->cache_snapshot_version;
+    *snapshot_version = remote->cache_snapshot_version;
+    remote_mutex_unlock(&remote->mutex);
+    return count;
+}
+
 bool airplay_remote_video_terminate_session(AirPlayRemoteVideo *remote,
                                             uint64_t session_id)
 {
@@ -1213,7 +1534,8 @@ bool airplay_remote_video_terminate_session(AirPlayRemoteVideo *remote,
 }
 
 bool airplay_remote_video_relinquish_session(AirPlayRemoteVideo *remote,
-                                             uint64_t session_id)
+                                             uint64_t session_id,
+                                             uint32_t claim_generation)
 {
     uint32_t generation = 0u;
     bool relinquished = false;
@@ -1222,13 +1544,18 @@ bool airplay_remote_video_relinquish_session(AirPlayRemoteVideo *remote,
         return false;
     remote_mutex_lock(&remote->mutex);
     if (remote->owner_session_id == session_id &&
-        remote->state != AIRPLAY_REMOTE_VIDEO_SESSION_IDLE)
+        remote->state != AIRPLAY_REMOTE_VIDEO_SESSION_IDLE &&
+        (claim_generation == 0u ||
+         remote->owner_claim_generation == claim_generation ||
+         (!remote->owner_claimed && remote->generation == claim_generation)))
     {
         generation = remote->generation;
         clear_owner_locked(remote);
         remote->generation++;
         relinquished = true;
     }
+    if (relinquished || claim_generation == 0u)
+        photo_clear_session_locked(remote, session_id);
     remote_mutex_unlock(&remote->mutex);
     if (relinquished)
         airplay_remote_hls_reset(remote->hls, session_id, generation);

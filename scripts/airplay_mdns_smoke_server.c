@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "protocol/airplay/discovery/mdns.h"
@@ -32,7 +33,7 @@ int main(int argc, char **argv)
     char instance_name[64];
     AirPlayMdnsDiagnostics diagnostics;
 
-    if (argc != 3)
+    if (argc != 3 && (argc != 4 || strcmp(argv[3], "legacy") != 0))
         return 2;
     bind_port = strtoul(argv[1], &end, 10);
     if (!end || *end != '\0' || bind_port > UINT16_MAX)
@@ -46,6 +47,9 @@ int main(int argc, char **argv)
     config.features = AIRPLAY_MDNS_FEATURES_MIRROR_COMPAT |
                       AIRPLAY_MDNS_FEATURE_VIDEO |
                       AIRPLAY_MDNS_FEATURE_HLS;
+    config.legacy_raop = argc == 4;
+    if (config.legacy_raop)
+        config.features |= AIRPLAY_MDNS_FEATURE_RSA_AUTHENTICATION;
     config.pin_required = true;
     snprintf(config.pairing_id, sizeof(config.pairing_id),
              "00112233-4455-4677-8899-aabbccddeeff");

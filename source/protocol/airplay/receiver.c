@@ -34,6 +34,23 @@ typedef struct
 
 static AirPlayReceiverState g_receiver;
 
+_Static_assert(AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS <=
+                   AIRPLAY_SESSION_MAX_PHOTO_CACHE_REFERENCES,
+               "photo cache must fit the retained logical session budget");
+
+static void receiver_sync_photo_cache(AirPlayReceiverState *receiver)
+{
+    uint64_t ids[AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS];
+    uint64_t version = 0u;
+    size_t count;
+    if (!receiver->sessions || !receiver->config.remote_video)
+        return;
+    count = airplay_remote_video_cached_sessions(receiver->config.remote_video,
+                                                 ids, &version);
+    (void)airplay_session_manager_sync_photo_cache(receiver->sessions,
+                                                  ids, count, version);
+}
+
 static bool is_pairing_uri(const char *uri)
 {
     return uri && (strcmp(uri, "/pair-pin-start") == 0 ||
@@ -90,6 +107,7 @@ static bool receiver_route(AirPlayRtspSession *session,
                handled;
     }
 
+    receiver_sync_photo_cache(receiver);
     observe_result = airplay_session_manager_observe(
         receiver->sessions, session->id, request, &snapshot);
     if (observe_result != AIRPLAY_SESSION_OBSERVE_OK)
@@ -137,12 +155,15 @@ static bool receiver_route(AirPlayRtspSession *session,
         }
         return handled;
     }
-    if ((requires_authorization(request->method) ||
-         airplay_session_request_is_remote_video(request)) &&
+    /* AirPlay 1 HTTP photo/video and ANNOUNCE-based RAOP work without pairing.
+     * Binary-plist media setup retains the existing paired-session requirement. */
+    if (requires_authorization(request->method) &&
+        !airplay_handlers_session_is_legacy(session) &&
         !airplay_pairing_session_verified(session))
         return airplay_pairing_route(session, request, response, receiver->pairing);
     handled = airplay_handlers_route(session, request, response,
                                      receiver->handlers);
+    receiver_sync_photo_cache(receiver);
     if (handled && response->status_code >= 200 &&
         response->status_code < 300 && strcmp(request->method, "TEARDOWN") == 0 &&
         session->state == AIRPLAY_RTSP_SESSION_CLOSED)
@@ -173,6 +194,7 @@ static void receiver_session_closed(AirPlayRtspSession *session, void *user_data
 
     airplay_handlers_session_closed(session, receiver->handlers);
     airplay_pairing_session_closed(session, receiver->pairing);
+    receiver_sync_photo_cache(receiver);
     session_found = airplay_session_manager_close(receiver->sessions,
                                                   session->id,
                                                   &close_result);
@@ -204,6 +226,7 @@ static void receiver_session_closed(AirPlayRtspSession *session, void *user_data
         airplay_remote_video_session_closed(receiver->config.remote_video,
                                             close_result.logical_session_id);
     }
+    receiver_sync_photo_cache(receiver);
 }
 
 static bool receiver_shared_secret(const AirPlayRtspSession *session,
@@ -284,6 +307,9 @@ bool airplay_receiver_start(const AirPlayReceiverConfig *config)
                        (unsigned long long)AIRPLAY_TRACE_NOW_MS(), failure_stage);
 
     advertised_features = config->features | AIRPLAY_MDNS_FEATURE_LEGACY_PAIRING;
+    advertised_features &= ~AIRPLAY_MDNS_FEATURE_SLIDESHOW;
+    if (!config->audio_metadata_callback)
+        advertised_features &= ~AIRPLAY_MDNS_FEATURE_METADATA;
     if ((!config->unwrap_key_callback && !airplay_fairplay_is_available()) ||
         !config->transport_prepare_callback ||
         !config->mirror_open_callback)
@@ -292,10 +318,19 @@ bool airplay_receiver_start(const AirPlayReceiverConfig *config)
                                  AIRPLAY_MDNS_FEATURES_FAIRPLAY_AUTH);
     if (!config->remote_video)
         advertised_features &= ~(AIRPLAY_MDNS_FEATURE_VIDEO |
-                                 AIRPLAY_MDNS_FEATURE_HLS);
-    if (!config->audio_open_callback)
+                                 AIRPLAY_MDNS_FEATURE_HLS |
+                                 AIRPLAY_MDNS_FEATURE_PHOTO |
+                                 AIRPLAY_MDNS_FEATURE_PHOTO_CACHING);
+    else
+        advertised_features |= AIRPLAY_MDNS_FEATURE_PHOTO |
+                               AIRPLAY_MDNS_FEATURE_PHOTO_CACHING;
+    if (!config->audio_open_callback && !config->legacy_audio_open_callback)
         advertised_features &= ~(AIRPLAY_MDNS_FEATURE_AUDIO |
                                  AIRPLAY_MDNS_FEATURE_RAOP_NOT_REQUIRED);
+    if (config->legacy_audio_open_callback)
+        advertised_features |= AIRPLAY_MDNS_FEATURE_RSA_AUTHENTICATION;
+    else
+        advertised_features &= ~AIRPLAY_MDNS_FEATURE_RSA_AUTHENTICATION;
     mdns_config.friendly_name = config->friendly_name;
     mdns_config.control_port = config->control_port;
     memcpy(mdns_config.device_id, device_id, sizeof(device_id));
@@ -303,6 +338,7 @@ bool airplay_receiver_start(const AirPlayReceiverConfig *config)
     memcpy(mdns_config.pairing_id, pairing_id, sizeof(pairing_id));
     mdns_config.features = advertised_features;
     mdns_config.pin_required = true;
+    mdns_config.legacy_raop = config->legacy_audio_open_callback != NULL;
     failure_stage = "dns-sd-txt";
     AIRPLAY_TRACE_SYNC("[airplay] t_ms=%llu receiver stage=%s begin\n",
                        (unsigned long long)AIRPLAY_TRACE_NOW_MS(), failure_stage);
@@ -323,6 +359,10 @@ bool airplay_receiver_start(const AirPlayReceiverConfig *config)
     handlers_config.transport_prepare_callback = config->transport_prepare_callback;
     handlers_config.mirror_open_callback = config->mirror_open_callback;
     handlers_config.audio_open_callback = config->audio_open_callback;
+    handlers_config.legacy_audio_open_callback = config->legacy_audio_open_callback;
+    handlers_config.audio_flush_callback = config->audio_flush_callback;
+    handlers_config.audio_volume_callback = config->audio_volume_callback;
+    handlers_config.audio_metadata_callback = config->audio_metadata_callback;
     handlers_config.audio_record_callback = config->audio_record_callback;
     handlers_config.media_record_callback = config->media_record_callback;
     handlers_config.mirror_stop_callback = config->mirror_stop_callback;

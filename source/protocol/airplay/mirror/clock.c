@@ -39,6 +39,9 @@ struct AirPlayMirrorClock
     bool audio_ready;
     bool previous_sync_ready;
     bool audio_only;
+    bool audio_only_rtp_ready;
+    uint32_t audio_only_last_rtp;
+    int64_t audio_only_samples;
 };
 
 static uint64_t absolute_i64(int64_t value)
@@ -316,6 +319,31 @@ AirPlayMirrorClockResult airplay_mirror_clock_map_audio(
 
     if (!clock || !pts_out || !clock->sample_rate)
         return AIRPLAY_MIRROR_CLOCK_OUT_OF_RANGE;
+    if (clock->audio_only)
+    {
+        /* Standalone playback follows its sample clock. The A/V skew guard
+         * cannot compare it with a nonexistent video stream (previously this
+         * dropped every packet after two seconds). NTP is still recorded for
+         * diagnostics, while mpv owns output pacing. */
+        if (clock->audio_only_rtp_ready)
+        {
+            int32_t delta = (int32_t)(rtp_timestamp - clock->audio_only_last_rtp);
+            if (delta < 0)
+                return AIRPLAY_MIRROR_CLOCK_OUT_OF_RANGE;
+            clock->audio_only_samples += delta;
+        }
+        clock->audio_only_last_rtp = rtp_timestamp;
+        clock->audio_only_rtp_ready = true;
+        pts = clock->audio_only_samples * AIRPLAY_MIRROR_CLOCK_TIME_BASE /
+              clock->sample_rate;
+        clock->stats.candidate_audio_pts = pts;
+        clock->last_audio_pts = pts;
+        clock->audio_ready = true;
+        update_jitter(&clock->audio_arrival, pts, local_time_us);
+        clock->stats.audio_jitter_us = clock->audio_arrival.jitter_us;
+        *pts_out = pts;
+        return AIRPLAY_MIRROR_CLOCK_OK;
+    }
     if (!clock->video_ready || !clock->audio_sync_ready)
     {
         clock->stats.unsynced_audio_drops++;

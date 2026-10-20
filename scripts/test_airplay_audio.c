@@ -6,10 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
 
 #include "protocol/airplay/media/stream_bridge.h"
 #include "protocol/airplay/mirror/audio.h"
@@ -171,7 +173,9 @@ static size_t make_packet(uint8_t *packet, size_t capacity, uint16_t sequence,
     packet[5] = (uint8_t)(timestamp >> 16);
     packet[6] = (uint8_t)(timestamp >> 8);
     packet[7] = (uint8_t)timestamp;
-    if (!encrypt_payload(key, iv, payload, packet + 12u, payload_size))
+    if (!key && !iv)
+        memcpy(packet + 12u, payload, payload_size);
+    else if (!encrypt_payload(key, iv, payload, packet + 12u, payload_size))
         return 0u;
     return 12u + payload_size;
 }
@@ -322,6 +326,110 @@ static void capture_video(const AirPlayMirrorAccessUnit *access_unit, void *user
         memcpy(fixture->data, access_unit->data, access_unit->size);
         fixture->size = access_unit->size;
     }
+}
+
+static void test_legacy_transport(void)
+{
+    const uint8_t samples[] = {0x00u, 0x01u, 0x7fu, 0xffu,
+                              0x80u, 0x00u, 0xffu, 0xffu};
+    AirPlayMirrorAudioConfig config = {0};
+    AirPlayMirrorAudio *audio = NULL;
+    AudioRecorder recorder = {0};
+    struct sockaddr_in peer = {0};
+    socklen_t peer_size = sizeof(peer);
+    struct timeval timeout = {.tv_sec = 1};
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    uint8_t packet[128], reply[128], request[32];
+    CHECK(fd >= 0);
+    if (fd < 0)
+        return;
+    peer.sin_family = AF_INET;
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(fd, (struct sockaddr *)&peer, sizeof(peer)) == 0);
+    CHECK(getsockname(fd, (struct sockaddr *)&peer, &peer_size) == 0);
+    CHECK(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    config.session_id = 42u;
+    config.compression_type = AIRPLAY_MIRROR_AUDIO_CT_PCM;
+    config.sample_rate = 48000u;
+    config.peer_ipv4_address = peer.sin_addr.s_addr;
+    config.peer_control_port = ntohs(peer.sin_port);
+    config.callback = record_audio;
+    config.callback_user_data = &recorder;
+    CHECK(airplay_mirror_audio_create(&config, &audio));
+    airplay_mirror_audio_set_recording(audio, true);
+    size_t size = make_packet(packet, sizeof(packet), 65534u, 100u,
+                              samples, sizeof(samples), NULL, NULL);
+    CHECK(airplay_mirror_audio_process_packet(audio, packet, size));
+    size = make_packet(packet, sizeof(packet), 0u, 104u,
+                        samples, sizeof(samples), NULL, NULL);
+    CHECK(airplay_mirror_audio_process_packet(audio, packet, size));
+    CHECK(atomic_load(&recorder.count) == 1u);
+    ssize_t received = recv(fd, request, sizeof(request), 0);
+    CHECK(received == 8 && request[0] == 0x80u && request[1] == 0xd5u);
+    CHECK(request[4] == 0xffu && request[5] == 0xffu &&
+          request[6] == 0u && request[7] == 1u);
+    size = make_packet(reply + 4u, sizeof(reply) - 4u, 65535u, 102u,
+                        samples, sizeof(samples), NULL, NULL);
+    reply[0] = 0x80u;
+    reply[1] = 0xd6u;
+    reply[2] = 0u;
+    reply[3] = 1u;
+    CHECK(airplay_mirror_audio_process_control_packet(audio, reply, size + 4u));
+    CHECK(atomic_load(&recorder.count) == 3u &&
+          recorder.sequences[1] == 65535u && recorder.sequences[2] == 0u);
+    CHECK(recorder.sizes[1] == sizeof(samples) &&
+          memcmp(recorder.payload[1], samples, sizeof(samples)) == 0);
+    airplay_mirror_audio_flush(audio, true, 0u, true, 104u);
+    size = make_packet(packet, sizeof(packet), 0u, 104u,
+                        samples, sizeof(samples), NULL, NULL);
+    CHECK(airplay_mirror_audio_process_packet(audio, packet, size));
+    CHECK(atomic_load(&recorder.count) == 3u);
+    size = make_packet(packet, sizeof(packet), 1u, 106u,
+                        samples, sizeof(samples), NULL, NULL);
+    CHECK(airplay_mirror_audio_process_packet(audio, packet, size));
+    CHECK(atomic_load(&recorder.count) == 4u && recorder.discontinuities[3]);
+
+    /* A legal RTP packet may contain CSRC, extension and padding bytes. */
+    size = make_packet(packet, sizeof(packet), 2u, 108u,
+                        samples, sizeof(samples), NULL, NULL);
+    memmove(packet + 24u, packet + 12u, sizeof(samples));
+    memset(packet + 12u, 0, 12u);
+    packet[0] = 0xb1u; /* V2, padding, extension, one CSRC */
+    packet[19] = 1u;   /* One four-byte extension word */
+    memset(packet + 32u, 0, 4u);
+    packet[35] = 4u;
+    CHECK(airplay_mirror_audio_process_packet(audio, packet, 36u));
+    CHECK(atomic_load(&recorder.count) == 5u && recorder.sizes[4] == sizeof(samples));
+    CHECK(memcmp(recorder.payload[4], samples, sizeof(samples)) == 0);
+    packet[19] = 50u;
+    CHECK(!airplay_mirror_audio_process_packet(audio, packet, 36u));
+    packet[19] = 1u;
+    packet[35] = 0u;
+    CHECK(!airplay_mirror_audio_process_packet(audio, packet, 36u));
+    size = make_packet(packet, sizeof(packet), 4u, 112u,
+                        samples, sizeof(samples), NULL, NULL);
+    CHECK(airplay_mirror_audio_process_packet(audio, packet, size));
+    for (unsigned i = 0u; i < 100u && atomic_load(&recorder.count) < 6u; ++i)
+        sleep_milliseconds(5u);
+    CHECK(atomic_load(&recorder.count) == 6u &&
+          recorder.sequences[5] == 4u && recorder.discontinuities[5]);
+    airplay_mirror_audio_destroy(audio);
+    audio = NULL;
+    AirPlayMirrorAudioFormat negotiated;
+    CHECK(airplay_mirror_audio_format(AIRPLAY_MIRROR_AUDIO_CT_PCM, 2u, 48000u,
+                                      &negotiated));
+    negotiated.rtp_payload_type = 97u;
+    config.format = &negotiated;
+    CHECK(airplay_mirror_audio_create(&config, &audio));
+    airplay_mirror_audio_set_recording(audio, true);
+    size = make_packet(packet, sizeof(packet), 10u, 200u,
+                        samples, sizeof(samples), NULL, NULL);
+    CHECK(!airplay_mirror_audio_process_packet(audio, packet, size));
+    packet[1] = 0xe1u; /* Negotiated dynamic payload 97 plus marker bit. */
+    CHECK(airplay_mirror_audio_process_packet(audio, packet, size));
+    CHECK(atomic_load(&recorder.count) == 7u && recorder.sequences[6] == 10u);
+    airplay_mirror_audio_destroy(audio);
+    close(fd);
 }
 
 static void check_container(const char *path,
@@ -479,6 +587,184 @@ static void test_audio_only(const uint8_t *audio, size_t audio_size)
     airplay_stream_bridge_release(bridge);
 }
 
+static void test_pcm_decode(void)
+{
+    const uint8_t pcm[] = {0x00u, 0x64u, 0xffu, 0x9cu,
+                           0x01u, 0x00u, 0xffu, 0x00u};
+    const int16_t expected[] = {100, -100, 256, -256};
+    AirPlayStreamBridge *bridge = NULL;
+    AirPlayMirrorAudioFormat format;
+    AirPlayStreamBridgeStats stats = {0};
+    CHECK(airplay_mirror_audio_format(AIRPLAY_MIRROR_AUDIO_CT_PCM, 2u,
+                                      48000u, &format));
+    CHECK(airplay_stream_bridge_create_profile(
+        0u, AIRPLAY_STREAM_BRIDGE_PROFILE_AUDIO_ONLY, &bridge));
+    CHECK(airplay_stream_bridge_configure_audio(bridge, &format));
+    for (unsigned i = 0u; i < 3u; ++i)
+    {
+        AirPlayMirrorAudioFrame frame = {
+            .data = pcm, .size = sizeof(pcm), .sequence = (uint16_t)i,
+            .rtp_timestamp = 48000u + i * 96000u};
+        CHECK(airplay_stream_bridge_push_audio(bridge, &frame));
+    }
+    CHECK(airplay_stream_bridge_get_stats(bridge, &stats));
+    CHECK(stats.audio_packets == 3u && stats.clock.skew_audio_drops == 0u);
+    CHECK(airplay_stream_bridge_finish(bridge));
+    CHECK(airplay_stream_bridge_claim_reader(bridge));
+    const char *path = "build/tests/airplay-pcm.mkv";
+    FILE *output = fopen(path, "wb");
+    CHECK(output != NULL);
+    uint8_t buffer[4096];
+    int64_t size;
+    while ((size = airplay_stream_bridge_read(bridge, buffer, sizeof(buffer))) > 0)
+        if (output)
+            CHECK(fwrite(buffer, 1u, (size_t)size, output) == (size_t)size);
+    if (output)
+        fclose(output);
+    airplay_stream_bridge_release_reader(bridge);
+    airplay_stream_bridge_release(bridge);
+    AVFormatContext *input = NULL;
+    AVCodecContext *decoder = NULL;
+    AVPacket *packet = av_packet_alloc();
+    AVFrame *decoded = av_frame_alloc();
+    CHECK(avformat_open_input(&input, path, NULL, NULL) >= 0);
+    unsigned decoded_count = 0u;
+    if (input)
+    {
+        CHECK(avformat_find_stream_info(input, NULL) >= 0);
+        CHECK(input->nb_streams == 1u);
+        const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_PCM_S16BE);
+        CHECK(codec != NULL);
+        decoder = avcodec_alloc_context3(codec);
+        CHECK(decoder && avcodec_parameters_to_context(decoder,
+              input->streams[0]->codecpar) >= 0);
+        CHECK(decoder && avcodec_open2(decoder, codec, NULL) >= 0);
+        if (decoder && packet && decoded)
+            while (av_read_frame(input, packet) >= 0)
+            {
+                CHECK(avcodec_send_packet(decoder, packet) >= 0);
+                while (avcodec_receive_frame(decoder, decoded) >= 0)
+                {
+                    CHECK(decoded->format == AV_SAMPLE_FMT_S16 &&
+                          decoded->nb_samples == 2);
+                    CHECK(memcmp(decoded->data[0], expected, sizeof(expected)) == 0);
+                    decoded_count++;
+                    av_frame_unref(decoded);
+                }
+                av_packet_unref(packet);
+            }
+    }
+    CHECK(decoded_count == 3u);
+    avcodec_free_context(&decoder);
+    av_packet_free(&packet);
+    av_frame_free(&decoded);
+    avformat_close_input(&input);
+}
+
+static void test_alac_roundtrip(void)
+{
+    const AVCodec *encoder = avcodec_find_encoder(AV_CODEC_ID_ALAC);
+    AVCodecContext *encode = avcodec_alloc_context3(encoder);
+    AVFrame *source = av_frame_alloc();
+    AVPacket *encoded = av_packet_alloc();
+    int16_t expected[2][352];
+    CHECK(encoder && encode && source && encoded);
+    if (!encoder || !encode || !source || !encoded)
+        goto cleanup;
+    encode->sample_rate = 44100;
+    encode->sample_fmt = AV_SAMPLE_FMT_S16P;
+    encode->bits_per_raw_sample = 16;
+    av_channel_layout_default(&encode->ch_layout, 2);
+    CHECK(avcodec_open2(encode, encoder, NULL) >= 0);
+    source->format = encode->sample_fmt;
+    source->sample_rate = encode->sample_rate;
+    source->nb_samples = 352;
+    CHECK(av_channel_layout_copy(&source->ch_layout, &encode->ch_layout) >= 0);
+    CHECK(av_frame_get_buffer(source, 0) >= 0);
+    for (unsigned i = 0u; i < 352u; ++i)
+    {
+        expected[0][i] = (int16_t)((int)i * 97 - 16384);
+        expected[1][i] = (int16_t)(16384 - (int)i * 83);
+    }
+    memcpy(source->data[0], expected[0], sizeof(expected[0]));
+    memcpy(source->data[1], expected[1], sizeof(expected[1]));
+    CHECK(avcodec_send_frame(encode, source) >= 0);
+    CHECK(avcodec_receive_packet(encode, encoded) >= 0);
+    if (encoded->size <= 0)
+        goto cleanup;
+
+    uint8_t key[16] = {1u, 2u, 3u}, iv[16] = {9u, 8u, 7u};
+    AirPlayMirrorAudioConfig config = {
+        .session_id = 99u, .aes_key = key, .aes_iv = iv,
+        .compression_type = AIRPLAY_MIRROR_AUDIO_CT_ALAC,
+        .callback = record_audio};
+    AudioRecorder recorder = {0};
+    AirPlayMirrorAudio *audio = NULL;
+    config.callback_user_data = &recorder;
+    CHECK(airplay_mirror_audio_create(&config, &audio));
+    airplay_mirror_audio_set_recording(audio, true);
+    uint8_t rtp[4096];
+    size_t size = make_packet(rtp, sizeof(rtp), 5u, 44100u,
+                              encoded->data, (size_t)encoded->size, key, iv);
+    CHECK(size && airplay_mirror_audio_process_packet(audio, rtp, size));
+    CHECK(atomic_load(&recorder.count) == 1u &&
+          recorder.sizes[0] == (size_t)encoded->size);
+    airplay_mirror_audio_destroy(audio);
+    test_dual_stream(AIRPLAY_MIRROR_AUDIO_CT_ALAC, 352u,
+                     recorder.payload[0], recorder.sizes[0],
+                     "build/tests/airplay-alac-roundtrip.mkv", AV_CODEC_ID_ALAC);
+    av_packet_unref(encoded);
+
+    AVFormatContext *input = NULL;
+    AVCodecContext *decode = NULL;
+    AVFrame *output = av_frame_alloc();
+    CHECK(avformat_open_input(&input, "build/tests/airplay-alac-roundtrip.mkv",
+                               NULL, NULL) >= 0);
+    unsigned count = 0u;
+    if (input)
+    {
+        CHECK(avformat_find_stream_info(input, NULL) >= 0);
+        int index = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, -1,
+                                        NULL, 0);
+        CHECK(index >= 0);
+        const AVCodec *decoder = avcodec_find_decoder(AV_CODEC_ID_ALAC);
+        decode = avcodec_alloc_context3(decoder);
+        if (index >= 0 && decode && output)
+        {
+            CHECK(avcodec_parameters_to_context(decode,
+                  input->streams[index]->codecpar) >= 0);
+            CHECK(avcodec_open2(decode, decoder, NULL) >= 0);
+            while (av_read_frame(input, encoded) >= 0)
+            {
+                if (encoded->stream_index == index)
+                {
+                    CHECK(avcodec_send_packet(decode, encoded) >= 0);
+                    while (avcodec_receive_frame(decode, output) >= 0)
+                    {
+                        CHECK(output->format == AV_SAMPLE_FMT_S16P &&
+                              output->nb_samples == 352);
+                        CHECK(memcmp(output->data[0], expected[0],
+                                      sizeof(expected[0])) == 0);
+                        CHECK(memcmp(output->data[1], expected[1],
+                                      sizeof(expected[1])) == 0);
+                        count++;
+                        av_frame_unref(output);
+                    }
+                }
+                av_packet_unref(encoded);
+            }
+        }
+    }
+    CHECK(count == 1u);
+    av_frame_free(&output);
+    avcodec_free_context(&decode);
+    avformat_close_input(&input);
+cleanup:
+    av_packet_free(&encoded);
+    av_frame_free(&source);
+    avcodec_free_context(&encode);
+}
+
 int main(void)
 {
     static const uint8_t alac_cookie[] = {
@@ -502,10 +788,21 @@ int main(void)
     CHECK(format.samples_per_frame == 352u);
     CHECK(format.codec_config_size == sizeof(alac_cookie));
     CHECK(memcmp(format.codec_config, alac_cookie, sizeof(alac_cookie)) == 0);
-    CHECK(!airplay_mirror_audio_format(AIRPLAY_MIRROR_AUDIO_CT_ALAC, 1024u,
+    CHECK(airplay_mirror_audio_format(AIRPLAY_MIRROR_AUDIO_CT_ALAC, 1024u,
                                        44100u, &format));
-    CHECK(!airplay_mirror_audio_format(AIRPLAY_MIRROR_AUDIO_CT_ALAC, 352u,
+    CHECK(format.codec_config[14] == 4u && format.codec_config[15] == 0u);
+    CHECK(airplay_mirror_audio_format(AIRPLAY_MIRROR_AUDIO_CT_ALAC, 352u,
                                        48000u, &format));
+    CHECK(format.sample_rate == 48000u && format.codec_config[34] == 0xbbu);
+    CHECK(!airplay_mirror_audio_format(AIRPLAY_MIRROR_AUDIO_CT_ALAC, 5000u,
+                                       48000u, &format));
+    CHECK(airplay_mirror_audio_format(AIRPLAY_MIRROR_AUDIO_CT_PCM, 352u,
+                                      48000u, &format));
+    CHECK(format.codec == AIRPLAY_MIRROR_AUDIO_CODEC_PCM_S16BE &&
+          format.codec_config_size == 0u);
+    test_legacy_transport();
+    test_pcm_decode();
+    test_alac_roundtrip();
     aac = read_hex("scripts/fixtures/airplay/mirror/aac-lc-frame.hex", &aac_size);
     CHECK(aac != NULL);
     if (aac)

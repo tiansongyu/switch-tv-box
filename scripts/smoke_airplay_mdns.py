@@ -143,7 +143,8 @@ def wait_for_ready(process: subprocess.Popen[str], timeout: float = 5.0) -> tupl
 
 
 def validate_records(
-    records: list[Record], instance: str, service: str, expected_ttl: int
+    records: list[Record], instance: str, service: str, expected_ttl: int,
+    legacy: bool = False,
 ) -> None:
     assert len(records) == 4, records
     by_kind = {record.kind: record for record in records}
@@ -153,16 +154,18 @@ def validate_records(
     assert by_kind[33].name == f"{instance}.{service}"
     assert by_kind[16].name == f"{instance}.{service}"
     txt = by_kind[16].data
+    feature_value = b"0x5AFFFEF7,0x0" if legacy else b"0x5A7FFEF7,0x0"
     if service == "_airplay._tcp.local":
-        assert b"features=0x5A7FFEF7,0x0" in txt, txt
+        assert b"features=" + feature_value in txt, txt
         assert b"pi=00112233-4455-4677-8899-aabbccddeeff" in txt, txt
+        assert b"pw=true" in txt, txt
     else:
-        assert b"ft=0x5A7FFEF7,0x0" in txt, txt
+        assert b"ft=" + feature_value in txt, txt
         assert b"ch=2" in txt, txt
-        assert b"et=0,3,5" in txt, txt
-        assert b"sf=0x8c" in txt, txt
+        assert (b"et=0,1,3,5" if legacy else b"et=0,3,5") in txt, txt
+        assert (b"sf=0x4" if legacy else b"sf=0x8c") in txt, txt
+        assert (b"pw=false" if legacy else b"pw=true") in txt, txt
         assert b"txtvers=1" in txt, txt
-    assert b"pw=true" in txt, txt
     assert b"pk=" in txt, txt
     assert struct.unpack("!H", by_kind[33].data[4:6])[0] == 7000
     assert by_kind[1].data == socket.inet_aton("127.0.0.1")
@@ -173,6 +176,7 @@ def receive_services(
     expected: dict[str, str],
     expected_ttl: int,
     timeout: float = 3.0,
+    legacy: bool = False,
 ) -> None:
     remaining = dict(expected)
     deadline = time.monotonic() + timeout
@@ -184,15 +188,16 @@ def receive_services(
         service = ptr.name.lower()
         if service not in remaining:
             continue
-        validate_records(records, remaining.pop(service), service, expected_ttl)
+        validate_records(records, remaining.pop(service), service, expected_ttl,
+                         legacy)
 
 
-def run_smoke(server_binary: Path) -> None:
+def run_mode(server_binary: Path, legacy: bool) -> None:
     monitor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     monitor.bind(("127.0.0.1", 0))
     monitor_port = monitor.getsockname()[1]
     process = subprocess.Popen(
-        [str(server_binary), "0", str(monitor_port)],
+        [str(server_binary), "0", str(monitor_port)] + (["legacy"] if legacy else []),
         cwd=server_binary.parents[2],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -205,7 +210,7 @@ def run_smoke(server_binary: Path) -> None:
             "_airplay._tcp.local": instance,
             "_raop._tcp.local": raop_instance,
         }
-        receive_services(monitor, services, 120)
+        receive_services(monitor, services, 120, legacy=legacy)
 
         query = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         query.bind(("127.0.0.1", 0))
@@ -213,12 +218,12 @@ def run_smoke(server_binary: Path) -> None:
             query.sendto(make_query("_airplay._tcp.local"), ("127.0.0.1", port))
             transaction_id, flags, records = parse_packet(receive_packet(query))
             assert transaction_id == 0x1234 and flags == 0x8400
-            validate_records(records, instance, "_airplay._tcp.local", 120)
+            validate_records(records, instance, "_airplay._tcp.local", 120, legacy)
 
             query.sendto(make_query("_raop._tcp.local"), ("127.0.0.1", port))
             transaction_id, flags, records = parse_packet(receive_packet(query))
             assert transaction_id == 0x1234 and flags == 0x8400
-            validate_records(records, raop_instance, "_raop._tcp.local", 120)
+            validate_records(records, raop_instance, "_raop._tcp.local", 120, legacy)
 
             query.sendto(make_txt_conflict(instance), ("127.0.0.1", port))
             receive_services(
@@ -228,6 +233,7 @@ def run_smoke(server_binary: Path) -> None:
                     "_raop._tcp.local": f"101112131415@{instance} (2)",
                 },
                 120,
+                legacy=legacy,
             )
         finally:
             query.close()
@@ -240,6 +246,7 @@ def run_smoke(server_binary: Path) -> None:
                 "_raop._tcp.local": f"101112131415@{instance} (2)",
             },
             0,
+            legacy=legacy,
         )
         process.wait(timeout=5.0)
     finally:
@@ -254,6 +261,14 @@ def run_smoke(server_binary: Path) -> None:
         if process.returncode not in (0, -15):
             stderr = process.stderr.read() if process.stderr else ""
             raise AssertionError(f"mDNS smoke server failed: {process.returncode}: {stderr}")
+
+
+def run_smoke(server_binary: Path) -> None:
+    # Both configurations exercise announcement, direct query, conflict rename
+    # and goodbye. Only the actual legacy receiver advertises RSA and skips PIN
+    # on _raop; modern _airplay pairing still requires PIN in either mode.
+    run_mode(server_binary, legacy=False)
+    run_mode(server_binary, legacy=True)
 
 
 def main() -> int:

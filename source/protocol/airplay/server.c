@@ -521,6 +521,15 @@ static AIRPLAY_THREAD_RETURN airplay_server_client_thread(void *argument)
     }
     airplay_rtsp_session_init(&session, atomic_fetch_add(&server->next_session_id, 1U) + 1U);
     airplay_rtsp_session_set_peer_ipv4(&session, client->peer_ipv4_address);
+    /* Apple-Challenge signs the address the sender connected to, which may
+     * differ from the default interface on a multi-homed receiver. */
+    {
+        struct sockaddr_in local = {0};
+        socklen_t local_size = sizeof(local);
+        if (getsockname(socket_fd, (struct sockaddr *)&local, &local_size) == 0 &&
+            local.sin_family == AF_INET)
+            session.local_ipv4_address = local.sin_addr.s_addr;
+    }
     session_initialized = true;
 
     while (atomic_load(&server->running) && session.state != AIRPLAY_RTSP_SESSION_CLOSED)

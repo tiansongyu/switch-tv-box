@@ -28,6 +28,7 @@ typedef struct
     uint64_t logical_session_id;
     uint32_t connection_count;
     uint32_t media_reference_count;
+    bool photo_cache_reference;
     uint8_t client_id[AIRPLAY_SESSION_CLIENT_ID_SIZE];
     bool client_id_bound;
     bool transport_terminated;
@@ -40,6 +41,7 @@ struct AirPlaySessionManager
     AirPlayConnectionEntry connections[AIRPLAY_SESSION_MAX_CONNECTIONS];
     AirPlayLogicalSessionEntry logical_sessions[AIRPLAY_SESSION_MAX_LOGICAL_SESSIONS];
     uint64_t next_logical_session_id;
+    uint64_t photo_cache_version;
     bool mutex_ready;
 };
 
@@ -128,6 +130,7 @@ bool airplay_session_request_is_remote_video(const AirPlayRtspRequest *request)
         return false;
     uri = request->uri;
     return strcmp(uri, "/play") == 0 ||
+           strcmp(uri, "/photo") == 0 ||
            strcmp(uri, "/stop") == 0 ||
            strcmp(uri, "/playback-info") == 0 ||
            strcmp(uri, "/action") == 0 ||
@@ -235,7 +238,7 @@ static AirPlayLogicalSessionEntry *find_free_logical(AirPlaySessionManager *mana
 static void release_logical_if_unreferenced(AirPlayLogicalSessionEntry *logical)
 {
     if (logical && logical->connection_count == 0U &&
-        logical->media_reference_count == 0U)
+        logical->media_reference_count == 0U && !logical->photo_cache_reference)
         memset(logical, 0, sizeof(*logical));
 }
 
@@ -615,6 +618,33 @@ bool airplay_session_manager_release_media(AirPlaySessionManager *manager,
     }
     session_mutex_unlock(&manager->mutex);
     return released;
+}
+
+bool airplay_session_manager_sync_photo_cache(AirPlaySessionManager *manager,
+                                              const uint64_t *session_ids,
+                                              size_t count, uint64_t version)
+{
+    if (!manager || (count && !session_ids) ||
+        count > AIRPLAY_SESSION_MAX_PHOTO_CACHE_REFERENCES || !version)
+        return false;
+    session_mutex_lock(&manager->mutex);
+    if (version > manager->photo_cache_version)
+    {
+        manager->photo_cache_version = version;
+        for (size_t index = 0u; index < AIRPLAY_SESSION_MAX_LOGICAL_SESSIONS; ++index)
+        {
+            AirPlayLogicalSessionEntry *logical = &manager->logical_sessions[index];
+            bool cached = false;
+            if (!logical->used)
+                continue;
+            for (size_t photo = 0u; photo < count; ++photo)
+                cached |= session_ids[photo] == logical->logical_session_id;
+            logical->photo_cache_reference = cached;
+            release_logical_if_unreferenced(logical);
+        }
+    }
+    session_mutex_unlock(&manager->mutex);
+    return true;
 }
 
 const char *airplay_connection_kind_name(AirPlayConnectionKind kind)

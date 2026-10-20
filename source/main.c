@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "app/network_diagnostics.h"
@@ -568,6 +569,8 @@ static void build_home_view_state(PlayerHomeViewState *out,
     }
     out->video_ready = video_ready;
     out->playback_active = main_snapshot_playback_active(snapshot);
+    out->audio_playback_active = snapshot && out->playback_active &&
+        player_media_is_airplay_audio(&snapshot->media);
     out->playback_state = snapshot ? snapshot->state : PLAYER_STATE_IDLE;
     if (snapshot && snapshot->state == PLAYER_STATE_ERROR)
     {
@@ -1850,9 +1853,11 @@ int main(int argc, char* argv[])
             }
 
             if (!iptv_panel_open && !browser_captured && home_state.playback_active &&
-                ((kDown & HidNpadButton_B) || return_home_player))
+                (((kDown & HidNpadButton_B) && !home_state.audio_playback_active) ||
+                 return_home_player))
             {
-                bool ok = player_view_show_video();
+                bool ok = home_state.audio_playback_active ?
+                    player_ui_toggle_pause(&video_ui, &snapshot) : player_view_show_video();
                 main_input_trace("[input] action=return-to-player ok=%d state=%s\n",
                                  ok ? 1 : 0,
                                  have_snapshot ? main_player_state_name(snapshot.state) : "none");

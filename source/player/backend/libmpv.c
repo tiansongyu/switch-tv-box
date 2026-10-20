@@ -15,6 +15,7 @@
 #include "player/seek_target.h"
 #include "player/trace.h"
 #include "protocol/airplay/media/stream_bridge.h"
+#include "protocol/airplay/media/remote_video.h"
 
 #ifdef HAVE_LIBMPV
 #include <mpv/client.h>
@@ -1404,6 +1405,25 @@ static bool libmpv_async_load_current(bool paused)
         }
         memcpy(options + length, timestamp_option, strlen(timestamp_option) + 1u);
     }
+    else if (strncmp(g_uri, "http://127.0.0.1:", 17u) == 0)
+    {
+        const char *path = strchr(g_uri + 17u, '/');
+        if (path && strncmp(path, AIRPLAY_REMOTE_PHOTO_LOCAL_PREFIX,
+                            sizeof(AIRPLAY_REMOTE_PHOTO_LOCAL_PREFIX) - 1u) == 0)
+        {
+            /* A photo remains visible until the sender replaces it or stops.
+             * Set this per file too, so unrelated future load options cannot
+             * accidentally restore the image demuxer's five-second timeout. */
+            const char *photo_option = ",image-display-duration=inf";
+            size_t length = strlen(options);
+            if (length + strlen(photo_option) >= sizeof(options))
+            {
+                mutexUnlock(&g_mutex);
+                return false;
+            }
+            memcpy(options + length, photo_option, strlen(photo_option) + 1u);
+        }
+    }
 
     args[0] = "loadfile";
     args[1] = g_uri;
@@ -1921,11 +1941,11 @@ static bool libmpv_init(void)
     // Switch libass has no system provider; use the font shipped on the SD card.
     libmpv_set_option_string_checked("sub-font-provider", "none");
     libmpv_set_option_string_checked("sub-fonts-dir",
-                                     "sdmc:/switch/NX-Cast/fonts");
+                                     "sdmc:/switch/switch-tv-box/fonts");
     libmpv_set_option_string_checked("sub-font", "Source Han Sans CN");
     libmpv_set_option_string_checked("osd-font-provider", "none");
     libmpv_set_option_string_checked("osd-fonts-dir",
-                                     "sdmc:/switch/NX-Cast/fonts");
+                                     "sdmc:/switch/switch-tv-box/fonts");
     libmpv_set_option_string_checked("osd-font", "Source Han Sans CN");
     // Prefer hardware decode on Switch. If the libmpv package exposes the
     // explicit nvtegra backend, use it directly; otherwise fall back to mpv's
@@ -1941,7 +1961,7 @@ static bool libmpv_init(void)
     libmpv_set_option_string_checked("gpu-hwdec-interop", "auto");
     libmpv_set_option_string_checked("vo", "libmpv");
     libmpv_set_option_string_checked("audio-channels", "stereo");
-    libmpv_set_option_string_checked("audio-client-name", "NX-Cast");
+    libmpv_set_option_string_checked("audio-client-name", "Switch TV Box");
     libmpv_set_option_string_checked("ao", "hos");
 
     rc = mpv_initialize(g_mpv);

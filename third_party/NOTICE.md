@@ -1,3 +1,14 @@
+Switch TV Box upstream baseline
+===============================
+
+This application derives from NX-Cast by Ode1l and contributors.
+Source: https://github.com/Ode1l/NX-Cast
+Revision: 0efdba4281122cdd97de0c3c1a7ebde7485d6d15 (0.3.2)
+License: GPL-3.0; the original license is retained at /LICENSE.
+Switch TV Box changes are documented in git history and CHANGELOG.md.
+The offline specification is third-party reference material with its original
+notices; see docs/reference/README.md. It is not part of the linked program.
+
 Third-party components
 ======================
 
@@ -55,3 +66,17 @@ the legal status of this compatibility technique as unclear. Inclusion is for
 open-source research/homebrew interoperability and does not imply Apple
 authorization, MFi certification, DRM support, or legal suitability in every
 jurisdiction.
+
+AirPlay 1 / AirPort Express shared RSA interoperability key
+----------------------------------------------------------
+
+Source: https://github.com/mikebrady/shairport-sync/blob/cf6998daa1876c5a8f97128a960c8afc0e731841/common.c
+Revision: `cf6998daa1876c5a8f97128a960c8afc0e731841` (retrieved 2026-10-20).
+The `super_secret_key` PEM constant is reproduced in
+`source/protocol/airplay/security/legacy_rsa_key.h`. It is the publicly documented
+shared AirPort Express compatibility key, not a user credential or this
+receiver's unique pairing key.
+
+License: MIT. The upstream copyright and complete permission/warranty notice
+are retained at the top of `legacy_rsa_key.h`. The RSA/base64 adapter, SDP parser,
+RTSP handler changes and tests in this project were implemented separately.

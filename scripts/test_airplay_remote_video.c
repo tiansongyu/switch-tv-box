@@ -90,10 +90,11 @@ static void fake_control_detached(uint64_t session_id, void *user_data)
     recorder->control_detached_count++;
 }
 
-static bool fake_claim(uint64_t session_id, void *user_data)
+static bool fake_claim(uint64_t session_id, uint32_t generation, void *user_data)
 {
     Recorder *recorder = user_data;
 
+    CHECK(generation != 0u);
     CHECK(session_id == 10u || session_id == 11u || session_id == 13u ||
           session_id == 14u);
     recorder->claim_count++;
@@ -108,10 +109,11 @@ static bool fake_claim(uint64_t session_id, void *user_data)
     return true;
 }
 
-static void fake_release(uint64_t session_id, void *user_data)
+static void fake_release(uint64_t session_id, uint32_t generation, void *user_data)
 {
     Recorder *recorder = user_data;
 
+    CHECK(generation != 0u);
     CHECK(session_id == 10u || session_id == 11u || session_id == 13u ||
           session_id == 14u);
     recorder->release_count++;
@@ -666,10 +668,10 @@ static void test_external_takeover_allows_same_session_reclaim(void)
     CHECK(response.status_code == 200 && recorder.claim_count == 1u);
     airplay_rtsp_response_clear(&response);
 
-    CHECK(!airplay_remote_video_relinquish_session(remote, 11u));
-    CHECK(airplay_remote_video_relinquish_session(remote, 10u));
+    CHECK(!airplay_remote_video_relinquish_session(remote, 11u, 0u));
+    CHECK(airplay_remote_video_relinquish_session(remote, 10u, 0u));
     CHECK(recorder.stop_count == 0u && recorder.release_count == 0u);
-    CHECK(!airplay_remote_video_relinquish_session(remote, 10u));
+    CHECK(!airplay_remote_video_relinquish_session(remote, 10u, 0u));
 
     CHECK(dispatch(remote, 10u, "POST", "/play", second,
                    sizeof(second) - 1u, "text/parameters", &response));
@@ -854,7 +856,7 @@ static void test_reverse_hls_deferral(void)
     airplay_remote_video_destroy(remote);
 }
 
-static void test_reverse_hls_load_failure_release(void)
+static void test_reverse_hls_claim_failure_release(bool cancel_during_claim)
 {
     static const char locator[] =
         "airplay://phone/library/master.m3u8";
@@ -904,16 +906,20 @@ static void test_reverse_hls_load_failure_release(void)
     CHECK(response.status_code == 200);
     airplay_rtsp_response_clear(&response);
 
-    recorder.fail_load = true;
+    recorder.remote = remote;
+    recorder.cancel_during_claim = cancel_during_claim;
+    recorder.fail_load = !cancel_during_claim;
     body = hls_action_body(2u, media_url, media, sizeof(media) - 1u,
                            &body_size);
     CHECK(body != NULL);
     CHECK(dispatch(remote, 13u, "POST", "/action", body, body_size,
                    "application/x-apple-binary-plist", &response));
     airplay_plist_buffer_free(body);
-    CHECK(response.status_code == 503);
-    CHECK(recorder.claim_count == 1u && recorder.load_count == 1u &&
-          recorder.play_count == 0u && recorder.stop_count == 1u &&
+    CHECK(response.status_code == (cancel_during_claim ? 409 : 503));
+    CHECK(recorder.claim_count == 1u &&
+          recorder.load_count == (cancel_during_claim ? 0u : 1u) &&
+          recorder.play_count == 0u &&
+          recorder.stop_count == (cancel_during_claim ? 0u : 1u) &&
           recorder.release_count == 1u);
     airplay_rtsp_response_clear(&response);
     airplay_remote_video_destroy(remote);
@@ -1037,7 +1043,8 @@ int main(void)
     test_external_takeover_allows_same_session_reclaim();
     test_direct_load_failure_allows_new_url();
     test_reverse_hls_deferral();
-    test_reverse_hls_load_failure_release();
+    test_reverse_hls_claim_failure_release(false);
+    test_reverse_hls_claim_failure_release(true);
     test_reverse_hls_close_clears_pending();
     test_reverse_hls_requires_claim();
     if (g_failures)

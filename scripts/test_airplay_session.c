@@ -449,6 +449,89 @@ static void test_transport_teardown_does_not_cross_client_identity(void)
     airplay_session_manager_destroy(manager);
 }
 
+static void test_photo_cache_retains_detached_session(void)
+{
+    AirPlaySessionManager *manager = airplay_session_manager_create();
+    AirPlaySessionSnapshot first;
+    AirPlaySessionSnapshot reconnected;
+    AirPlaySessionCloseResult closed;
+    AirPlayRtspRequest request =
+        make_request("PUT", "/photo", "HTTP/1.1", false, "cached-photo");
+
+    assert(manager);
+    assert(airplay_session_request_is_remote_video(&request));
+    assert(airplay_session_manager_observe(manager, 400U, &request, &first) ==
+           AIRPLAY_SESSION_OBSERVE_OK);
+    assert(airplay_session_manager_sync_photo_cache(
+        manager, &first.logical_session_id, 1U, 2U));
+    assert(airplay_session_manager_close(manager, 400U, &closed));
+    assert(closed.last_logical_connection);
+    /* A slow control thread may submit an older snapshot after the cache owner
+     * already disconnected. It must not discard the current cache reference. */
+    assert(airplay_session_manager_sync_photo_cache(manager, NULL, 0U, 1U));
+    assert(airplay_session_manager_observe(
+               manager, 401U, &request, &reconnected) ==
+           AIRPLAY_SESSION_OBSERVE_OK);
+    assert(reconnected.logical_session_id == first.logical_session_id);
+    assert(reconnected.logical_connection_count == 1U);
+    assert(airplay_session_manager_close(manager, 401U, &closed));
+    /* Explicit stop/eviction drops the last cache reference. */
+    assert(airplay_session_manager_sync_photo_cache(manager, NULL, 0U, 3U));
+    assert(airplay_session_manager_observe(
+               manager, 402U, &request, &reconnected) ==
+           AIRPLAY_SESSION_OBSERVE_OK);
+    assert(reconnected.logical_session_id != first.logical_session_id);
+    assert(airplay_session_manager_close(manager, 402U, &closed));
+    airplay_session_manager_destroy(manager);
+}
+
+static void test_photo_cache_eviction_releases_capacity(void)
+{
+    AirPlaySessionManager *manager = airplay_session_manager_create();
+    AirPlaySessionSnapshot snapshot;
+    AirPlaySessionCloseResult closed;
+    uint64_t cached[AIRPLAY_SESSION_MAX_PHOTO_CACHE_REFERENCES] = {0};
+    char apple_session_id[48];
+
+    assert(manager);
+    assert(!airplay_session_manager_sync_photo_cache(manager, NULL, 1U, 1U));
+    assert(!airplay_session_manager_sync_photo_cache(manager, cached, 1U, 0U));
+    assert(!airplay_session_manager_sync_photo_cache(
+        manager, cached, AIRPLAY_SESSION_MAX_PHOTO_CACHE_REFERENCES + 1U, 1U));
+    /* Reuse every cache slot repeatedly while all TCP connections disconnect.
+     * Retained cache identities must stay bounded by the four actual slots. */
+    for (size_t i = 0U; i < 32U; ++i)
+    {
+        snprintf(apple_session_id, sizeof(apple_session_id), "photo-%zu", i);
+        AirPlayRtspRequest request =
+            make_request("PUT", "/photo", "HTTP/1.1", false, apple_session_id);
+        assert(airplay_session_manager_observe(
+                   manager, 500U + i, &request, &snapshot) ==
+               AIRPLAY_SESSION_OBSERVE_OK);
+        cached[i % AIRPLAY_SESSION_MAX_PHOTO_CACHE_REFERENCES] =
+            snapshot.logical_session_id;
+        size_t count = i + 1U < AIRPLAY_SESSION_MAX_PHOTO_CACHE_REFERENCES
+                           ? i + 1U
+                           : AIRPLAY_SESSION_MAX_PHOTO_CACHE_REFERENCES;
+        assert(airplay_session_manager_sync_photo_cache(
+            manager, cached, count, i + 1U));
+        assert(airplay_session_manager_close(manager, 500U + i, &closed));
+    }
+    assert(airplay_session_manager_sync_photo_cache(manager, NULL, 0U, 33U));
+    for (size_t i = 0U; i < AIRPLAY_SESSION_MAX_LOGICAL_SESSIONS; ++i)
+    {
+        snprintf(apple_session_id, sizeof(apple_session_id), "after-cache-%zu", i);
+        AirPlayRtspRequest request =
+            make_request("PUT", "/photo", "HTTP/1.1", false, apple_session_id);
+        assert(airplay_session_manager_observe(
+                   manager, 600U + i, &request, &snapshot) ==
+               AIRPLAY_SESSION_OBSERVE_OK);
+    }
+    for (size_t i = 0U; i < AIRPLAY_SESSION_MAX_LOGICAL_SESSIONS; ++i)
+        assert(airplay_session_manager_close(manager, 600U + i, &closed));
+    airplay_session_manager_destroy(manager);
+}
+
 int main(void)
 {
     test_connection_classification();
@@ -463,6 +546,8 @@ int main(void)
     test_transport_teardown_waits_for_final_control_close();
     test_final_control_close_waits_for_transport_teardown();
     test_transport_teardown_does_not_cross_client_identity();
+    test_photo_cache_retains_detached_session();
+    test_photo_cache_eviction_releases_capacity();
     puts("airplay session tests passed");
     return 0;
 }

@@ -64,7 +64,7 @@ struct SwitchActionHint { const char *button; const char *label; };
                         "-I", str(ROOT / "source"), str(build / "preview.cpp"), str(build / "home.o"),
                         *(str(imgui / name) for name in ["imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp"]),
                         "-o", str(build / "preview")], check=True)
-        for scenario in ["home", "playing", "pairing", "offline", "english", "long-title"]:
+        for scenario in ["home", "playing", "music", "music-paused", "pairing", "offline", "english", "long-title"]:
             ppm = build / f"{scenario}.ppm"
             subprocess.run([str(build / "preview"), str(ROOT / "assets/fonts/switch_font.ttf"),
                             str(ppm), scenario], check=True)

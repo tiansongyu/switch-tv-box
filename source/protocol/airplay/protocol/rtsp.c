@@ -459,6 +459,10 @@ static const char *rtsp_reason_phrase(int status_code)
         return "Request Timeout";
     case 413:
         return "Content Too Large";
+    case 412:
+        return "Precondition Failed";
+    case 415:
+        return "Unsupported Media Type";
     case 421:
         return "Misdirected Request";
     case 455:

@@ -56,6 +56,7 @@ typedef struct
     bool airplay_pin_visible;
     bool video_ready;
     bool playback_active;
+    bool audio_playback_active;
     PlayerState playback_state;
     bool has_error;
     char error_line[PLAYER_HOME_ERROR_MAX];

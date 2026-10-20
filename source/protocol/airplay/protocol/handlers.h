@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "protocol/airplay/discovery/dns.h"
+#include "protocol/airplay/mirror/audio.h"
 #include "protocol/airplay/protocol/rtsp.h"
 #include "protocol/airplay/security/fairplay.h"
 
@@ -54,6 +55,19 @@ typedef bool (*AirPlayAudioOpenCallback)(
     uint16_t *control_port_out, void *user_data);
 typedef bool (*AirPlayAudioRecordCallback)(uint64_t session_id,
                                            void *user_data);
+typedef bool (*AirPlayLegacyAudioOpenCallback)(
+    uint64_t session_id, const uint8_t key[16], const uint8_t iv[16],
+    const AirPlayMirrorAudioFormat *format, uint32_t peer_ipv4_address,
+    uint16_t peer_control_port, uint16_t *data_port_out,
+    uint16_t *control_port_out, void *user_data);
+typedef bool (*AirPlayAudioFlushCallback)(
+    uint64_t session_id, bool has_sequence, uint16_t sequence,
+    bool has_timestamp, uint32_t timestamp, void *user_data);
+typedef bool (*AirPlayAudioVolumeCallback)(uint64_t session_id, float volume_db,
+                                           void *user_data);
+typedef void (*AirPlayAudioMetadataCallback)(
+    uint64_t session_id, const char *content_type, const uint8_t *data,
+    size_t size, void *user_data);
 typedef void (*AirPlayMediaRecordCallback)(uint64_t session_id, void *user_data);
 typedef void (*AirPlayMirrorStopCallback)(uint64_t session_id, void *user_data);
 typedef bool (*AirPlayStreamStopCallback)(uint64_t session_id, bool video,
@@ -74,6 +88,10 @@ typedef struct
     AirPlayTransportPrepareCallback transport_prepare_callback;
     AirPlayMirrorOpenCallback mirror_open_callback;
     AirPlayAudioOpenCallback audio_open_callback;
+    AirPlayLegacyAudioOpenCallback legacy_audio_open_callback;
+    AirPlayAudioFlushCallback audio_flush_callback;
+    AirPlayAudioVolumeCallback audio_volume_callback;
+    AirPlayAudioMetadataCallback audio_metadata_callback;
     AirPlayAudioRecordCallback audio_record_callback;
     AirPlayMediaRecordCallback media_record_callback;
     AirPlayMirrorStopCallback mirror_stop_callback;
@@ -93,6 +111,7 @@ bool airplay_handlers_route(AirPlayRtspSession *session,
                             void *user_data);
 void airplay_handlers_session_closed(AirPlayRtspSession *session, void *user_data);
 AirPlayHandlerPhase airplay_handlers_session_phase(const AirPlayRtspSession *session);
+bool airplay_handlers_session_is_legacy(const AirPlayRtspSession *session);
 const char *airplay_handler_phase_name(AirPlayHandlerPhase phase);
 
 #endif

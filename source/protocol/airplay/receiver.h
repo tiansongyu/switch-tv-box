@@ -21,6 +21,10 @@ typedef struct
     AirPlayTransportPrepareCallback transport_prepare_callback;
     AirPlayMirrorOpenCallback mirror_open_callback;
     AirPlayAudioOpenCallback audio_open_callback;
+    AirPlayLegacyAudioOpenCallback legacy_audio_open_callback;
+    AirPlayAudioFlushCallback audio_flush_callback;
+    AirPlayAudioVolumeCallback audio_volume_callback;
+    AirPlayAudioMetadataCallback audio_metadata_callback;
     AirPlayAudioRecordCallback audio_record_callback;
     AirPlayMediaRecordCallback media_record_callback;
     AirPlayMirrorStopCallback mirror_stop_callback;

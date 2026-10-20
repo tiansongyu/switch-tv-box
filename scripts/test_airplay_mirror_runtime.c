@@ -510,15 +510,20 @@ static void run_audio_first_cycles(AirPlayMirrorRuntime *runtime,
         audio_payload_size, key, iv);
     CHECK(audio_packet_size != 0u &&
           send_udp(audio_port, audio_packet, audio_packet_size));
-    sleep_milliseconds(20u);
-    pthread_mutex_lock(&player->mutex);
-    CHECK(player->set_uri_count == completed_cycles);
-    CHECK(player->play_count == completed_cycles);
-    pthread_mutex_unlock(&player->mutex);
+    CHECK(wait_for_count(player, &player->set_uri_count, completed_cycles + 1u));
+    CHECK(wait_for_count(player, &player->play_count, completed_cycles + 1u));
+    CHECK(airplay_mirror_runtime_flush_audio(audio_only_session, true, 1u,
+                                             true, 44100u, runtime));
+    CHECK(wait_for_count(player, &player->stop_count, completed_cycles + 1u));
+    audio_packet_size = make_audio_packet(
+        audio_packet, sizeof(audio_packet), 2u, 45124u, audio_payload,
+        audio_payload_size, key, iv);
+    CHECK(send_udp(audio_port, audio_packet, audio_packet_size));
+    CHECK(wait_for_count(player, &player->set_uri_count, completed_cycles + 2u));
+    CHECK(wait_for_count(player, &player->play_count, completed_cycles + 2u));
     airplay_mirror_runtime_stop(audio_only_session, runtime);
-    pthread_mutex_lock(&player->mutex);
-    CHECK(player->stop_count == completed_cycles);
-    pthread_mutex_unlock(&player->mutex);
+    CHECK(wait_for_count(player, &player->stop_count, completed_cycles + 2u));
+    completed_cycles += 2u;
 
     timing_port = 0u;
     audio_port = 0u;

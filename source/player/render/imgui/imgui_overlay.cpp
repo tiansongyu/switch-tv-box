@@ -1268,6 +1268,8 @@ void draw_home_screen(ImDrawList *draw, const PlayerHomeViewState &home, float w
     const bool receiver_ready = home.network_ready && home.airplay_running;
     const bool tv_focused = !home.home_language_focused && !home.player_focused;
     const bool resume_focused = home.playback_active && home.player_focused;
+    const bool music_paused = home.audio_playback_active &&
+                              home.playback_state == PLAYER_STATE_PAUSED;
     const time_t now = time(nullptr);
     struct tm local = {};
     char clock_text[16] = "--:--";
@@ -1341,7 +1343,7 @@ void draw_home_screen(ImDrawList *draw, const PlayerHomeViewState &home, float w
     centered("A", 108, 434, 17, IM_COL32(13, 48, 64, 255));
     centered(tr("Open channels", "打开频道库"), 231, 434, 23, IM_COL32(13, 48, 64, 255));
 
-    // This card is actionable only while a session is active, like B on the home screen.
+    // Music is controlled here; video returns to its existing full-screen session.
     draw->AddRectFilled(ImVec2(HOME_PLAYER_LEFT, HOME_PLAYER_TOP),
                         ImVec2(HOME_PLAYER_RIGHT, HOME_PLAYER_BOTTOM), surface, 20);
     draw->AddRect(ImVec2(HOME_PLAYER_LEFT, HOME_PLAYER_TOP),
@@ -1350,13 +1352,26 @@ void draw_home_screen(ImDrawList *draw, const PlayerHomeViewState &home, float w
     draw->AddRectFilled(ImVec2(72, 532), ImVec2(134, 594), IM_COL32(32, 52, 74, 255), 16);
     if (home.playback_active)
     {
-        draw->AddTriangleFilled(ImVec2(95, 550), ImVec2(95, 576), ImVec2(115, 563), cyan);
-        draw_home_text(draw, 154, 530, 24, ink, tr("Continue watching", "继续播放"));
-        const char *title = home.iptv_playback_active && home.iptv_last_name[0] ? home.iptv_last_name :
+        if (home.audio_playback_active)
+        {
+            draw->AddLine(ImVec2(99, 570), ImVec2(99, 548), cyan, 3);
+            draw->AddLine(ImVec2(115, 566), ImVec2(115, 544), cyan, 3);
+            draw->AddLine(ImVec2(99, 548), ImVec2(115, 544), cyan, 4);
+            draw->AddCircleFilled(ImVec2(94, 572), 6, cyan, 24);
+            draw->AddCircleFilled(ImVec2(110, 568), 6, cyan, 24);
+        }
+        else
+            draw->AddTriangleFilled(ImVec2(95, 550), ImVec2(95, 576), ImVec2(115, 563), cyan);
+        draw_home_text(draw, 154, 530, 24, ink, home.audio_playback_active
+                       ? tr("AirPlay music", "AirPlay 音乐") : tr("Continue watching", "继续播放"));
+        const char *title = home.audio_playback_active ?
+                            (music_paused ? tr("Paused · Select and press A", "已暂停 · 选中后按 A 继续")
+                                          : tr("Playing · Select and press A", "正在播放 · 选中后按 A 暂停")) :
+                            home.iptv_playback_active && home.iptv_last_name[0] ? home.iptv_last_name :
                             tr("Return to the current session", "返回当前播放画面");
         clipped(title, 154, 568, 450, 20, muted);
         draw->AddCircle(ImVec2(706, 563), 18, cyan, 24, 1.5f);
-        centered("B", 706, 563, 22, cyan);
+        centered(home.audio_playback_active ? "A" : "B", 706, 563, 22, cyan);
     }
     else
     {
@@ -1377,6 +1392,8 @@ void draw_home_screen(ImDrawList *draw, const PlayerHomeViewState &home, float w
     draw->AddCircleFilled(ImVec2(822, 310), 4, receiver_ready ? cyan : IM_COL32(248, 184, 91, 255));
     draw_home_text(draw, 836, 298, 20, receiver_ready ? cyan : muted,
                    !home.network_ready ? tr("Connect to Wi-Fi", "请先连接网络") :
+                   home.audio_playback_active ? (music_paused ? tr("Music paused", "音乐已暂停") :
+                                                               tr("Playing your music", "音乐正在播放")) :
                    receiver_ready ? tr("Ready to connect", "已就绪，等待连接") : tr("Starting receiver", "接收服务正在启动"));
     draw->AddLine(ImVec2(816, 336), ImVec2(1200, 336), border);
     if (home.airplay_pin_visible && home.airplay_pin[0])
@@ -1415,6 +1432,7 @@ void draw_home_screen(ImDrawList *draw, const PlayerHomeViewState &home, float w
     draw_home_text(draw, 48, 685, 16, muted, "Switch TV Box  " NXCAST_APP_VERSION);
     const SwitchActionHint hints[] = {
         {"A", home.home_language_focused ? tr("Language", "切换语言") :
+              resume_focused && home.audio_playback_active ? (music_paused ? tr("Play", "继续播放") : tr("Pause", "暂停")) :
               resume_focused ? tr("Continue", "继续播放") : tr("Open", "打开")},
         {"X", tr("Live TV", "电视直播")},
         {"B", tr("Player", "返回播放")},
@@ -1423,7 +1441,7 @@ void draw_home_screen(ImDrawList *draw, const PlayerHomeViewState &home, float w
     SwitchActionHint visible_hints[4];
     int count = 0;
     for (int i = 0; i < 4; ++i)
-        if (i != 2 || home.playback_active)
+        if (i != 2 || (home.playback_active && !home.audio_playback_active))
             visible_hints[count++] = hints[i];
     draw_switch_action_hints(draw, width - 48, 692, visible_hints, count, true);
 }

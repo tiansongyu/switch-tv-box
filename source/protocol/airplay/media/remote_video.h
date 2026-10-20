@@ -8,6 +8,9 @@
 
 #define AIRPLAY_REMOTE_VIDEO_URL_MAX 4095u
 #define AIRPLAY_REMOTE_VIDEO_METADATA_MAX 255u
+#define AIRPLAY_REMOTE_PHOTO_MAX_BYTES (4u * 1024u * 1024u)
+#define AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS 4u
+#define AIRPLAY_REMOTE_PHOTO_LOCAL_PREFIX "/switch-tv-box-photo/"
 
 typedef enum
 {
@@ -31,8 +34,14 @@ typedef struct
 
 typedef struct
 {
-    bool (*claim_owner)(uint64_t session_id, void *user_data);
-    void (*release_owner)(uint64_t session_id, void *user_data);
+    /* Both values identify a claim. Superseded requests must never release or
+     * stop a newer claim, even when they use the same session ID. */
+    bool (*claim_owner)(uint64_t session_id, uint32_t generation,
+                        void *user_data);
+    void (*release_owner)(uint64_t session_id, uint32_t generation,
+                          void *user_data);
+    bool (*stop_owner)(uint64_t session_id, uint32_t generation,
+                       void *user_data);
     void (*control_attached)(uint64_t session_id, void *user_data);
     void (*control_detached)(uint64_t session_id, void *user_data);
     bool (*load)(const char *url, const char *metadata, void *user_data);
@@ -65,11 +74,18 @@ bool airplay_remote_video_route_local(AirPlayRemoteVideo *remote,
                                       bool *handled_out);
 void airplay_remote_video_session_closed(AirPlayRemoteVideo *remote,
                                          uint64_t session_id);
+/* Bounded cache owners keep their logical session IDs across HTTP sockets.
+ * Version orders snapshots so delayed synchronization cannot resurrect refs. */
+size_t airplay_remote_video_cached_sessions(
+    AirPlayRemoteVideo *remote,
+    uint64_t session_ids[AIRPLAY_REMOTE_PHOTO_CACHE_SLOTS],
+    uint64_t *snapshot_version);
 bool airplay_remote_video_terminate_session(AirPlayRemoteVideo *remote,
                                             uint64_t session_id);
 /* Clears protocol-side ownership after an external coordinator stopped media. */
 bool airplay_remote_video_relinquish_session(AirPlayRemoteVideo *remote,
-                                             uint64_t session_id);
+                                             uint64_t session_id,
+                                             uint32_t claim_generation);
 bool airplay_remote_video_url_supported(const char *url);
 
 #endif

@@ -147,7 +147,7 @@ static void test_parse_failures(void)
                        AIRPLAY_RTSP_ERROR_INVALID_FORMAT);
     expect_parse_error("OPTIONS  * RTSP/1.0\r\nCSeq: 1\r\n\r\n",
                        AIRPLAY_RTSP_ERROR_INVALID_FORMAT);
-    expect_parse_error("POST /pair-setup RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 1048577\r\n\r\n",
+    expect_parse_error("POST /pair-setup RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 4194305\r\n\r\n",
                        AIRPLAY_RTSP_ERROR_LIMIT_EXCEEDED);
 
     memset(large_header, 'A', AIRPLAY_RTSP_MAX_HEADER_BYTES);

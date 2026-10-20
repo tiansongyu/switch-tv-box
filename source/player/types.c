@@ -8,6 +8,12 @@ bool player_uri_is_screen_mirror(const char *uri)
     return uri && strcmp(uri, PLAYER_SCREEN_MIRROR_URI) == 0;
 }
 
+bool player_media_is_airplay_audio(const PlayerMedia *media)
+{
+    return media && player_uri_is_screen_mirror(media->uri) &&
+           media->metadata && strcmp(media->metadata, "AirPlay Audio") == 0;
+}
+
 static char *player_strdup_or_null(const char *value)
 {
     char *copy;

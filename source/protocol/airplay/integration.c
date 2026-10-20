@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include <switch.h>
 
@@ -18,7 +19,7 @@
 
 #define AIRPLAY_CONTROL_PORT 7000u
 #define AIRPLAY_STREAM_CAPACITY (4u * 1024u * 1024u)
-#define AIRPLAY_STORAGE_DIRECTORY "sdmc:/switch/NX-Cast/airplay"
+#define AIRPLAY_STORAGE_DIRECTORY "sdmc:/switch/switch-tv-box/airplay"
 #define AIRPLAY_RESOURCE_TRANSITION_TIMEOUT_MS 6000u
 
 #ifndef NXCAST_AIRPLAY_DISCOVERY_ENABLED
@@ -28,6 +29,7 @@
 typedef struct
 {
     Mutex mutex;
+    Mutex remote_claim_mutex;
     bool mutex_ready;
     bool running;
     bool starting;
@@ -38,8 +40,12 @@ typedef struct
     AirPlayRemoteVideo *remote_video;
     AirPlayMirrorRuntime *mirror_runtime;
     PlayerOwnershipLease remote_lease;
+    uint32_t remote_claim_generation;
+    uint32_t remote_latest_request_generation;
     PlayerOwnershipLease mirror_lease;
     uint32_t mirror_runtime_generation;
+    uint64_t volume_session_id;
+    float volume_db;
 } AirPlayIntegrationState;
 
 static AirPlayIntegrationState g_airplay;
@@ -49,6 +55,7 @@ static void integration_ensure_mutex(void)
     if (g_airplay.mutex_ready)
         return;
     mutexInit(&g_airplay.mutex);
+    mutexInit(&g_airplay.remote_claim_mutex);
     g_airplay.mutex_ready = true;
 }
 
@@ -178,55 +185,112 @@ static bool integration_submit_player(PlayerCommandSource source,
     return true;
 }
 
-static bool integration_remote_claim(uint64_t session_id, void *user_data)
+static bool integration_remote_claim(uint64_t session_id,
+                                      uint32_t request_generation,
+                                      void *user_data)
 {
-    ProtocolMediaTransaction transaction;
+    ProtocolMediaTransaction transaction = {0};
+    PlayerOwnershipLease previous = {0};
+    bool current;
+    const char *failure_status = NULL;
 
     (void)user_data;
+    if (!request_generation)
+        return false;
+    mutexLock(&g_airplay.mutex);
+    uint32_t latest = g_airplay.remote_latest_request_generation;
+    current = latest == 0u ||
+              (request_generation != latest &&
+               (uint32_t)(request_generation - latest) < 0x80000000u);
+    if (current)
+        g_airplay.remote_latest_request_generation = request_generation;
+    mutexUnlock(&g_airplay.mutex);
+    if (!current)
+        return false;
+
+    /* Serialize coordinator transactions separately from the state mutex.
+     * A delayed older claim must not steal ownership after a newer commit.
+     * The state mutex remains available to the resource-handoff callbacks. */
+    mutexLock(&g_airplay.remote_claim_mutex);
+    mutexLock(&g_airplay.mutex);
+    current = g_airplay.remote_latest_request_generation == request_generation;
+    mutexUnlock(&g_airplay.mutex);
+    if (!current)
+        goto failed;
     if (!protocol_coordinator_media_begin(PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO,
                                            session_id, &transaction))
-        return false;
+        goto failed;
     if (!protocol_coordinator_media_wait_resources(
             &transaction.lease, AIRPLAY_RESOURCE_TRANSITION_TIMEOUT_MS))
     {
-        protocol_coordinator_media_abort(&transaction);
-        integration_set_status("AirPlay resource handoff failed");
-        return false;
-    }
-    if (!airplay_receiver_retain_media_session(session_id))
-    {
-        protocol_coordinator_media_abort(&transaction);
-        integration_set_status("AirPlay session handoff failed");
-        return false;
+        failure_status = "AirPlay resource handoff failed";
+        goto failed;
     }
     mutexLock(&g_airplay.mutex);
+    current = g_airplay.remote_latest_request_generation == request_generation;
+    if (!current || !airplay_receiver_retain_media_session(session_id))
+    {
+        mutexUnlock(&g_airplay.mutex);
+        failure_status = "AirPlay session handoff failed";
+        goto failed;
+    }
+    previous = g_airplay.remote_lease;
     g_airplay.remote_lease = transaction.lease;
+    g_airplay.remote_claim_generation = request_generation;
+    snprintf(g_airplay.status, sizeof(g_airplay.status),
+             "AirPlay video connected");
     mutexUnlock(&g_airplay.mutex);
+    /* Overlapping claims can supersede one another before the protocol marks
+     * the first owner as committed. Balance its retained session exactly once.
+     * The coordinator already invalidated the previous player lease. */
+    if (previous.owner == PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO)
+        (void)airplay_receiver_release_media_session(previous.token);
     (void)integration_submit_media_event(
         &transaction.lease, PROTOCOL_MEDIA_EVENT_CONTROL_ATTACHED);
-    integration_set_status("AirPlay video connected");
     protocol_coordinator_media_end(&transaction);
+    mutexUnlock(&g_airplay.remote_claim_mutex);
     return true;
+
+failed:
+    protocol_coordinator_media_abort(&transaction);
+    if (failure_status)
+    {
+        mutexLock(&g_airplay.mutex);
+        if (g_airplay.remote_latest_request_generation == request_generation)
+            snprintf(g_airplay.status, sizeof(g_airplay.status), "%s",
+                     failure_status);
+        mutexUnlock(&g_airplay.mutex);
+    }
+    mutexUnlock(&g_airplay.remote_claim_mutex);
+    return false;
 }
 
-static void integration_remote_release(uint64_t session_id, void *user_data)
+static void integration_remote_release(uint64_t session_id,
+                                        uint32_t request_generation,
+                                        void *user_data)
 {
-    PlayerOwnershipLease lease;
+    PlayerOwnershipLease lease = {0};
 
     (void)user_data;
-    lease = integration_remote_lease();
-    if (lease.owner == PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO &&
-        lease.token == session_id)
+    mutexLock(&g_airplay.mutex);
+    if (request_generation &&
+        g_airplay.remote_claim_generation == request_generation &&
+        g_airplay.remote_lease.owner == PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO &&
+        g_airplay.remote_lease.token == session_id)
+    {
+        lease = g_airplay.remote_lease;
+        memset(&g_airplay.remote_lease, 0, sizeof(g_airplay.remote_lease));
+        g_airplay.remote_claim_generation = 0u;
+        snprintf(g_airplay.status, sizeof(g_airplay.status), "Ready for AirPlay");
+    }
+    mutexUnlock(&g_airplay.mutex);
+    if (lease.owner == PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO)
     {
         (void)integration_submit_player(PLAYER_COMMAND_SOURCE_AIRPLAY_VIDEO,
                                         &lease,
                                         PLAYER_COMMAND_RELEASE_LEASE, NULL,
                                         NULL, 0);
-        mutexLock(&g_airplay.mutex);
-        memset(&g_airplay.remote_lease, 0, sizeof(g_airplay.remote_lease));
-        mutexUnlock(&g_airplay.mutex);
         (void)airplay_receiver_release_media_session(session_id);
-        integration_set_status("Ready for AirPlay");
     }
 }
 
@@ -306,6 +370,29 @@ static bool integration_remote_stop(void *user_data)
 
     (void)user_data;
     lease = integration_remote_lease();
+    if (lease.owner == PLAYER_MEDIA_OWNER_NONE)
+        return true;
+    (void)integration_submit_media_event(
+        &lease, PROTOCOL_MEDIA_EVENT_STOP_REQUESTED);
+    return integration_submit_player(PLAYER_COMMAND_SOURCE_AIRPLAY_VIDEO,
+                                     &lease, PLAYER_COMMAND_STOP, NULL,
+                                     NULL, 0);
+}
+
+static bool integration_remote_stop_owner(uint64_t session_id,
+                                           uint32_t request_generation,
+                                           void *user_data)
+{
+    PlayerOwnershipLease lease = {0};
+
+    (void)user_data;
+    mutexLock(&g_airplay.mutex);
+    if (request_generation &&
+        g_airplay.remote_claim_generation == request_generation &&
+        g_airplay.remote_lease.owner == PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO &&
+        g_airplay.remote_lease.token == session_id)
+        lease = g_airplay.remote_lease;
+    mutexUnlock(&g_airplay.mutex);
     if (lease.owner == PLAYER_MEDIA_OWNER_NONE)
         return true;
     (void)integration_submit_media_event(
@@ -488,6 +575,8 @@ static void integration_mirror_status(AirPlayMirrorRuntimeStatus status,
                                       uint32_t generation, void *user_data)
 {
     PlayerOwnershipLease lease;
+    AirPlayMirrorRuntime *runtime = g_airplay.mirror_runtime;
+    (void)user_data;
 
     if (status != AIRPLAY_MIRROR_RUNTIME_IDLE &&
         !integration_mirror_lease_for_generation(generation, &lease))
@@ -500,24 +589,32 @@ static void integration_mirror_status(AirPlayMirrorRuntimeStatus status,
     switch (status)
     {
     case AIRPLAY_MIRROR_RUNTIME_PREPARING:
-        integration_set_status("Preparing AirPlay mirroring");
+        integration_set_status(
+            airplay_mirror_runtime_profile(runtime) ==
+                    AIRPLAY_STREAM_BRIDGE_PROFILE_AUDIO_ONLY
+                ? "Preparing AirPlay audio"
+                : "Preparing AirPlay mirroring");
         break;
     case AIRPLAY_MIRROR_RUNTIME_WAITING_KEYFRAME:
         integration_set_status(
-            airplay_mirror_runtime_profile(user_data) ==
+            airplay_mirror_runtime_profile(runtime) ==
                     AIRPLAY_STREAM_BRIDGE_PROFILE_AUDIO_ONLY
                 ? "Waiting for AirPlay audio"
                 : "Waiting for AirPlay video");
         break;
     case AIRPLAY_MIRROR_RUNTIME_PLAYING:
-        integration_set_status("AirPlay mirroring active");
+        integration_set_status(
+            airplay_mirror_runtime_profile(runtime) ==
+                    AIRPLAY_STREAM_BRIDGE_PROFILE_AUDIO_ONLY
+                ? "AirPlay audio playing"
+                : "AirPlay mirroring active");
         break;
     case AIRPLAY_MIRROR_RUNTIME_ERROR:
 #if defined(NXCAST_EXCLUSIVE_MEDIA_RESOURCES) && \
     NXCAST_EXCLUSIVE_MEDIA_RESOURCES
         if (protocol_coordinator_media_validate(&lease))
         {
-            airplay_mirror_runtime_stop(lease.token, user_data);
+            airplay_mirror_runtime_stop(lease.token, runtime);
             (void)integration_submit_player(
                 PLAYER_COMMAND_SOURCE_AIRPLAY_MIRROR, &lease,
                 PLAYER_COMMAND_STOP, NULL, NULL, 0);
@@ -620,13 +717,69 @@ static void integration_mirror_record(uint64_t session_id, void *user_data)
     protocol_coordinator_media_end(&transaction);
 }
 
+static bool integration_audio_volume(uint64_t session_id, float volume_db,
+                                      void *user_data)
+{
+    PlayerOwnershipLease lease = integration_mirror_lease();
+    (void)user_data;
+    if (!isfinite(volume_db) || volume_db > 0.0f ||
+        (volume_db < -30.0f && volume_db != -144.0f))
+        return false;
+    mutexLock(&g_airplay.mutex);
+    g_airplay.volume_session_id = session_id;
+    g_airplay.volume_db = volume_db;
+    mutexUnlock(&g_airplay.mutex);
+    /* Senders may set volume between SETUP and RECORD. Keep it until the
+     * session owns playback so another active source's volume is unaffected. */
+    if (lease.token != session_id || !protocol_coordinator_media_validate(&lease))
+        return true;
+    int volume = volume_db == -144.0f ? 0
+                 : (int)(100.0f * powf(10.0f, volume_db / 20.0f) + 0.5f);
+    return integration_submit_player(PLAYER_COMMAND_SOURCE_AIRPLAY_MIRROR,
+                                      &lease, PLAYER_COMMAND_SET_VOLUME,
+                                      NULL, NULL, volume);
+}
+
 static bool integration_audio_record(uint64_t session_id, void *user_data)
 {
-    bool accepted = airplay_mirror_runtime_record_audio(session_id, user_data);
-
-    integration_set_status(accepted ? "AirPlay audio connected (no playback)"
-                                    : "AirPlay audio setup error");
-    return accepted;
+    ProtocolMediaTransaction transaction;
+    uint32_t generation = 0u;
+    PlayerOwnershipLease current = integration_mirror_lease();
+    AirPlayMirrorRuntimeStatus status =
+        airplay_mirror_runtime_status(user_data, &generation);
+    if (current.token == session_id &&
+        protocol_coordinator_media_validate(&current))
+        return airplay_mirror_runtime_record_audio(session_id, user_data);
+    if (generation == 0u || status != AIRPLAY_MIRROR_RUNTIME_PREPARING ||
+        !protocol_coordinator_media_begin(PLAYER_MEDIA_OWNER_AIRPLAY_MIRROR,
+                                           session_id, &transaction))
+        return false;
+    if (!protocol_coordinator_media_wait_resources(
+            &transaction.lease, AIRPLAY_RESOURCE_TRANSITION_TIMEOUT_MS))
+    {
+        protocol_coordinator_media_abort(&transaction);
+        integration_set_status("AirPlay resource handoff failed");
+        return false;
+    }
+    mutexLock(&g_airplay.mutex);
+    g_airplay.mirror_lease = transaction.lease;
+    g_airplay.mirror_runtime_generation = generation;
+    bool have_volume = g_airplay.volume_session_id == session_id;
+    float volume_db = g_airplay.volume_db;
+    mutexUnlock(&g_airplay.mutex);
+    if (!airplay_mirror_runtime_record_audio(session_id, user_data))
+    {
+        (void)integration_clear_mirror_lease(generation,
+                                            transaction.lease.generation);
+        protocol_coordinator_media_abort(&transaction);
+        integration_set_status("AirPlay audio setup error");
+        return false;
+    }
+    if (have_volume)
+        (void)integration_audio_volume(session_id, volume_db, user_data);
+    protocol_coordinator_media_end(&transaction);
+    integration_set_status("Waiting for AirPlay audio");
+    return true;
 }
 
 static void integration_pin_display(const char pin[5], void *user_data)
@@ -705,6 +858,7 @@ static bool integration_start_sync(void)
                        (unsigned long long)AIRPLAY_TRACE_NOW_MS(), failure_stage);
     remote_ops.claim_owner = integration_remote_claim;
     remote_ops.release_owner = integration_remote_release;
+    remote_ops.stop_owner = integration_remote_stop_owner;
     remote_ops.control_attached = integration_remote_control_attached;
     remote_ops.control_detached = integration_remote_control_detached;
     remote_ops.load = integration_remote_load;
@@ -728,7 +882,7 @@ static bool integration_start_sync(void)
     failure_stage = "receiver";
     AIRPLAY_TRACE_SYNC("[airplay] t_ms=%llu integration stage=%s begin\n",
                        (unsigned long long)AIRPLAY_TRACE_NOW_MS(), failure_stage);
-    receiver_config.friendly_name = "NX-Cast";
+    receiver_config.friendly_name = "Switch TV Box";
     receiver_config.storage_directory = AIRPLAY_STORAGE_DIRECTORY;
     receiver_config.control_port = AIRPLAY_CONTROL_PORT;
     receiver_config.features = AIRPLAY_MDNS_FEATURES_MIRROR_COMPAT |
@@ -740,6 +894,10 @@ static bool integration_start_sync(void)
     receiver_config.transport_prepare_callback = integration_mirror_prepare;
     receiver_config.mirror_open_callback = integration_mirror_open;
     receiver_config.audio_open_callback = airplay_mirror_runtime_audio_open;
+    receiver_config.legacy_audio_open_callback =
+        airplay_mirror_runtime_legacy_audio_open;
+    receiver_config.audio_flush_callback = airplay_mirror_runtime_flush_audio;
+    receiver_config.audio_volume_callback = integration_audio_volume;
     receiver_config.audio_record_callback = integration_audio_record;
     receiver_config.media_record_callback = integration_mirror_record;
     receiver_config.mirror_stop_callback = airplay_mirror_runtime_stop;
@@ -833,10 +991,12 @@ void airplay_integration_stop_active_media(void)
     PlayerOwnershipLease remote;
     PlayerOwnershipLease mirror;
     AirPlayMirrorRuntime *mirror_runtime;
+    uint32_t remote_claim_generation;
 
     integration_ensure_mutex();
     mutexLock(&g_airplay.mutex);
     remote = g_airplay.remote_lease;
+    remote_claim_generation = g_airplay.remote_claim_generation;
     mirror = g_airplay.mirror_lease;
     mirror_runtime = g_airplay.mirror_runtime;
     mutexUnlock(&g_airplay.mutex);
@@ -847,8 +1007,9 @@ void airplay_integration_stop_active_media(void)
     if (remote.owner == PLAYER_MEDIA_OWNER_AIRPLAY_VIDEO &&
         protocol_coordinator_media_validate(&remote))
     {
-        (void)integration_remote_stop(NULL);
-        integration_remote_release(remote.token, NULL);
+        (void)integration_remote_stop_owner(remote.token,
+                                            remote_claim_generation, NULL);
+        integration_remote_release(remote.token, remote_claim_generation, NULL);
     }
 }
 
@@ -865,6 +1026,8 @@ bool airplay_integration_release_active_media(
     };
     bool release_remote = false;
     bool release_mirror = false;
+    bool remote_reference_released = false;
+    uint32_t remote_claim_generation;
     bool released;
 
     if (!lease)
@@ -872,6 +1035,7 @@ bool airplay_integration_release_active_media(
     integration_ensure_mutex();
     mutexLock(&g_airplay.mutex);
     remote = g_airplay.remote_lease;
+    remote_claim_generation = g_airplay.remote_claim_generation;
     mirror = g_airplay.mirror_lease;
     remote_video = g_airplay.remote_video;
     mirror_runtime = g_airplay.mirror_runtime;
@@ -897,7 +1061,8 @@ bool airplay_integration_release_active_media(
         return false;
     if (release_remote && remote_video)
         (void)airplay_remote_video_relinquish_session(remote_video,
-                                                      lease->token);
+                                                      lease->token,
+                                                      remote_claim_generation);
 
     mutexLock(&g_airplay.mutex);
     if (release_remote && remote.owner == g_airplay.remote_lease.owner &&
@@ -905,6 +1070,8 @@ bool airplay_integration_release_active_media(
         remote.generation == g_airplay.remote_lease.generation)
     {
         memset(&g_airplay.remote_lease, 0, sizeof(g_airplay.remote_lease));
+        g_airplay.remote_claim_generation = 0u;
+        remote_reference_released = true;
     }
     if (release_mirror && mirror.owner == g_airplay.mirror_lease.owner &&
         mirror.token == g_airplay.mirror_lease.token &&
@@ -913,10 +1080,12 @@ bool airplay_integration_release_active_media(
         memset(&g_airplay.mirror_lease, 0, sizeof(g_airplay.mirror_lease));
         g_airplay.mirror_runtime_generation = 0u;
     }
+    if (g_airplay.remote_lease.owner == PLAYER_MEDIA_OWNER_NONE &&
+        g_airplay.mirror_lease.owner == PLAYER_MEDIA_OWNER_NONE)
+        snprintf(g_airplay.status, sizeof(g_airplay.status), "Ready for AirPlay");
     mutexUnlock(&g_airplay.mutex);
-    if (release_remote)
+    if (remote_reference_released)
         (void)airplay_receiver_release_media_session(lease->token);
-    integration_set_status("Ready for AirPlay");
     AIRPLAY_TRACE(
         "[airplay] t_ms=%llu takeover-release owner=%s token=%llu "
         "generation=%u\n",
@@ -967,6 +1136,8 @@ void airplay_integration_stop(void)
     g_airplay.pin_visible = false;
     memset(g_airplay.pin, 0, sizeof(g_airplay.pin));
     memset(&g_airplay.remote_lease, 0, sizeof(g_airplay.remote_lease));
+    g_airplay.remote_claim_generation = 0u;
+    g_airplay.remote_latest_request_generation = 0u;
     memset(&g_airplay.mirror_lease, 0, sizeof(g_airplay.mirror_lease));
     g_airplay.mirror_runtime_generation = 0u;
     snprintf(g_airplay.status, sizeof(g_airplay.status), "AirPlay stopped");

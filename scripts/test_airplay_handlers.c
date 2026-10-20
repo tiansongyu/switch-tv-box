@@ -419,7 +419,7 @@ static void test_youtube_http_compatibility(AirPlayHandlers *handlers)
           strcmp(response_header(&response, "Content-Type"),
                  "text/x-apple-plist+xml") == 0);
     CHECK(response_body_contains(&response,
-                                 "<key>features</key><integer>639</integer>"));
+                                 "<key>features</key><integer>640</integer>"));
     CHECK(response_body_contains(&response,
                                  "<key>osBuildVersion</key><string>12B435</string>"));
     CHECK(response_body_contains(&response,
@@ -603,7 +603,7 @@ static void test_control_transcript(AirPlayHandlers *handlers, Recorder *recorde
     CHECK(dispatch(handlers, &session, "SET_PARAMETER", "/stream",
                    unsupported_parameter, sizeof(unsupported_parameter),
                    "application/octet-stream", &response));
-    CHECK(response.status_code == 400);
+    CHECK(response.status_code == 415);
     airplay_rtsp_response_clear(&response);
 
     root = airplay_plist_new_dict();

@@ -79,6 +79,29 @@ int main(void)
     CHECK(stats.requests_sent == 1u);
     CHECK(stats.responses_received == 1u);
 
+    memset(request, 0, sizeof(request));
+    request[0] = 0x80u;
+    request[1] = 0xd2u;
+    request[3] = 19u;
+    request[24] = 0x12u;
+    request[31] = 0x34u;
+    CHECK(sendto(socket_fd, request, sizeof(request), 0,
+                 (const struct sockaddr *)&sender, sender_size) ==
+          (ssize_t)sizeof(request));
+    received = recvfrom(socket_fd, response, sizeof(response), 0, NULL, NULL);
+    CHECK(received == (ssize_t)sizeof(response));
+    CHECK(response[0] == 0x80u && response[1] == 0xd3u && response[3] == 19u);
+    CHECK(memcmp(response + 8u, request + 24u, 8u) == 0);
+    CHECK(memcmp(response + 16u, "\0\0\0\0\0\0\0\0", 8u) != 0);
+    CHECK(memcmp(response + 24u, "\0\0\0\0\0\0\0\0", 8u) != 0);
+    response[1] = 0xd4u;
+    CHECK(sendto(socket_fd, response, sizeof(response), 0,
+                 (const struct sockaddr *)&sender, sender_size) ==
+          (ssize_t)sizeof(response));
+    sleep_milliseconds(20u);
+    CHECK(airplay_mirror_timing_get_stats(timing, &stats));
+    CHECK(stats.responses_received == 1u);
+
     airplay_mirror_timing_destroy(timing);
     close(socket_fd);
     if (g_failures != 0)

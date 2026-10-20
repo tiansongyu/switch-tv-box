@@ -75,6 +75,13 @@ static void test_snapshot_lifecycle(void)
 
 int main(void)
 {
+    PlayerMedia audio = { .uri = PLAYER_SCREEN_MIRROR_URI, .metadata = "AirPlay Audio" };
+    PlayerMedia mirror = { .uri = PLAYER_SCREEN_MIRROR_URI, .metadata = "AirPlay Mirroring" };
+    PlayerMedia video = { .uri = "https://example.test/video", .metadata = "AirPlay Audio" };
+    assert(player_media_is_airplay_audio(&audio));
+    assert(!player_media_is_airplay_audio(&mirror));
+    assert(!player_media_is_airplay_audio(&video));
+    assert(!player_media_is_airplay_audio(NULL));
     for (int iteration = 0; iteration < 1000; ++iteration)
     {
         test_media_lifecycle();

@@ -61,6 +61,14 @@ bool airplay_mirror_runtime_audio_open(
     uint8_t compression_type, uint16_t samples_per_frame,
     uint32_t sample_rate, uint16_t *data_port_out,
     uint16_t *control_port_out, void *user_data);
+bool airplay_mirror_runtime_legacy_audio_open(
+    uint64_t session_id, const uint8_t key[16], const uint8_t iv[16],
+    const AirPlayMirrorAudioFormat *format,
+    uint32_t peer_ipv4_address, uint16_t peer_control_port,
+    uint16_t *data_port_out, uint16_t *control_port_out, void *user_data);
+bool airplay_mirror_runtime_flush_audio(
+    uint64_t session_id, bool has_sequence, uint16_t sequence,
+    bool has_timestamp, uint32_t timestamp, void *user_data);
 bool airplay_mirror_runtime_record_audio(uint64_t session_id,
                                          void *user_data);
 void airplay_mirror_runtime_record(uint64_t session_id, void *user_data);

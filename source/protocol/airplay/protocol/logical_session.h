@@ -11,6 +11,7 @@
 #define AIRPLAY_SESSION_CLIENT_ID_SIZE 32U
 #define AIRPLAY_SESSION_MAX_CONNECTIONS 8U
 #define AIRPLAY_SESSION_MAX_LOGICAL_SESSIONS 8U
+#define AIRPLAY_SESSION_MAX_PHOTO_CACHE_REFERENCES 4U
 
 typedef enum
 {
@@ -76,6 +77,11 @@ bool airplay_session_manager_retain_media(AirPlaySessionManager *manager,
                                           uint64_t logical_session_id);
 bool airplay_session_manager_release_media(AirPlaySessionManager *manager,
                                            uint64_t logical_session_id);
+/* A bounded photo-cache snapshot retains identities without claiming playback.
+ * Versions discard snapshots that arrive out of order from control threads. */
+bool airplay_session_manager_sync_photo_cache(AirPlaySessionManager *manager,
+                                              const uint64_t *session_ids,
+                                              size_t count, uint64_t version);
 
 bool airplay_session_request_is_remote_video(const AirPlayRtspRequest *request);
 bool airplay_session_request_requires_logical_binding(

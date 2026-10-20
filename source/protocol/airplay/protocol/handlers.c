@@ -1,6 +1,9 @@
 #include "handlers.h"
 
 #include <stdio.h>
+#include <ctype.h>
+#include <errno.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -8,14 +11,15 @@
 #include "protocol/airplay/media/remote_video.h"
 #include "protocol/airplay/diagnostics.h"
 #include "protocol/airplay/protocol/plist.h"
+#include "protocol/airplay/protocol/sdp.h"
 #include "protocol/airplay/security/crypto.h"
+#include "protocol/airplay/security/legacy_rsa.h"
 #include "protocol/airplay/trace.h"
 
 #define AIRPLAY_PLIST_CONTENT_TYPE "application/x-apple-binary-plist"
 #define AIRPLAY_OCTET_CONTENT_TYPE "application/octet-stream"
 #define AIRPLAY_TEXT_CONTENT_TYPE "text/parameters"
 #define AIRPLAY_XML_PLIST_CONTENT_TYPE "text/x-apple-plist+xml"
-#define AIRPLAY_HLS_SERVER_FEATURES 0x27fu
 
 typedef struct
 {
@@ -42,6 +46,10 @@ typedef struct
     uint8_t aes_key[16];
     uint8_t aes_iv[16];
     uint64_t stream_connection_id;
+    bool legacy_announced;
+    bool legacy_encrypted;
+    AirPlayMirrorAudioFormat legacy_format;
+    float volume_db;
 } AirPlayHandlerSession;
 
 struct AirPlayHandlers
@@ -129,6 +137,12 @@ static AirPlayHandlerSession *session_context(AirPlayRtspSession *session)
     }
     session->protocol_context = context;
     return context;
+}
+
+bool airplay_handlers_session_is_legacy(const AirPlayRtspSession *session)
+{
+    const AirPlayHandlerSession *context = session ? session->protocol_context : NULL;
+    return context && context->legacy_announced;
 }
 
 static void diagnostic_note_setup_streams(AirPlayHandlerSession *context,
@@ -473,34 +487,30 @@ static bool add_audio_info(AirPlayPlistValue *root)
 {
     AirPlayPlistValue *latencies = airplay_plist_new_array();
     AirPlayPlistValue *formats = airplay_plist_new_array();
-    AirPlayPlistValue *item = NULL;
+    bool attached;
 
     if (!latencies || !formats)
         goto failure;
-    item = new_audio_latency(100u);
-    if (!item || !array_append(latencies, item))
+    if (!array_append(latencies, new_audio_latency(100u)))
         goto failure;
-    item = new_audio_latency(101u);
-    if (!item || !array_append(latencies, item))
+    if (!array_append(latencies, new_audio_latency(101u)))
         goto failure;
-    item = new_audio_format(100u);
-    if (!item || !array_append(formats, item))
+    if (!array_append(formats, new_audio_format(100u)))
         goto failure;
-    item = new_audio_format(101u);
-    if (!item || !array_append(formats, item))
+    if (!array_append(formats, new_audio_format(101u)))
         goto failure;
-    item = NULL;
-    if (!dict_set(root, "initialVolume", airplay_plist_new_real(0.0)) ||
-        !dict_set(root, "audioLatencies", latencies))
+    if (!dict_set(root, "initialVolume", airplay_plist_new_real(0.0)))
         goto failure;
+    /* dict_set and array_append consume their value even when allocation fails. */
+    attached = dict_set(root, "audioLatencies", latencies);
     latencies = NULL;
-    if (!dict_set(root, "audioFormats", formats))
+    if (!attached)
         goto failure;
+    attached = dict_set(root, "audioFormats", formats);
     formats = NULL;
-    return true;
+    return attached;
 
 failure:
-    airplay_plist_free(item);
     airplay_plist_free(latencies);
     airplay_plist_free(formats);
     return false;
@@ -567,7 +577,7 @@ static bool handle_server_info(AirPlayHandlers *handlers,
         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
         "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
         "<plist version=\"1.0\"><dict>"
-        "<key>features</key><integer>%u</integer>"
+        "<key>features</key><integer>%llu</integer>"
         "<key>macAddress</key><string>%s</string>"
         "<key>model</key><string>AppleTV3,2</string>"
         "<key>osBuildVersion</key><string>12B435</string>"
@@ -576,7 +586,8 @@ static bool handle_server_info(AirPlayHandlers *handlers,
         "<key>vv</key><integer>2</integer>"
         "<key>deviceid</key><string>%s</string>"
         "</dict></plist>\n",
-        AIRPLAY_HLS_SERVER_FEATURES, handlers->device_id, handlers->device_id);
+        (unsigned long long)handlers->config.features,
+        handlers->device_id, handlers->device_id);
     if (written <= 0 || (size_t)written >= sizeof(body))
         return airplay_rtsp_response_set_status(response, 500);
     return airplay_rtsp_response_set_body(response, body, (size_t)written,
@@ -738,6 +749,191 @@ static AirPlayPlistValue *decode_dict(const AirPlayRtspRequest *request)
         return NULL;
     }
     return root;
+}
+
+static bool handle_announce(AirPlayHandlers *handlers,
+                            AirPlayHandlerSession *context,
+                            AirPlayRtspSession *session,
+                            const AirPlayRtspRequest *request,
+                            AirPlayRtspResponse *response)
+{
+    AirPlaySdp sdp;
+    uint8_t key[16] = {0}, iv[16] = {0}, wrapped[72];
+    size_t size = 0u;
+    bool ok = false;
+
+    if (session->state != AIRPLAY_RTSP_SESSION_CONNECTED || context->initial_setup)
+        return airplay_rtsp_response_set_status(response, 455);
+    if (!handlers->config.legacy_audio_open_callback)
+        return airplay_rtsp_response_set_status(response, 501);
+    if (!content_type_is(request, "application/sdp") ||
+        !airplay_sdp_parse(request->body, request->body_length, &sdp))
+        return airplay_rtsp_response_set_status(response, 400);
+    if (sdp.iv[0] &&
+        (!airplay_legacy_base64_decode(sdp.iv, iv, sizeof(iv), &size) ||
+         size != sizeof(iv)))
+        goto cleanup;
+    if (sdp.rsa_key[0])
+    {
+        if (!airplay_legacy_rsa_unwrap(sdp.rsa_key, key))
+            goto cleanup;
+    }
+    else if (sdp.fairplay_key[0])
+    {
+        if (!airplay_legacy_base64_decode(sdp.fairplay_key, wrapped,
+                                         sizeof(wrapped), &size) ||
+            size != sizeof(wrapped))
+            goto cleanup;
+        if (handlers->config.unwrap_key_callback)
+            ok = handlers->config.unwrap_key_callback(
+                wrapped, key, handlers->config.callback_user_data);
+        else
+            ok = airplay_fairplay_unwrap_key(context->fairplay, wrapped, key) ==
+                 AIRPLAY_FAIRPLAY_OK;
+        if (!ok)
+            goto cleanup;
+    }
+    context->legacy_format = sdp.format;
+    context->legacy_encrypted = sdp.iv[0] != '\0';
+    context->legacy_announced = true;
+    memcpy(context->aes_key, key, sizeof(key));
+    memcpy(context->aes_iv, iv, sizeof(iv));
+    ok = true;
+cleanup:
+    airplay_crypto_secure_zero(key, sizeof(key));
+    airplay_crypto_secure_zero(iv, sizeof(iv));
+    airplay_crypto_secure_zero(&sdp, sizeof(sdp));
+    return ok ? true : airplay_rtsp_response_set_status(response, 400);
+}
+
+static bool parse_uint(const char *text, uint32_t limit, uint32_t *value)
+{
+    char *end;
+    unsigned long parsed;
+    if (!text || !isdigit((unsigned char)*text))
+        return false;
+    errno = 0;
+    parsed = strtoul(text, &end, 10);
+    if (errno || *end || parsed > limit)
+        return false;
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+/* Iterate semicolon-separated transport/RTP parameters without strtok state. */
+static bool next_parameter(const char **cursor, char *value, size_t capacity)
+{
+    const char *start = *cursor;
+    const char *end;
+    size_t length;
+    while (*start == ';' || *start == ' ' || *start == '\t')
+        ++start;
+    if (!*start)
+    {
+        *cursor = start;
+        value[0] = '\0';
+        return true;
+    }
+    end = strchr(start, ';');
+    if (!end)
+        end = start + strlen(start);
+    *cursor = end;
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+        --end;
+    length = (size_t)(end - start);
+    if (!length || length >= capacity)
+        return false;
+    memcpy(value, start, length);
+    value[length] = '\0';
+    return true;
+}
+
+static bool handle_legacy_setup(AirPlayHandlers *handlers,
+                                 AirPlayHandlerSession *context,
+                                 AirPlayRtspSession *session,
+                                 const AirPlayRtspRequest *request,
+                                 AirPlayRtspResponse *response)
+{
+    const char *cursor = airplay_rtsp_request_header(request, "Transport");
+    char token[256], transport_response[256], session_id[32];
+    uint32_t peer_control = 0u, peer_timing = 0u;
+    uint16_t data_port = 0u, control_port = 0u, timing_port = 0u;
+    bool unicast = false, prepared = false;
+    AirPlayTransportSetup setup = {0};
+
+    if (!context->legacy_announced || context->initial_setup ||
+        session->state != AIRPLAY_RTSP_SESSION_CONNECTED)
+        return airplay_rtsp_response_set_status(response, 455);
+    if (!cursor || request->body_length ||
+        !next_parameter(&cursor, token, sizeof(token)) ||
+        strcasecmp(token, "RTP/AVP/UDP") != 0)
+        return airplay_rtsp_response_set_status(response, 461);
+    while (*cursor)
+    {
+        if (!next_parameter(&cursor, token, sizeof(token)))
+            return airplay_rtsp_response_set_status(response, 461);
+        if (!token[0])
+            break;
+        if (strcasecmp(token, "unicast") == 0)
+            unicast = true;
+        else if (strncasecmp(token, "control_port=", 13u) == 0)
+        {
+            if (peer_control || !parse_uint(token + 13u, UINT16_MAX, &peer_control) ||
+                !peer_control)
+                return airplay_rtsp_response_set_status(response, 461);
+        }
+        else if (strncasecmp(token, "timing_port=", 12u) == 0)
+        {
+            if (peer_timing || !parse_uint(token + 12u, UINT16_MAX, &peer_timing) ||
+                !peer_timing)
+                return airplay_rtsp_response_set_status(response, 461);
+        }
+        else if (strcasecmp(token, "mode=record") != 0 &&
+                 strcasecmp(token, "mode=\"record\"") != 0 &&
+                 strcasecmp(token, "interleaved=0-1") != 0)
+            return airplay_rtsp_response_set_status(response, 461);
+    }
+    if (!unicast || !peer_control || !peer_timing ||
+        !handlers->config.transport_prepare_callback ||
+        !handlers->config.legacy_audio_open_callback)
+        return airplay_rtsp_response_set_status(response, 461);
+    setup.session_id = session->logical_session_id;
+    setup.peer_ipv4_address = session->peer_ipv4_address;
+    setup.peer_timing_port = (uint16_t)peer_timing;
+    setup.uses_ntp_timing = true;
+    /* Transport stores key bytes even when the RTP stream is unencrypted. */
+    setup.key = context->aes_key;
+    setup.iv = context->aes_iv;
+    prepared = handlers->config.transport_prepare_callback(
+        &setup, &timing_port, handlers->config.callback_user_data);
+    if (!prepared || !timing_port ||
+        !handlers->config.legacy_audio_open_callback(
+            session->logical_session_id,
+            context->legacy_encrypted ? context->aes_key : NULL,
+            context->legacy_encrypted ? context->aes_iv : NULL,
+            &context->legacy_format, session->peer_ipv4_address,
+            (uint16_t)peer_control, &data_port, &control_port,
+            handlers->config.callback_user_data) || !data_port || !control_port)
+        goto failure;
+    snprintf(transport_response, sizeof(transport_response),
+             "RTP/AVP/UDP;unicast;mode=record;server_port=%u;control_port=%u;timing_port=%u",
+             data_port, control_port, timing_port);
+    snprintf(session_id, sizeof(session_id), "%llu",
+             (unsigned long long)session->logical_session_id);
+    if (!airplay_rtsp_response_add_header(response, "Transport", transport_response) ||
+        !airplay_rtsp_response_add_header(response, "Session", session_id))
+        goto failure;
+    context->initial_setup = true;
+    context->audio_setup = true;
+    context->diagnostic_initial_setup_ok = true;
+    context->diagnostic_audio_setup_ok = true;
+    session->state = AIRPLAY_RTSP_SESSION_SETUP;
+    return true;
+failure:
+    if (prepared && handlers->config.mirror_stop_callback)
+        handlers->config.mirror_stop_callback(
+            session->logical_session_id, handlers->config.callback_user_data);
+    return airplay_rtsp_response_set_status(response, 461);
 }
 
 static bool derive_session_key(AirPlayHandlers *handlers,
@@ -985,8 +1181,7 @@ static bool setup_streams(AirPlayHandlers *handlers,
             if (!response_stream ||
                 !dict_set(response_stream, "dataPort",
                           airplay_plist_new_uint(data_port)) ||
-                !dict_set(response_stream, "type", airplay_plist_new_uint(type)) ||
-                !array_append(response_streams, response_stream))
+                !dict_set(response_stream, "type", airplay_plist_new_uint(type)))
             {
                 AIRPLAY_OBSERVE(
                     "[airplay-setup-failure] session=%llu stream=%s stage=response-plist\n",
@@ -995,6 +1190,8 @@ static bool setup_streams(AirPlayHandlers *handlers,
                 airplay_plist_free(response_stream);
                 goto failure;
             }
+            if (!array_append(response_streams, response_stream))
+                goto failure;
         }
     }
     if (!dict_set(response_root, "streams", response_streams))
@@ -1283,18 +1480,22 @@ static bool handle_record(AirPlayHandlers *handlers,
     context->diagnostic_record_ok = true;
     context->diagnostic_last_status = 200;
     trace_phase_transition(session, phase_before, "record", true);
-    return airplay_rtsp_response_add_header(response, "Audio-Latency", "0") &&
+    return airplay_rtsp_response_add_header(response, "Audio-Latency",
+                                            context->legacy_announced ? "11025" : "0") &&
            airplay_rtsp_response_add_header(response, "Audio-Jack-Status",
                                             "connected; type=analog");
 }
 
-static bool handle_get_parameter(const AirPlayRtspRequest *request,
+static bool handle_get_parameter(const AirPlayHandlerSession *context,
+                                 const AirPlayRtspRequest *request,
                                  AirPlayRtspResponse *response)
 {
-    static const char volume[] = "volume: 0.000000\r\n";
+    char volume[64];
     static const char needle[] = "volume";
     bool requests_volume = false;
 
+    if (!request->body_length)
+        return true; /* Empty GET_PARAMETER is an RTSP keepalive. */
     if (!content_type_is(request, AIRPLAY_TEXT_CONTENT_TYPE))
         return airplay_rtsp_response_set_status(response, 400);
     for (size_t index = 0u; index + sizeof(needle) - 1u <= request->body_length; ++index)
@@ -1306,8 +1507,159 @@ static bool handle_get_parameter(const AirPlayRtspRequest *request,
         }
     }
     if (requests_volume)
-        return airplay_rtsp_response_set_body(response, volume, sizeof(volume) - 1u,
+    {
+        int size = snprintf(volume, sizeof(volume), "volume: %.6f\r\n",
+                            (double)context->volume_db);
+        return size > 0 && (size_t)size < sizeof(volume) &&
+               airplay_rtsp_response_set_body(response, volume, (size_t)size,
                                               AIRPLAY_TEXT_CONTENT_TYPE);
+    }
+    return true;
+}
+
+static bool valid_dmap(const uint8_t *body, size_t size)
+{
+    size_t offset = 0u;
+    while (offset < size)
+    {
+        uint32_t length;
+        if (size - offset < 8u)
+            return false;
+        length = ((uint32_t)body[offset + 4u] << 24u) |
+                 ((uint32_t)body[offset + 5u] << 16u) |
+                 ((uint32_t)body[offset + 6u] << 8u) | body[offset + 7u];
+        offset += 8u;
+        if (length > size - offset)
+            return false;
+        offset += length;
+    }
+    return true;
+}
+
+static bool handle_set_parameter(AirPlayHandlers *handlers,
+                                 AirPlayHandlerSession *context,
+                                 const AirPlayRtspSession *session,
+                                 const AirPlayRtspRequest *request,
+                                 AirPlayRtspResponse *response)
+{
+    const char *type = airplay_rtsp_request_header(request, "Content-Type");
+    if (!request->body_length)
+        return true;
+    if (content_type_is(request, AIRPLAY_TEXT_CONTENT_TYPE))
+    {
+        char *body, *cursor;
+        bool has_volume = false, valid = true;
+        float volume = 0.0f;
+        if (request->body_length > 16384u ||
+            memchr(request->body, 0, request->body_length))
+            return airplay_rtsp_response_set_status(response, 400);
+        body = malloc(request->body_length + 1u);
+        if (!body)
+            return false;
+        memcpy(body, request->body, request->body_length);
+        body[request->body_length] = '\0';
+        cursor = body;
+        while (*cursor && valid)
+        {
+            char *line = cursor, *end;
+            cursor += strcspn(cursor, "\r\n");
+            if (*cursor)
+            {
+                *cursor++ = '\0';
+                while (*cursor == '\r' || *cursor == '\n')
+                    ++cursor;
+            }
+            if (strncmp(line, "volume:", 7u) == 0)
+            {
+                errno = 0;
+                volume = strtof(line + 7u, &end);
+                while (*end == ' ' || *end == '\t')
+                    ++end;
+                valid = !has_volume && end != line + 7u && !errno && !*end &&
+                        isfinite(volume) &&
+                        ((volume >= -30.0f && volume <= 0.0f) || volume == -144.0f);
+                has_volume = true;
+            }
+            else if (strncmp(line, "progress:", 9u) == 0)
+            {
+                /* Progress timestamps wrap at 32 bits; ordering is not numeric. */
+                unsigned long long start, current, finish;
+                int used = 0;
+                valid = sscanf(line + 9u, " %llu/%llu/%llu %n",
+                               &start, &current, &finish, &used) == 3 &&
+                        used && !line[9u + (size_t)used] &&
+                        start <= UINT32_MAX && current <= UINT32_MAX &&
+                        finish <= UINT32_MAX;
+            }
+            /* Future text parameters can be ignored without breaking playback. */
+        }
+        free(body);
+        if (!valid)
+            return airplay_rtsp_response_set_status(response, 400);
+        if (has_volume)
+        {
+            if (handlers->config.audio_volume_callback &&
+                !handlers->config.audio_volume_callback(
+                    session->logical_session_id, volume,
+                    handlers->config.callback_user_data))
+                return airplay_rtsp_response_set_status(response, 500);
+            context->volume_db = volume;
+        }
+    }
+    else if (content_type_is(request, "application/x-dmap-tagged"))
+    {
+        if (!valid_dmap(request->body, request->body_length))
+            return airplay_rtsp_response_set_status(response, 400);
+    }
+    else if (!content_type_is(request, "image/jpeg") &&
+             !content_type_is(request, "image/png"))
+        return airplay_rtsp_response_set_status(response, 415);
+    if (handlers->config.audio_metadata_callback)
+        handlers->config.audio_metadata_callback(
+            session->logical_session_id, type, request->body,
+            request->body_length, handlers->config.callback_user_data);
+    return true;
+}
+
+static bool handle_flush(AirPlayHandlers *handlers,
+                          AirPlayHandlerSession *context,
+                          const AirPlayRtspSession *session,
+                          const AirPlayRtspRequest *request,
+                          AirPlayRtspResponse *response)
+{
+    const char *cursor = airplay_rtsp_request_header(request, "RTP-Info");
+    uint32_t sequence = 0u, timestamp = 0u;
+    bool has_sequence = false, has_timestamp = false;
+    char parameter[128];
+    if (session->state != AIRPLAY_RTSP_SESSION_RECORDING &&
+        session->state != AIRPLAY_RTSP_SESSION_SETUP)
+        return airplay_rtsp_response_set_status(response, 455);
+    while (cursor && *cursor)
+    {
+        if (!next_parameter(&cursor, parameter, sizeof(parameter)))
+            return airplay_rtsp_response_set_status(response, 400);
+        if (!parameter[0])
+            break;
+        if (strncmp(parameter, "seq=", 4u) == 0)
+        {
+            if (has_sequence || !parse_uint(parameter + 4u, UINT16_MAX, &sequence))
+                return airplay_rtsp_response_set_status(response, 400);
+            has_sequence = true;
+        }
+        else if (strncmp(parameter, "rtptime=", 8u) == 0)
+        {
+            if (has_timestamp || !parse_uint(parameter + 8u, UINT32_MAX, &timestamp))
+                return airplay_rtsp_response_set_status(response, 400);
+            has_timestamp = true;
+        }
+        else
+            return airplay_rtsp_response_set_status(response, 400);
+    }
+    if (context->audio_setup && handlers->config.audio_flush_callback &&
+        !handlers->config.audio_flush_callback(
+            session->logical_session_id, has_sequence, (uint16_t)sequence,
+            has_timestamp, timestamp, handlers->config.callback_user_data))
+        return airplay_rtsp_response_set_status(response, 500);
     return true;
 }
 
@@ -1438,6 +1790,20 @@ bool airplay_handlers_route(AirPlayRtspSession *session,
     context = session_context(session);
     if (!context)
         return false;
+    {
+        const char *challenge = airplay_rtsp_request_header(request, "Apple-Challenge");
+        if (challenge)
+        {
+            char challenge_response[345];
+            if (!airplay_legacy_rsa_challenge(
+                    challenge, session->local_ipv4_address, handlers->device_id,
+                    challenge_response))
+                return airplay_rtsp_response_set_status(response, 400);
+            if (!airplay_rtsp_response_add_header(response, "Apple-Response",
+                                                  challenge_response))
+                return false;
+        }
+    }
     if (!handler_state_valid(session, context))
     {
         AIRPLAY_TRACE_WARN(
@@ -1485,7 +1851,7 @@ bool airplay_handlers_route(AirPlayRtspSession *session,
     if (strcmp(request->method, "OPTIONS") == 0)
         return airplay_rtsp_response_add_header(
             response, "Public",
-            "SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
+            "ANNOUNCE, SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER, GET, POST");
     if (strcmp(request->uri, "/server-info") == 0)
         return handle_server_info(handlers, request, response);
     if (strcmp(request->uri, "/info") == 0)
@@ -1502,8 +1868,14 @@ bool airplay_handlers_route(AirPlayRtspSession *session,
         return true;
     if (strcmp(request->uri, "/audioMode") == 0)
         return handle_audio_mode(request, response);
+    if (strcmp(request->method, "ANNOUNCE") == 0)
+        return handle_announce(handlers, context, session, request, response);
     if (strcmp(request->method, "SETUP") == 0)
+    {
+        if (context->legacy_announced)
+            return handle_legacy_setup(handlers, context, session, request, response);
         return handle_setup(handlers, context, session, request, response);
+    }
     if (strcmp(request->method, "RECORD") == 0)
         return handle_record(handlers, context, session, response);
     if (strcmp(request->method, "GET_PARAMETER") == 0)
@@ -1511,24 +1883,17 @@ bool airplay_handlers_route(AirPlayRtspSession *session,
         if (session->state != AIRPLAY_RTSP_SESSION_SETUP &&
             session->state != AIRPLAY_RTSP_SESSION_RECORDING)
             return airplay_rtsp_response_set_status(response, 455);
-        return handle_get_parameter(request, response);
+        return handle_get_parameter(context, request, response);
     }
     if (strcmp(request->method, "SET_PARAMETER") == 0)
     {
         if (session->state != AIRPLAY_RTSP_SESSION_SETUP &&
             session->state != AIRPLAY_RTSP_SESSION_RECORDING)
             return airplay_rtsp_response_set_status(response, 455);
-        return request->body_length == 0u ||
-                       content_type_is(request, AIRPLAY_TEXT_CONTENT_TYPE) ||
-                       content_type_is(request, "application/x-dmap-tagged") ||
-                       content_type_is(request, "image/jpeg")
-                   ? true
-                   : airplay_rtsp_response_set_status(response, 400);
+        return handle_set_parameter(handlers, context, session, request, response);
     }
     if (strcmp(request->method, "FLUSH") == 0)
-        return session->state == AIRPLAY_RTSP_SESSION_RECORDING
-                   ? true
-                   : airplay_rtsp_response_set_status(response, 455);
+        return handle_flush(handlers, context, session, request, response);
     if (strcmp(request->method, "TEARDOWN") == 0)
         return handle_teardown(handlers, context, session, request, response);
     return airplay_rtsp_response_set_status(response, 501);

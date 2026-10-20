@@ -103,6 +103,59 @@ static bool mirror_open(uint64_t session_id, const uint8_t key[16],
     return true;
 }
 
+static bool legacy_audio_open(uint64_t session_id, const uint8_t key[16],
+                               const uint8_t iv[16],
+                               const AirPlayMirrorAudioFormat *format,
+                               uint32_t peer, uint16_t peer_control,
+                               uint16_t *data_port, uint16_t *control_port,
+                               void *user_data)
+{
+    (void)session_id;
+    (void)key;
+    (void)iv;
+    (void)peer;
+    (void)user_data;
+    if (!format || format->codec != AIRPLAY_MIRROR_AUDIO_CODEC_ALAC ||
+        !peer_control || !data_port || !control_port)
+        return false;
+    *data_port = 7012u;
+    *control_port = 7013u;
+    return true;
+}
+
+static bool audio_record(uint64_t session_id, void *user_data)
+{
+    (void)session_id;
+    (void)user_data;
+    return true;
+}
+
+static bool audio_flush(uint64_t session_id, bool has_sequence, uint16_t sequence,
+                         bool has_timestamp, uint32_t timestamp, void *user_data)
+{
+    (void)session_id;
+    (void)has_sequence;
+    (void)sequence;
+    (void)has_timestamp;
+    (void)timestamp;
+    (void)user_data;
+    return true;
+}
+
+static bool audio_volume(uint64_t session_id, float volume_db, void *user_data)
+{
+    (void)session_id;
+    (void)volume_db;
+    (void)user_data;
+    return true;
+}
+
+static uint16_t remote_port(void *user_data)
+{
+    (void)user_data;
+    return airplay_receiver_port();
+}
+
 int main(int argc, char **argv)
 {
     AirPlayReceiverConfig config = {0};
@@ -112,7 +165,8 @@ int main(int argc, char **argv)
         .pause = remote_action,
         .stop = remote_action,
         .seek_ms = remote_seek,
-        .snapshot = remote_snapshot};
+        .snapshot = remote_snapshot,
+        .control_port = remote_port};
     AirPlayRemoteVideo *remote_video = NULL;
     char storage_template[] = "/tmp/nxcast-airplay-receiver-smoke.XXXXXX";
     char *storage_directory;
@@ -136,16 +190,21 @@ int main(int argc, char **argv)
     signal(SIGTERM, handle_signal);
     if (!airplay_remote_video_create(&remote_ops, &remote_video))
         goto cleanup;
-    config.friendly_name = "NX-Cast Test";
+    config.friendly_name = "Switch TV Box Test";
     config.storage_directory = storage_directory;
     config.control_port = (uint16_t)port;
     config.features = AIRPLAY_MDNS_FEATURE_VIDEO |
                       AIRPLAY_MDNS_FEATURE_HLS |
                       AIRPLAY_MDNS_FEATURE_SCREEN_MIRROR |
+                      AIRPLAY_MDNS_FEATURE_AUDIO |
                       AIRPLAY_MDNS_FEATURE_SCREEN_ROTATE;
     config.enable_discovery = false;
     config.transport_prepare_callback = mirror_prepare;
     config.mirror_open_callback = mirror_open;
+    config.legacy_audio_open_callback = legacy_audio_open;
+    config.audio_record_callback = audio_record;
+    config.audio_flush_callback = audio_flush;
+    config.audio_volume_callback = audio_volume;
     config.remote_video = remote_video;
     if (!airplay_receiver_start(&config))
         goto cleanup;

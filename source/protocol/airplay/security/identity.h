@@ -9,7 +9,7 @@
 
 #define AIRPLAY_IDENTITY_DEVICE_ID_SIZE 6u
 #define AIRPLAY_IDENTITY_FINGERPRINT_SIZE AIRPLAY_CRYPTO_SHA256_SIZE
-#define AIRPLAY_IDENTITY_DEFAULT_DIR "sdmc:/switch/NX-Cast/airplay"
+#define AIRPLAY_IDENTITY_DEFAULT_DIR "sdmc:/switch/switch-tv-box/airplay"
 
 typedef struct AirPlayIdentity AirPlayIdentity;
 

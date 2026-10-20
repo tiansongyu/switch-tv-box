@@ -8,6 +8,7 @@
 #define AIRPLAY_MIRROR_AUDIO_RTP_HEADER_SIZE 12u
 #define AIRPLAY_MIRROR_AUDIO_MAX_PACKET (32u * 1024u)
 #define AIRPLAY_MIRROR_AUDIO_WINDOW 64u
+#define AIRPLAY_MIRROR_AUDIO_CT_PCM 1u
 #define AIRPLAY_MIRROR_AUDIO_CT_ALAC 2u
 #define AIRPLAY_MIRROR_AUDIO_CT_AAC_LC 4u
 #define AIRPLAY_MIRROR_AUDIO_CT_AAC_ELD 8u
@@ -17,15 +18,18 @@ typedef enum
 {
     AIRPLAY_MIRROR_AUDIO_CODEC_INVALID = 0,
     AIRPLAY_MIRROR_AUDIO_CODEC_AAC,
-    AIRPLAY_MIRROR_AUDIO_CODEC_ALAC
+    AIRPLAY_MIRROR_AUDIO_CODEC_ALAC,
+    AIRPLAY_MIRROR_AUDIO_CODEC_PCM_S16BE
 } AirPlayMirrorAudioCodec;
 
 typedef struct
 {
     AirPlayMirrorAudioCodec codec;
     uint8_t compression_type;
+    uint8_t rtp_payload_type;
     uint32_t sample_rate;
     uint16_t channels;
+    uint16_t bits_per_sample;
     uint16_t samples_per_frame;
     uint8_t codec_config[AIRPLAY_MIRROR_AUDIO_CODEC_CONFIG_MAX];
     size_t codec_config_size;
@@ -54,6 +58,10 @@ typedef struct
     uint8_t compression_type;
     uint16_t samples_per_frame;
     uint32_t sample_rate;
+    /* An SDP negotiated format overrides the mirror defaults above. */
+    const AirPlayMirrorAudioFormat *format;
+    uint32_t peer_ipv4_address;
+    uint16_t peer_control_port;
     AirPlayMirrorAudioCallback callback;
     AirPlayMirrorAudioSyncCallback sync_callback;
     void *callback_user_data;
@@ -65,9 +73,14 @@ bool airplay_mirror_audio_format(uint8_t compression_type,
                                  uint16_t samples_per_frame,
                                  uint32_t sample_rate,
                                  AirPlayMirrorAudioFormat *format_out);
+bool airplay_mirror_audio_format_alac(const uint32_t fmtp[11],
+                                      AirPlayMirrorAudioFormat *format_out);
 bool airplay_mirror_audio_create(const AirPlayMirrorAudioConfig *config,
                                  AirPlayMirrorAudio **audio_out);
 void airplay_mirror_audio_set_recording(AirPlayMirrorAudio *audio, bool recording);
+void airplay_mirror_audio_flush(AirPlayMirrorAudio *audio,
+                                bool has_sequence, uint16_t sequence,
+                                bool has_timestamp, uint32_t timestamp);
 void airplay_mirror_audio_destroy(AirPlayMirrorAudio *audio);
 uint16_t airplay_mirror_audio_data_port(const AirPlayMirrorAudio *audio);
 uint16_t airplay_mirror_audio_control_port(const AirPlayMirrorAudio *audio);
