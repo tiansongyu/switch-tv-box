@@ -10,12 +10,12 @@
 
 ## 功能
 
-- 深色大字电视界面，默认中文，可切英文；显示时钟、IP、接收状态、配对码和继续播放。
-- 保留 NX-Cast 的 M3U/M3U8 直播源、分类、搜索、收藏、最近观看、EPG、手柄及触摸操作。
-- DLNA 投送，mpv/FFmpeg/deko3d/nvtegra 硬件加速播放器。
+- 首页只保留 **IPTV、AirPlay、DLNA** 三个入口，默认中文，支持手柄和触摸。
+- IPTV 支持 M3U/M3U8、分类、搜索、EPG；播放中可呼出频道列表切台，收藏栏目保存到 SD 卡。
+- DLNA 视频投屏，接收手机应用发送的视频地址，支持播放、暂停、停止，以及可定位视频的进度跳转；[投屏指南与实现说明](docs/DLNA.md)记录了参考 wiliwili 的修复与验证范围。
 - AirPlay 1 RAOP：RSA/AES、ALAC/AAC/PCM、UDP 音频、音量、FLUSH、重传和实际音频输出链路。
 - AirPlay 1 照片：JPEG/PNG、预缓存、缓存显示；在播放器中保持显示至停止或替换。
-- 保留 URL/HLS 视频、PIN 配对和带声音的屏幕镜像；独立音乐使用主页音乐卡。
+- 保留 URL/HLS 视频、PIN 配对和带声音的屏幕镜像；音乐和照片统一归入 AirPlay 入口。
 
 协议、真实编解码、生命周期和界面已有主机测试；Switch 交叉编译与 SD 安装包已通过，[本次验证记录](docs/VALIDATION.md)包含结果和产物校验值。**尚未完成物理 Switch 与各代 iOS/macOS 的互操作验收，不能称为“完美支持所有 AirPlay 1”。** 老式 `/stream` 镜像、服务器幻灯片/转场、歌曲封面显示等仍有明确缺口，详见 [AirPlay 1 能力与验证](docs/AIRPLAY1.md)。
 
@@ -40,9 +40,12 @@ switch/switch-tv-box/
 | 操作 | 按键 |
 |---|---|
 | 首页选择 / 确认 | 方向键或摇杆 / A |
-| 打开频道库 | X 或按下摇杆 |
-| 继续观看 | 选择继续播放卡按 A，或 B |
-| 音乐暂停 / 继续 | 选择音乐卡按 A |
+| 打开频道库（含播放中） | X 或按下摇杆 |
+| 频道列表中切台 | 方向键选择、A 播放、B 收起列表 |
+| 收藏 / 取消收藏 | 频道列表选中频道后按 Y |
+| 查看收藏频道 | 频道列表顶部选择“收藏” |
+| 返回正在播放的画面 | 首页按 B，或在投屏页面选择播放控制 |
+| AirPlay 音乐暂停 / 继续 | AirPlay 页面选择播放控制后按 A |
 | 播放画面暂停 / 跳转 / 音量 | A / 左右或 L、R / 上下 |
 | 返回首页 / 退出 | B / + |
 
@@ -59,7 +62,9 @@ switch/switch-tv-box/
 
 只跑测试：`./scripts/build-local.sh test`。只编译和打包：`./scripts/build-local.sh build`。VS Code 默认构建任务使用 Docker。完整说明见 [构建指南](docs/BUILD.md)。
 
-生成八种真实 UI 预览：`python3 scripts/preview_home.py`，输出到 `artifacts/ui/`。
+使用本机已有 Eden 在独立虚拟桌面运行实际 NRO：见 [模拟器启动与兼容说明](docs/EMULATOR.md)，包括独立 SD 配置、兼容 SDK 和局域网发现助手。
+
+生成十六种真实 UI 预览：`python3 scripts/preview_home.py`，输出到 `artifacts/ui/`。
 
 ## 本地规范与来源
 
