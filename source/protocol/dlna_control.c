@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "app/platform_compat.h"
 #include "log/log.h"
 #include "protocol/dlna/control/event_server.h"
 #include "protocol/dlna/control/soap_server.h"
@@ -19,6 +20,7 @@
 #include "protocol/dlna/description/scpd.h"
 #include "protocol/dlna/description/template_resource.h"
 #include "protocol/dlna/discovery/ssdp.h"
+#include "protocol/dlna/discovery/local_address.h"
 #include "protocol/http/http_server.h"
 
 static bool g_dlnaRunning = false;
@@ -210,6 +212,9 @@ static void dlna_identity_ensure_loaded(void)
 
 static char *dlna_determine_local_ip_alloc(void)
 {
+    if (tvbox_eden_compat_enabled())
+        return dlna_eden_local_address_alloc();
+
     int sock;
     struct sockaddr_in remote;
     struct sockaddr_in local;

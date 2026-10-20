@@ -21,6 +21,7 @@
 #include "app/network_diagnostics.h"
 #include "app/platform_compat.h"
 #include "log/log.h"
+#include "local_address.h"
 #include "protocol/dlna/server_info.h"
 
 #define SSDP_PORT 1900
@@ -280,6 +281,11 @@ static char *ssdp_format_date_alloc(void)
 // Determine the outbound IPv4 address by connecting a dummy UDP socket.
 static bool determine_local_ip(char **out)
 {
+    if (g_ssdp.eden_compat)
+    {
+        *out = dlna_eden_local_address_alloc();
+        return *out != NULL;
+    }
     int sock = ssdp_socket_create(AF_INET, SOCK_DGRAM, 0);
     char *local_ip = NULL;
     if (sock < 0)

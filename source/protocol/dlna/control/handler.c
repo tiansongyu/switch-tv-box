@@ -86,8 +86,81 @@ static void xml_decode_in_place(char *value)
     dst = value;
     while (*src)
     {
+        if (strncmp(src, "<![CDATA[", 9) == 0)
+        {
+            char *end = strstr(src + 9, "]]>");
+            if (end)
+            {
+                size_t length = (size_t)(end - (src + 9));
+                memmove(dst, src + 9, length);
+                dst += length;
+                src = end + 3;
+                continue;
+            }
+        }
         if (*src == '&')
         {
+            if (src[1] == '#')
+            {
+                const char *number = src + 2;
+                unsigned base = 10;
+                unsigned codepoint = 0;
+                bool valid = true;
+                if (*number == 'x' || *number == 'X')
+                {
+                    base = 16;
+                    ++number;
+                }
+                const char *first = number;
+                while (*number && *number != ';')
+                {
+                    unsigned digit;
+                    if (*number >= '0' && *number <= '9')
+                        digit = (unsigned)(*number - '0');
+                    else if (base == 16 && *number >= 'a' && *number <= 'f')
+                        digit = (unsigned)(*number - 'a') + 10;
+                    else if (base == 16 && *number >= 'A' && *number <= 'F')
+                        digit = (unsigned)(*number - 'A') + 10;
+                    else
+                        break;
+                    if (codepoint > (0x10FFFFu - digit) / base)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    codepoint = codepoint * base + digit;
+                    ++number;
+                }
+                valid = valid && number != first && *number == ';' &&
+                    (codepoint >= 0x20 || codepoint == 9 || codepoint == 10 || codepoint == 13) &&
+                    !(codepoint >= 0xD800 && codepoint <= 0xDFFF) &&
+                    codepoint != 0xFFFE && codepoint != 0xFFFF;
+                if (valid)
+                {
+                    if (codepoint < 0x80)
+                        *dst++ = (char)codepoint;
+                    else if (codepoint < 0x800)
+                    {
+                        *dst++ = (char)(0xC0 | (codepoint >> 6));
+                        *dst++ = (char)(0x80 | (codepoint & 0x3F));
+                    }
+                    else if (codepoint < 0x10000)
+                    {
+                        *dst++ = (char)(0xE0 | (codepoint >> 12));
+                        *dst++ = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+                        *dst++ = (char)(0x80 | (codepoint & 0x3F));
+                    }
+                    else
+                    {
+                        *dst++ = (char)(0xF0 | (codepoint >> 18));
+                        *dst++ = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+                        *dst++ = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+                        *dst++ = (char)(0x80 | (codepoint & 0x3F));
+                    }
+                    src = (char *)number + 1;
+                    continue;
+                }
+            }
             if (strncmp(src, "&amp;", 5) == 0)
             {
                 *dst++ = '&';
@@ -318,8 +391,8 @@ bool soap_handler_extract_xml_value_alloc(const char *xml, const char *tag, char
             return false;
         if (open_end > open && open_end[-1] == '/')
         {
-            cursor = open_end + 1;
-            continue;
+            *out = strdup("");
+            return *out != NULL;
         }
 
         const char *value_start = open_end + 1;
@@ -327,6 +400,15 @@ bool soap_handler_extract_xml_value_alloc(const char *xml, const char *tag, char
         while (true)
         {
             const char *close = strstr(scan, "</");
+            const char *cdata = strstr(scan, "<![CDATA[");
+            if (cdata && (!close || cdata < close))
+            {
+                const char *end = strstr(cdata + 9, "]]>");
+                if (!end)
+                    return false;
+                scan = end + 3;
+                continue;
+            }
             if (!close)
                 break;
 

@@ -15,7 +15,11 @@ if [[ "${TVBOX_ACTION:-release}" == test || "${TVBOX_ACTION:-release}" == releas
     python3 scripts/test_dev_workflow.py
     python3 scripts/test_ffmpeg_install.py
     python3 scripts/test_ssdp_receive.py
+    python3 scripts/test_dlna_address.py
+    python3 scripts/test_dlna_avtransport.py
     python3 scripts/test_platform_compat.py
+    python3 scripts/test_eden_socket_compat.py
+    python3 scripts/test_eden_airplay_advertise.py
 fi
 if [[ "${TVBOX_ACTION:-release}" == build || "${TVBOX_ACTION:-release}" == release ]]; then
     make RELEASE_JOBS="${BUILD_JOBS:-8}" release-build

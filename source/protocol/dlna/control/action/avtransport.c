@@ -104,8 +104,24 @@ static bool avtransport_submit_play_command(void)
         protocol_coordinator_media_abort(&transaction);
         return false;
     }
-    submitted = avtransport_submit_leased_command(
-        &transaction.lease, PLAYER_COMMAND_PLAY, NULL, 0);
+    /* The player may have loaded AirPlay/IPTV media since DLNA released its
+     * lease. Reopen the saved DLNA resource before resuming under a new lease. */
+    const DlnaProtocolStateView *state = dlna_protocol_state_view();
+    char *uri = strdup(state->av_transport_uri);
+    char *metadata = strdup(state->av_transport_uri_metadata);
+    PlayerCommandRequest request = {0};
+    request.kind = PLAYER_COMMAND_OPEN;
+    request.source = PLAYER_COMMAND_SOURCE_DLNA;
+    request.lease = transaction.lease;
+    request.uri = uri;
+    request.metadata = metadata;
+    submitted = uri && metadata && player_command_status_succeeded(
+        player_submit_command_wait(&request, DLNA_PLAYER_COMMAND_TIMEOUT_MS));
+    free(uri);
+    free(metadata);
+    if (submitted)
+        submitted = avtransport_submit_leased_command(
+            &transaction.lease, PLAYER_COMMAND_PLAY, NULL, 0);
     if (submitted)
         protocol_coordinator_media_end(&transaction);
     else
@@ -145,12 +161,6 @@ static bool avtransport_run_owned_seek_ms(int position_ms)
 {
     return avtransport_submit_owned_command(PLAYER_COMMAND_SEEK_MS, NULL,
                                             position_ms);
-}
-
-static bool avtransport_run_owned_seek_target(const char *target)
-{
-    return avtransport_submit_owned_command(PLAYER_COMMAND_SEEK_TARGET,
-                                            target, 0);
 }
 
 static void avtransport_get_snapshot(RendererSnapshot *snapshot)
@@ -288,7 +298,14 @@ static bool avtransport_try_instance_id(const SoapActionContext *ctx,
 
     *instance_id_out = NULL;
     if (soap_handler_try_arg_alloc(ctx, "InstanceID", instance_id_out))
-        return true;
+    {
+        if (strcmp(*instance_id_out, "0") == 0)
+            return true;
+        free(*instance_id_out);
+        *instance_id_out = NULL;
+        soap_handler_set_fault(out, 718, "Invalid InstanceID");
+        return false;
+    }
 
     *instance_id_out = strdup("0");
     if (!*instance_id_out)
@@ -297,6 +314,39 @@ static bool avtransport_try_instance_id(const SoapActionContext *ctx,
         return false;
     }
     log_debug("[avtransport] default InstanceID=0 for %s\n", action_name);
+    return true;
+}
+
+static bool avtransport_require_instance_id(const SoapActionContext *ctx,
+                                             SoapActionOutput *out,
+                                             char **instance_id_out)
+{
+    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", instance_id_out))
+        return false;
+    if (strcmp(*instance_id_out, "0") == 0)
+        return true;
+    free(*instance_id_out);
+    *instance_id_out = NULL;
+    soap_handler_set_fault(out, 718, "Invalid InstanceID");
+    return false;
+}
+
+static bool avtransport_valid_network_uri(const char *uri)
+{
+    const char *authority;
+    if (strncasecmp(uri, "http://", 7) == 0)
+        authority = uri + 7;
+    else if (strncasecmp(uri, "https://", 8) == 0)
+        authority = uri + 8;
+    else if (strncasecmp(uri, "rtsp://", 7) == 0)
+        authority = uri + 7;
+    else
+        return false;
+    if (!*authority || *authority == '/' || *authority == '?' || *authority == '#')
+        return false;
+    for (const unsigned char *p = (const unsigned char *)uri; *p; ++p)
+        if (*p <= 0x20 || *p == 0x7F)
+            return false;
     return true;
 }
 
@@ -466,7 +516,7 @@ bool avtransport_set_uri(const SoapActionContext *ctx, SoapActionOutput *out)
     if (!ctx || !out)
         return false;
 
-    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", &instance_id))
+    if (!avtransport_require_instance_id(ctx, out, &instance_id))
         return false;
 
     if (!soap_handler_require_arg_alloc(ctx, out, "CurrentURI", &uri))
@@ -485,6 +535,35 @@ bool avtransport_set_uri(const SoapActionContext *ctx, SoapActionOutput *out)
             soap_handler_set_fault(out, 501, "Action Failed");
             return false;
         }
+    }
+
+    if (!uri[0])
+    {
+        PlayerOwnershipLease current = {0};
+        bool owned = protocol_coordinator_media_current(&current) &&
+            current.owner == PLAYER_MEDIA_OWNER_DLNA &&
+            current.token == DLNA_PLAYER_OWNER_TOKEN;
+        bool cleared = !owned || avtransport_submit_stop_and_release();
+        if (cleared)
+        {
+            dlna_protocol_state_apply_set_uri("", "");
+            dlna_controller_session_reset();
+            soap_handler_set_success(out, "");
+        }
+        else
+            soap_handler_set_fault(out, 701, "Transition not available");
+        free(instance_id);
+        free(uri);
+        free(metadata);
+        return cleared;
+    }
+    if (!avtransport_valid_network_uri(uri))
+    {
+        free(instance_id);
+        free(uri);
+        free(metadata);
+        soap_handler_set_fault(out, 716, "Resource not found");
+        return false;
     }
 
     seq = player_trace_begin_media("SetAVTransportURI", uri, metadata);
@@ -572,12 +651,19 @@ bool avtransport_play(const SoapActionContext *ctx, SoapActionOutput *out)
     if (!ctx || !out)
         return false;
 
-    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", &instance_id))
+    if (!avtransport_require_instance_id(ctx, out, &instance_id))
         return false;
 
     if (!soap_handler_require_arg_alloc(ctx, out, "Speed", &speed))
     {
         free(instance_id);
+        return false;
+    }
+    if (strcmp(speed, "1") != 0)
+    {
+        free(instance_id);
+        free(speed);
+        soap_handler_set_fault(out, 717, "Play speed not supported");
         return false;
     }
 
@@ -622,7 +708,7 @@ bool avtransport_pause(const SoapActionContext *ctx, SoapActionOutput *out)
     if (!ctx || !out)
         return false;
 
-    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", &instance_id))
+    if (!avtransport_require_instance_id(ctx, out, &instance_id))
         return false;
 
     if (state->av_transport_uri[0] == '\0')
@@ -656,7 +742,7 @@ bool avtransport_stop(const SoapActionContext *ctx, SoapActionOutput *out)
     if (!ctx || !out)
         return false;
 
-    if (!soap_handler_require_arg_alloc(ctx, out, "InstanceID", &instance_id))
+    if (!avtransport_require_instance_id(ctx, out, &instance_id))
         return false;
 
     avtransport_log_trace("Stop", "begin", dlna_protocol_state_view()->av_transport_uri, "-");
@@ -669,7 +755,11 @@ bool avtransport_stop(const SoapActionContext *ctx, SoapActionOutput *out)
     }
 
     dlna_protocol_state_apply_stop();
-    dlna_controller_session_request_home();
+    /* STOP has already reached the player actor and released its lease.
+     * The view follows STOPPED back to home automatically. A deferred home
+     * request would make the UI issue STOP_ANY (or release a newly claimed
+     * lease), racing a controller's immediate Play or another protocol. */
+    dlna_controller_session_reset();
     avtransport_log_trace("Stop", "done", dlna_protocol_state_view()->av_transport_uri, "-");
     free(instance_id);
     soap_handler_set_success(out, "");
@@ -929,17 +1019,11 @@ bool avtransport_seek(const SoapActionContext *ctx, SoapActionOutput *out)
         log_debug("[avtransport] default Unit=REL_TIME for Seek\n");
     }
 
-    if (!soap_handler_try_arg_alloc(ctx, "Target", &target))
+    if (!soap_handler_require_arg_alloc(ctx, out, "Target", &target))
     {
-        target = strdup("00:00:00");
-        if (!target)
-        {
-            free(instance_id);
-            free(unit);
-            soap_handler_set_fault(out, 501, "Action Failed");
-            return false;
-        }
-        log_debug("[avtransport] default Target=00:00:00 for Seek\n");
+        free(instance_id);
+        free(unit);
+        return false;
     }
 
     if (strcasecmp(unit, "REL_TIME") != 0 &&
@@ -977,13 +1061,22 @@ bool avtransport_seek(const SoapActionContext *ctx, SoapActionOutput *out)
         return true;
     }
 
+    int target_ms;
+    if (!player_seek_target_parse_ms(target, &target_ms))
+    {
+        free(instance_id);
+        free(unit);
+        free(target);
+        soap_handler_set_fault(out, 711, "Illegal seek target");
+        return false;
+    }
     normalized_target = avtransport_normalize_seek_target_alloc(target);
     effective_target = normalized_target ? normalized_target : target;
     if (normalized_target && strcmp(normalized_target, target) != 0)
         log_debug("[avtransport] normalize seek target raw=%s normalized=%s\n", target, normalized_target);
 
     avtransport_log_trace("Seek", "begin", state->av_transport_uri, effective_target);
-    if (!avtransport_run_owned_seek_target(effective_target))
+    if (!avtransport_run_owned_seek_ms(target_ms))
     {
         avtransport_log_trace("Seek", "failed", state->av_transport_uri, "player-command");
         free(instance_id);

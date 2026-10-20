@@ -1029,7 +1029,11 @@ void dlna_protocol_state_apply_set_uri(const char *uri, const char *metadata)
     set_state_int_by_name("NumberOfTracks", uri && uri[0] != '\0' ? 1 : 0);
     set_state_string_by_name("RelativeTimePosition", "00:00:00");
     set_state_string_by_name("AbsoluteTimePosition", "00:00:00");
-    set_state_string_by_name("TransportState", "PAUSED_PLAYBACK");
+    set_state_string_by_name("CurrentTrackDuration", "00:00:00");
+    set_state_string_by_name("CurrentMediaDuration", "00:00:00");
+    set_state_string_by_name("TransportPlaySpeed", "1");
+    set_state_string_by_name("TransportState",
+                            uri && uri[0] ? "PAUSED_PLAYBACK" : "NO_MEDIA_PRESENT");
     set_state_string_by_name("TransportStatus", "OK");
 }
 
