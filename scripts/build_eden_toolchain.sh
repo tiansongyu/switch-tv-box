@@ -18,4 +18,6 @@ docker build --file "$repo_root/Dockerfile.eden-macros" \
     --tag "$output_image" "$repo_root"
 docker run --rm --entrypoint cat "$output_image" \
     /opt/switch-tv-box/eden-macros/verification.json
+docker run --rm --entrypoint cat "$output_image" \
+    /opt/switch-tv-box/mpv-hos/mpv-hos-verification.json
 printf 'Compatibility SDK ready: %s (base %s)\n' "$output_image" "$base_image_id"

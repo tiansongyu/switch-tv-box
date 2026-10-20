@@ -23,6 +23,7 @@ RUN apt-get update && \
       libavutil-dev \
       libmbedtls-dev \
       libsodium-dev \
+      patch \
       pkg-config \
       python3 \
       zstd && \
@@ -56,6 +57,14 @@ RUN /usr/local/bin/fetch_switch_ffmpeg_airplay.sh /tmp/nxcast-ffmpeg && \
     test -f /opt/devkitpro/portlibs/switch/include/mpv/client.h && \
     test -f /opt/devkitpro/portlibs/switch/lib/libmpv.a && \
     rm -rf /tmp/nxcast-ffmpeg
+
+COPY scripts/build_mpv_hos_sdk.sh \
+     scripts/test_mpv_hos_capacity.py \
+     scripts/verify_mpv_hos_object.py \
+     scripts/patches/mpv-hos-buffer-capacity.patch \
+     /opt/switch-tv-box/mpv-hos/
+
+RUN bash /opt/switch-tv-box/mpv-hos/build_mpv_hos_sdk.sh
 
 RUN apt-get update && apt-get install -y --no-install-recommends zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,14 @@
+--- a/audio/out/ao_hos.c
++++ b/audio/out/ao_hos.c
+@@ -220,7 +220,10 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state) {
+     }
+ 
+     if (priv->cur_buf_idx != -1)
+-        state->free_samples -= priv->num_samples - priv->cur_queued_samples;
++        // A partially filled wavebuf is still Free/Done until audio_write()
++        // queues it. The loop counted its entire capacity: subtract only the
++        // samples already written, leaving the actual remaining capacity.
++        state->free_samples -= priv->cur_queued_samples;
+ 
+     state->queued_samples = priv->total_queued_samples -
+         audrvVoiceGetPlayedSampleCount(&priv->driver, 0);

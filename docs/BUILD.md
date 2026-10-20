@@ -64,3 +64,33 @@ describe the fork.
 
 Pushing `main` runs CI and uploads a build artifact. It does not automatically
 publish a continuous release. Tagged releases remain an explicit separate action.
+
+## HOS audio capacity fix
+
+Both the standard Dockerfile and the Eden derivative rebuild the HOS output
+driver from [averne/mpv commit d8b833e1](https://github.com/averne/mpv/blob/d8b833e1c6e7b6bd2e41507c46285bab95deede2/audio/out/ao_hos.c),
+using the [mpv 0.36.0](https://github.com/mpv-player/mpv/tree/v0.36.0) headers.
+The source archives and original SDK object are SHA-256 checked. This corrects
+the available-sample calculation for a partly filled audio buffer: if three
+8192-sample buffers are queued and a fourth contains 6144 samples, the driver
+must report 2048 writable samples. The original reports 6144, and its next write
+can fail after consuming only part of the supplied audio. The same calculation
+applies on physical Switch hardware.
+
+`scripts/build_mpv_hos_sdk.sh` builds just `ao_hos.c.21.o` with the Switch SDK,
+checks the structure offsets used by the original object, and requires identical
+driver data, callback relocations and external symbols. It also verifies that
+every other member of `libmpv.a` remains unchanged. Unknown SDK object versions
+are rejected. Running the installer again verifies the existing fixed object
+and runs its regression tests without replacing it.
+
+The regression compiles the real patched `get_state` and `audio_write` function
+bodies with deterministic audrv test doubles. Its 447 ASan/UBSan cases cover
+Free/Done buffers, 2/4/16 buffers, partial 0/2048/4096/6144/full samples, writes
+across buffer boundaries, full queues and guarded storage. The unpatched source
+must reproduce the failure as a negative control. These tests validate buffer
+accounting; device playback still needs a Switch or emulator runtime check.
+
+The container retains exact sources, license, patch, ABI verification and build
+provenance in `/opt/switch-tv-box/mpv-hos/`. The original netease-switch image is
+unchanged. CI includes every patch/build/test input in its toolchain cache key.
