@@ -47,8 +47,10 @@ typedef struct
 {
     bool storage_ready;
     bool home_language_focused;
+    bool player_focused;
     bool home_language_save_failed;
     bool network_ready;
+    char ip_address[48];
     bool dlna_running;
     bool airplay_running;
     bool airplay_pin_visible;

@@ -127,13 +127,20 @@ int main(void)
     assert(home_ui_is_chinese());
     test_translation();
 
-    assert(home_ui_hit(HOME_FOCUS_TV, 940, 320));
+    assert(home_ui_hit(HOME_FOCUS_TV, 336, 320));
     assert(home_ui_hit(HOME_FOCUS_LANGUAGE, 1100, 60));
-    assert(!home_ui_hit(HOME_FOCUS_TV, 336, 320));
+    assert(!home_ui_hit(HOME_FOCUS_TV, 940, 320));
     assert(!home_ui_hit(HOME_FOCUS_LANGUAGE, 336, 320));
     assert(!home_ui_hit(HOME_FOCUS_TV, 940, 660));
     assert(!home_ui_hit(HOME_FOCUS_LANGUAGE, 1100, 100));
     assert(!home_ui_hit(HOME_FOCUS_TV, HOME_TV_RIGHT, 320));
+    assert(home_ui_hit(HOME_FOCUS_PLAYER, 336, 560));
+    assert(home_ui_hit(HOME_FOCUS_PLAYER, HOME_PLAYER_LEFT, HOME_PLAYER_TOP));
+    assert(!home_ui_hit(HOME_FOCUS_PLAYER, HOME_PLAYER_RIGHT, 560));
+    assert(!home_ui_hit(HOME_FOCUS_PLAYER, 336, HOME_PLAYER_BOTTOM));
+    assert(!home_ui_hit(HOME_FOCUS_TV, 336, 560));
+    assert(!home_ui_hit(HOME_FOCUS_PLAYER, 336, 320));
+    assert(!home_ui_hit(HOME_FOCUS_PLAYER, 940, 560));
     assert(!home_ui_hit((HomeFocus)99, 940, 320));
     remove(path);
     rmdir(directory);

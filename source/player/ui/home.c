@@ -195,5 +195,8 @@ bool home_ui_hit(HomeFocus target, int x, int y)
     if (target == HOME_FOCUS_TV)
         return x >= HOME_TV_LEFT && x < HOME_TV_RIGHT &&
                y >= HOME_TV_TOP && y < HOME_TV_BOTTOM;
+    if (target == HOME_FOCUS_PLAYER)
+        return x >= HOME_PLAYER_LEFT && x < HOME_PLAYER_RIGHT &&
+               y >= HOME_PLAYER_TOP && y < HOME_PLAYER_BOTTOM;
     return false;
 }

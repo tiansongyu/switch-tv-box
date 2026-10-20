@@ -102,8 +102,8 @@ static int g_nxlinkSock = -1;
 static bool g_networkInitialized = false;
 static bool g_consoleInitialized = false;
 static const char g_shutdownTraceDirParent[] = "sdmc:/switch";
-static const char g_shutdownTraceDir[] = "sdmc:/switch/NX-Cast";
-static const char g_shutdownTracePath[] = "sdmc:/switch/NX-Cast/shutdown_trace.log";
+static const char g_shutdownTraceDir[] = "sdmc:/switch/switch-tv-box";
+static const char g_shutdownTracePath[] = "sdmc:/switch/switch-tv-box/shutdown_trace.log";
 
 static void shutdown_stdio_trace(const char *fmt, ...);
 static void shutdown_trace_reset(void);
@@ -544,8 +544,16 @@ static void build_home_view_state(PlayerHomeViewState *out,
     memset(out, 0, sizeof(*out));
     out->storage_ready = storage_ready;
     out->home_language_focused = g_home_focus == HOME_FOCUS_LANGUAGE;
+    out->player_focused = g_home_focus == HOME_FOCUS_PLAYER;
     out->home_language_save_failed = g_home_language_save_failed;
     out->network_ready = network_ready;
+    if (network_ready)
+    {
+        struct in_addr local = { .s_addr = gethostid() };
+        if (local.s_addr != 0 && local.s_addr != INADDR_NONE)
+            (void)inet_ntop(AF_INET, &local, out->ip_address,
+                           sizeof(out->ip_address));
+    }
     out->dlna_running = protocols &&
                         protocols->services[PROTOCOL_SERVICE_DLNA] ==
                             PROTOCOL_SERVICE_RUNNING;
@@ -842,7 +850,7 @@ static MainIptvUrlResult main_iptv_prompt_and_open(bool player_ready)
         return iptv_add_source_url(url) ? MAIN_IPTV_URL_SOURCE_QUEUED : MAIN_IPTV_URL_NONE;
     if (!player_ready)
     {
-        iptv_set_status("Player is not ready. Check the media toolchain and restart NX-Cast.");
+        iptv_set_status("Player is not ready. Check the media toolchain and restart Switch TV Box.");
         return MAIN_IPTV_URL_NONE;
     }
     return iptv_play_url(url) ? MAIN_IPTV_URL_PLAYING : MAIN_IPTV_URL_NONE;
@@ -929,7 +937,7 @@ static void main_browser_apply(PlayerBrowserAction action, PlayerBrowserPage pre
     {
     case PLAYER_BROWSER_ACTION_PLAY:
         if (!player_ready)
-            iptv_set_status("Player is not ready. Check the media toolchain and restart NX-Cast.");
+            iptv_set_status("Player is not ready. Check the media toolchain and restart Switch TV Box.");
         else if (iptv_play_channel(action.index))
         {
             /* Selection is complete; X can reopen the browser while playing. */
@@ -1012,7 +1020,7 @@ static void render_home_view(const PlayerHomeViewState *state)
 
     printf(ANSI_TEXT "       CAST MEDIA TO YOUR SWITCH" ANSI_RESET "\n");
     printf("       Keep your phone and Switch on the same Wi-Fi, then select "
-           ANSI_ACCENT "NX-Cast" ANSI_RESET ".\n\n");
+           ANSI_ACCENT "Switch TV Box" ANSI_RESET ".\n\n");
 
     printf("  +-------------------+        +---------------+        +-------------------+\n");
     printf("  |  PHONE / DESKTOP  |        |     DLNA      |        |  NX-CAST SWITCH   |\n");
@@ -1023,7 +1031,7 @@ static void render_home_view(const PlayerHomeViewState *state)
 
     printf(ANSI_ACCENT "  [ QUICK START ]" ANSI_RESET "\n");
     printf("  1. Open a video app or IPTV page on your phone / desktop.\n");
-    printf("  2. Tap Cast, DLNA, or AirPlay, then choose " ANSI_ACCENT "NX-Cast" ANSI_RESET ".\n");
+    printf("  2. Tap Cast, DLNA, or AirPlay, then choose " ANSI_ACCENT "Switch TV Box" ANSI_RESET ".\n");
     printf("  3. Wait for the loading spinner; playback controls appear on touch.\n\n");
 
     printf(ANSI_ACCENT "  [ PLAYER CONTROLS ]" ANSI_RESET "\n");
@@ -1204,18 +1212,7 @@ int main(int argc, char* argv[])
     set_power_policy(true, true);
 
     bool storageReady = dlna_resource_store_ensure_defaults();
-    bool system_chinese = false;
-    if (R_SUCCEEDED(setInitialize()))
-    {
-        u64 language_code = 0;
-        SetLanguage language = SetLanguage_ENUS;
-        if (R_SUCCEEDED(setGetSystemLanguage(&language_code)) &&
-            R_SUCCEEDED(setMakeLanguage(language_code, &language)))
-            system_chinese = language == SetLanguage_ZHCN || language == SetLanguage_ZHTW ||
-                             language == SetLanguage_ZHHANS || language == SetLanguage_ZHHANT;
-        setExit();
-    }
-    home_ui_init("sdmc:/switch/NX-Cast/ui-language.txt", system_chinese);
+    home_ui_init("sdmc:/switch/switch-tv-box/ui-language.txt", true);
     if (storageReady)
         log_info("[storage] DLNA resources ready on SD.\n");
     else
@@ -1350,7 +1347,7 @@ int main(int argc, char* argv[])
     PlayerUiState video_ui;
     player_ui_reset(&video_ui);
 
-    log_info("[ui] NX-Cast starting. Press + to exit.\n");
+    log_info("[ui] Switch TV Box starting. Press + to exit.\n");
     log_info("[ui] Home view shows cast instructions and last error only.\n");
     if (videoPlatformReady)
         log_info("[ui] Video view auto-activates while playback is active.\n");
@@ -1814,11 +1811,20 @@ int main(int argc, char* argv[])
             u64 home_navigation_down = home_navigation & ~g_home_navigation_previous;
             g_home_navigation_previous = home_navigation;
             bool open_home_channels = false;
+            bool return_home_player = false;
             if (!iptv_panel_open && !browser_captured)
             {
+                if (!home_state.playback_active && g_home_focus == HOME_FOCUS_PLAYER)
+                    g_home_focus = HOME_FOCUS_TV;
                 if (home_navigation_down & HidNpadButton_Up)
-                    g_home_focus = HOME_FOCUS_LANGUAGE;
+                    g_home_focus = g_home_focus == HOME_FOCUS_PLAYER ?
+                        HOME_FOCUS_TV : HOME_FOCUS_LANGUAGE;
                 if (home_navigation_down & HidNpadButton_Down)
+                    g_home_focus = g_home_focus == HOME_FOCUS_TV &&
+                        home_state.playback_active ? HOME_FOCUS_PLAYER : HOME_FOCUS_TV;
+                if (home_navigation_down & HidNpadButton_Right)
+                    g_home_focus = HOME_FOCUS_LANGUAGE;
+                if (home_navigation_down & HidNpadButton_Left)
                     g_home_focus = HOME_FOCUS_TV;
                 bool language_tapped = touch_tap &&
                     home_ui_hit(HOME_FOCUS_LANGUAGE, touch_tap_x, touch_tap_y);
@@ -1836,9 +1842,15 @@ int main(int argc, char* argv[])
                     ((kDown & HidNpadButton_A) && g_home_focus == HOME_FOCUS_TV);
                 if (tv_tapped)
                     touch_tap = false;
+                return_home_player = home_state.playback_active &&
+                    ((touch_tap && home_ui_hit(HOME_FOCUS_PLAYER, touch_tap_x, touch_tap_y)) ||
+                     ((kDown & HidNpadButton_A) && g_home_focus == HOME_FOCUS_PLAYER));
+                if (return_home_player)
+                    touch_tap = false;
             }
 
-            if (!iptv_panel_open && !browser_captured && (kDown & HidNpadButton_B) && home_state.playback_active)
+            if (!iptv_panel_open && !browser_captured && home_state.playback_active &&
+                ((kDown & HidNpadButton_B) || return_home_player))
             {
                 bool ok = player_view_show_video();
                 main_input_trace("[input] action=return-to-player ok=%d state=%s\n",
